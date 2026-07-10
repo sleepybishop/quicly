@@ -445,6 +445,59 @@ static void test_transport_parameters(void)
     memset(&decoded, 0x55, sizeof(decoded));
     ok(quicly_decode_transport_parameter_list(&decoded, NULL, NULL, NULL, NULL, dup_bytes, dup_bytes + sizeof(dup_bytes)) ==
        QUICLY_TRANSPORT_ERROR_TRANSPORT_PARAMETER);
+
+    /* grease_quic_bit tests (RFC 9287) */
+    static const uint8_t grease_quic_bit_bytes[] = {0x6a, 0xb2, 0x00};
+    memset(&decoded, 0x55, sizeof(decoded));
+    ok(quicly_decode_transport_parameter_list(&decoded, NULL, NULL, NULL, NULL, grease_quic_bit_bytes,
+                                              grease_quic_bit_bytes + sizeof(grease_quic_bit_bytes)) == 0);
+    ok(decoded.grease_quic_bit == 1);
+
+    static const uint8_t invalid_grease_bytes[] = {0x6a, 0xb2, 0x01, 0x00};
+    memset(&decoded, 0x55, sizeof(decoded));
+    ok(quicly_decode_transport_parameter_list(&decoded, NULL, NULL, NULL, NULL, invalid_grease_bytes,
+                                              invalid_grease_bytes + sizeof(invalid_grease_bytes)) ==
+       QUICLY_TRANSPORT_ERROR_TRANSPORT_PARAMETER);
+
+    ptls_buffer_t tp_buf;
+    ptls_buffer_init(&tp_buf, "", 0);
+    quicly_transport_parameters_t encode_params = quicly_spec_context.transport_params;
+    encode_params.grease_quic_bit = 1;
+    ok(quicly_encode_transport_parameter_list(&tp_buf, &encode_params, NULL, NULL, NULL, NULL, 0) == 0);
+    memset(&decoded, 0x55, sizeof(decoded));
+    ok(quicly_decode_transport_parameter_list(&decoded, NULL, NULL, NULL, NULL, tp_buf.base, tp_buf.base + tp_buf.off) == 0);
+    ok(decoded.grease_quic_bit == 1);
+    ptls_buffer_dispose(&tp_buf);
+}
+
+static size_t decode_packet_once(quicly_context_t *ctx, const uint8_t *bytes, size_t len)
+{
+    quicly_decoded_packet_t decoded;
+    size_t off = 0;
+    return quicly_decode_packet(ctx, &decoded, bytes, len, &off);
+}
+
+static void test_grease_quic_bit(void)
+{
+    static const uint8_t version_negotiation[] = {0x80, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1};
+    static const uint8_t unknown_version[] = {0x80, 0xab, 0xab, 0xab, 0x0a, 0, 0};
+    static const uint8_t initial_bit_zero[] = {0x80, 0, 0, 0, 1, 0, 0, 0, 1, 0};
+    static const uint8_t initial_bit_one[] = {0xc0, 0, 0, 0, 1, 0, 0, 0, 1, 0};
+    static const uint8_t short_bit_zero[] = {0, 0};
+    quicly_context_t ctx = quic_ctx;
+
+    /* Version Negotiation and unknown versions do not have the QUIC v1 fixed-bit semantics. */
+    ctx.transport_params.grease_quic_bit = 0;
+    ok(decode_packet_once(&ctx, version_negotiation, sizeof(version_negotiation)) == sizeof(version_negotiation));
+    ok(decode_packet_once(&ctx, unknown_version, sizeof(unknown_version)) == sizeof(unknown_version));
+
+    /* For recognized versions and short headers, bit zero is accepted only when advertised locally. */
+    ok(decode_packet_once(&ctx, initial_bit_zero, sizeof(initial_bit_zero)) == SIZE_MAX);
+    ok(decode_packet_once(&ctx, initial_bit_one, sizeof(initial_bit_one)) == sizeof(initial_bit_one));
+    ok(decode_packet_once(&ctx, short_bit_zero, sizeof(short_bit_zero)) == SIZE_MAX);
+    ctx.transport_params.grease_quic_bit = 1;
+    ok(decode_packet_once(&ctx, initial_bit_zero, sizeof(initial_bit_zero)) == sizeof(initial_bit_zero));
+    ok(decode_packet_once(&ctx, short_bit_zero, sizeof(short_bit_zero)) == sizeof(short_bit_zero));
 }
 
 size_t decode_packets(quicly_decoded_packet_t *decoded, struct iovec *raw, size_t cnt)
@@ -1544,6 +1597,7 @@ int main(int argc, char **argv)
     subtest("test-vector", test_vector);
     subtest("test-retry-aead", test_retry_aead);
     subtest("transport-parameters", test_transport_parameters);
+    subtest("grease-quic-bit", test_grease_quic_bit);
     subtest("cid", test_cid);
     subtest("simple", test_simple);
     subtest("stream-concurrency", test_stream_concurrency);
