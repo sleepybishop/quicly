@@ -217,6 +217,15 @@ typedef struct st_quicly_max_stream_data_t {
     uint64_t bidi_local, bidi_remote, uni;
 } quicly_max_stream_data_t;
 
+typedef struct st_quicly_version_information_t {
+    /* chosen version */
+    uint32_t chosen_version;
+    /* locally-supported versions advertised by the peer (terminated by 0) */
+    uint32_t available_versions[16];
+    /* number of versions advertised by the peer, including unsupported and reserved versions */
+    size_t num_available_versions;
+} quicly_version_information_t;
+
 /**
  * Transport Parameters; the struct contains "configuration parameters", ODCID is managed separately
  */
@@ -270,6 +279,8 @@ typedef struct st_quicly_transport_parameters_t {
      *
      */
     uint16_t max_datagram_frame_size;
+    /* version information (RFC 9368) */
+    quicly_version_information_t version_information;
 } quicly_transport_parameters_t;
 
 typedef struct st_quicly_salt_t {
@@ -317,6 +328,17 @@ struct st_quicly_context_t {
      * negotiation.
      */
     uint32_t initial_version;
+    /**
+     * (client-only) zero-terminated list of versions that may be selected after receiving an incompatible Version Negotiation
+     * packet, in descending preference order. Applications MUST limit this list to versions that can carry the application
+     * protocols offered by the connection. NULL disables incompatible version selection.
+     */
+    const uint32_t *client_version_preference;
+    /**
+     * (server-only) zero-terminated list of Fully Deployed Versions advertised in Version Information. This is deployment policy,
+     * and therefore can be narrower than `quicly_supported_versions` during a staged rollout. NULL advertises an empty list.
+     */
+    const uint32_t *server_fully_deployed_versions;
     /**
      * (server-only) amplification limit before the peer address is validated
      */
@@ -1170,6 +1192,10 @@ struct st_quicly_address_token_plaintext_t {
  * zero-terminated list of protocol versions being supported by quicly
  */
 extern const uint32_t quicly_supported_versions[];
+/**
+ * conservative default version policy; contains QUIC v1 only
+ */
+extern const uint32_t quicly_default_version_preference[];
 /**
  * returns a boolean indicating if given protocol version is supported
  */
