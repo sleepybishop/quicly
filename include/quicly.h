@@ -231,6 +231,15 @@ typedef struct st_quicly_max_stream_data_t {
     uint64_t bidi_local, bidi_remote, uni;
 } quicly_max_stream_data_t;
 
+typedef struct st_quicly_version_information_t {
+    /* chosen version */
+    uint32_t chosen_version;
+    /* locally-supported versions advertised by the peer (terminated by 0) */
+    uint32_t available_versions[16];
+    /* number of versions advertised by the peer, including unsupported and reserved versions */
+    size_t num_available_versions;
+} quicly_version_information_t;
+
 /**
  * Transport Parameters; the struct contains "configuration parameters", ODCID is managed separately
  */
@@ -288,6 +297,8 @@ typedef struct st_quicly_transport_parameters_t {
     uint8_t enable_multipath : 1;
     /** multipath extension maximum path ID */
     uint64_t initial_max_path_id;
+    /* version information (RFC 9368) */
+    quicly_version_information_t version_information;
 } quicly_transport_parameters_t;
 
 typedef struct st_quicly_salt_t {
