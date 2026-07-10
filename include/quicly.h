@@ -74,7 +74,7 @@ extern "C" {
  */
 #define QUICLY_PROTOCOL_VERSION_DRAFT27 0xff00001b
 
-#define QUICLY_PACKET_IS_INITIAL(first_byte) (((first_byte) & 0xf0) == 0xc0)
+#define QUICLY_PACKET_IS_INITIAL(first_byte) ((((first_byte) | QUICLY_QUIC_BIT) & 0xf0) == 0xc0)
 
 #define QUICLY_STATELESS_RESET_PACKET_MIN_LEN 39
 
@@ -270,6 +270,8 @@ typedef struct st_quicly_transport_parameters_t {
      *
      */
     uint16_t max_datagram_frame_size;
+    /* grease_quic_bit (RFC 9287) */
+    uint8_t grease_quic_bit : 1;
 } quicly_transport_parameters_t;
 
 typedef struct st_quicly_salt_t {

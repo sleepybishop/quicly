@@ -64,6 +64,7 @@
 #define QUICLY_TRANSPORT_PARAMETER_ID_RETRY_SOURCE_CONNECTION_ID 16
 #define QUICLY_TRANSPORT_PARAMETER_ID_MAX_DATAGRAM_FRAME_SIZE 0x20
 #define QUICLY_TRANSPORT_PARAMETER_ID_MIN_ACK_DELAY 0xff04de1b
+#define QUICLY_TRANSPORT_PARAMETER_ID_GREASE_QUIC_BIT 0x2ab2
 
 /**
  * maximum size of token that quicly accepts
@@ -675,7 +676,7 @@ static inline uint8_t get_epoch(uint8_t first_byte)
     if (!QUICLY_PACKET_IS_LONG_HEADER(first_byte))
         return QUICLY_EPOCH_1RTT;
 
-    switch (first_byte & QUICLY_PACKET_TYPE_BITMASK) {
+    switch ((first_byte | QUICLY_QUIC_BIT) & QUICLY_PACKET_TYPE_BITMASK) {
     case QUICLY_PACKET_TYPE_INITIAL:
         return QUICLY_EPOCH_INITIAL;
     case QUICLY_PACKET_TYPE_HANDSHAKE:
@@ -821,7 +822,7 @@ size_t quicly_decode_packet(quicly_context_t *ctx, quicly_decoded_packet_t *pack
             goto Error;
         packet->cid.src.base = (uint8_t *)src;
         src += packet->cid.src.len;
-        switch (packet->octets.base[0] & QUICLY_PACKET_TYPE_BITMASK) {
+        switch ((packet->octets.base[0] | QUICLY_QUIC_BIT) & QUICLY_PACKET_TYPE_BITMASK) {
         case QUICLY_PACKET_TYPE_INITIAL:
         case QUICLY_PACKET_TYPE_0RTT:
             if (ctx->cid_encryptor == NULL || packet->cid.dest.encrypted.len == 0 ||
@@ -848,9 +849,11 @@ size_t quicly_decode_packet(quicly_context_t *ctx, quicly_decoded_packet_t *pack
         case QUICLY_PROTOCOL_VERSION_DRAFT29:
         case QUICLY_PROTOCOL_VERSION_DRAFT27:
             /* these are the recognized versions, and they share the same packet header format */
+            if ((packet->octets.base[0] & QUICLY_QUIC_BIT) == 0 && !ctx->transport_params.grease_quic_bit)
+                goto Error;
             if (packet->cid.dest.encrypted.len > QUICLY_MAX_CID_LEN_V1 || packet->cid.src.len > QUICLY_MAX_CID_LEN_V1)
                 goto Error;
-            if ((packet->octets.base[0] & QUICLY_PACKET_TYPE_BITMASK) == QUICLY_PACKET_TYPE_RETRY) {
+            if (((packet->octets.base[0] | QUICLY_QUIC_BIT) & QUICLY_PACKET_TYPE_BITMASK) == QUICLY_PACKET_TYPE_RETRY) {
                 /* retry */
                 if (src_end - src <= PTLS_AESGCM_TAG_SIZE)
                     goto Error;
@@ -859,7 +862,7 @@ size_t quicly_decode_packet(quicly_context_t *ctx, quicly_decoded_packet_t *pack
                 packet->encrypted_off = src - packet->octets.base;
             } else {
                 /* coalescible long header packet */
-                if ((packet->octets.base[0] & QUICLY_PACKET_TYPE_BITMASK) == QUICLY_PACKET_TYPE_INITIAL) {
+                if (((packet->octets.base[0] | QUICLY_QUIC_BIT) & QUICLY_PACKET_TYPE_BITMASK) == QUICLY_PACKET_TYPE_INITIAL) {
                     /* initial has a token */
                     uint64_t token_len;
                     if ((token_len = quicly_decodev(&src, src_end)) == UINT64_MAX)
@@ -886,6 +889,8 @@ size_t quicly_decode_packet(quicly_context_t *ctx, quicly_decoded_packet_t *pack
         packet->_is_stateless_reset_cached = QUICLY__DECODED_PACKET_CACHED_NOT_STATELESS_RESET;
     } else {
         /* short header */
+        if ((packet->octets.base[0] & QUICLY_QUIC_BIT) == 0 && !ctx->transport_params.grease_quic_bit)
+            goto Error;
         if (ctx->cid_encryptor != NULL) {
             if (src_end - src < QUICLY_MAX_CID_LEN_V1)
                 goto Error;
@@ -2495,6 +2500,8 @@ int quicly_encode_transport_parameter_list(ptls_buffer_t *buf, const quicly_tran
     if (params->max_datagram_frame_size != 0)
         PUSH_TP(buf, QUICLY_TRANSPORT_PARAMETER_ID_MAX_DATAGRAM_FRAME_SIZE,
                 { ptls_buffer_push_quicint(buf, params->max_datagram_frame_size); });
+    if (params->grease_quic_bit)
+        PUSH_TP(buf, QUICLY_TRANSPORT_PARAMETER_ID_GREASE_QUIC_BIT, {});
     /* if requested, add a greasing TP of 1 MTU size so that CH spans across multiple packets */
     if (expand_by != 0) {
         PUSH_TP(buf, 31 * 100 + 27, {
@@ -2698,6 +2705,13 @@ quicly_error_t quicly_decode_transport_parameter_list(quicly_transport_parameter
                 if (v > UINT16_MAX)
                     v = UINT16_MAX;
                 params->max_datagram_frame_size = (uint16_t)v;
+            });
+            DECODE_TP(QUICLY_TRANSPORT_PARAMETER_ID_GREASE_QUIC_BIT, {
+                if (src != end) {
+                    ret = QUICLY_TRANSPORT_ERROR_TRANSPORT_PARAMETER;
+                    goto Exit;
+                }
+                params->grease_quic_bit = 1;
             });
             /* skip unknown extension */
             if (tp_index >= 0)
@@ -3953,6 +3967,13 @@ static quicly_error_t commit_send_packet(quicly_conn_t *conn, quicly_send_contex
     }
     quicly_encode16(s->dst_payload_from - QUICLY_SEND_PN_SIZE, (uint16_t)conn->egress.packet_number);
 
+    if (conn->super.remote.transport_params.grease_quic_bit) {
+        uint8_t rand_val;
+        conn->super.ctx->tls->random_bytes(&rand_val, 1);
+        if ((rand_val & 1) == 0)
+            *s->target.first_byte_at &= ~QUICLY_QUIC_BIT;
+    }
+
     /* encrypt the packet */
     s->dst += s->target.cipher->aead->algo->tag_size;
     datagram_size = s->dst - s->payload_buf.datagram;
@@ -5007,7 +5028,7 @@ size_t quicly_send_version_negotiation(quicly_context_t *ctx, ptls_iovec_t dest_
 
     /* type_flags */
     ctx->tls->random_bytes(dst, 1);
-    *dst |= QUICLY_LONG_HEADER_BIT;
+    *dst |= QUICLY_LONG_HEADER_BIT | QUICLY_QUIC_BIT;
     ++dst;
     /* version */
     dst = quicly_encode32(dst, 0);
@@ -5798,8 +5819,7 @@ Exit:
     }
     if (ret == 0 && s->target.first_byte_at != NULL) {
         /* last packet can be small-sized, unless it is the first flight sent from the client */
-        if ((s->payload_buf.datagram[0] & QUICLY_PACKET_TYPE_BITMASK) == QUICLY_PACKET_TYPE_INITIAL &&
-            (quicly_is_client(conn) || !ack_only))
+        if (QUICLY_PACKET_IS_INITIAL(s->payload_buf.datagram[0]) && (quicly_is_client(conn) || !ack_only))
             s->target.full_size = 1;
         commit_send_packet(conn, s, 0);
     }
@@ -7270,7 +7290,7 @@ quicly_error_t quicly_accept(quicly_conn_t **conn, quicly_context_t *ctx, struct
     *conn = NULL;
 
     /* process initials only */
-    if ((packet->octets.base[0] & QUICLY_PACKET_TYPE_BITMASK) != QUICLY_PACKET_TYPE_INITIAL) {
+    if (((packet->octets.base[0] | QUICLY_QUIC_BIT) & QUICLY_PACKET_TYPE_BITMASK) != QUICLY_PACKET_TYPE_INITIAL) {
         ret = QUICLY_ERROR_PACKET_IGNORED;
         goto Exit;
     }
@@ -7495,7 +7515,7 @@ static quicly_error_t do_receive(quicly_conn_t *conn, struct sockaddr *dest_addr
             ret = QUICLY_ERROR_PACKET_IGNORED;
             goto Exit;
         }
-        switch (packet->octets.base[0] & QUICLY_PACKET_TYPE_BITMASK) {
+        switch ((packet->octets.base[0] | QUICLY_QUIC_BIT) & QUICLY_PACKET_TYPE_BITMASK) {
         case QUICLY_PACKET_TYPE_RETRY: {
             assert(packet->encrypted_off + PTLS_AESGCM_TAG_SIZE == packet->octets.len);
             /* handle only if the connection is the client */
@@ -7649,7 +7669,7 @@ static quicly_error_t do_receive(quicly_conn_t *conn, struct sockaddr *dest_addr
     conn->paths[path_index]->packet_last_received = conn->super.stats.num_packets.received;
     conn->paths[path_index]->num_packets.received += 1;
     if (QUICLY_PACKET_IS_LONG_HEADER(packet->octets.base[0])) {
-        switch (packet->octets.base[0] & QUICLY_PACKET_TYPE_BITMASK) {
+        switch ((packet->octets.base[0] | QUICLY_QUIC_BIT) & QUICLY_PACKET_TYPE_BITMASK) {
         case QUICLY_PACKET_TYPE_INITIAL:
             conn->super.stats.num_packets.initial_received += 1;
             break;
@@ -7796,9 +7816,10 @@ quicly_error_t quicly_receive(quicly_conn_t *conn, struct sockaddr *dest_addr, s
             adjust_pointers_of_decoded_packet(&delayed->packet, delayed->bytes);
             /* attach */
             size_t slot;
-            if ((delayed->packet.octets.base[0] & QUICLY_PACKET_TYPE_BITMASK) == QUICLY_PACKET_TYPE_0RTT) {
+            if (((delayed->packet.octets.base[0] | QUICLY_QUIC_BIT) & QUICLY_PACKET_TYPE_BITMASK) == QUICLY_PACKET_TYPE_0RTT) {
                 slot = &conn->delayed_packets.zero_rtt - conn->delayed_packets.as_array;
-            } else if ((delayed->packet.octets.base[0] & QUICLY_PACKET_TYPE_BITMASK) == QUICLY_PACKET_TYPE_HANDSHAKE) {
+            } else if (((delayed->packet.octets.base[0] | QUICLY_QUIC_BIT) & QUICLY_PACKET_TYPE_BITMASK) ==
+                       QUICLY_PACKET_TYPE_HANDSHAKE) {
                 slot = &conn->delayed_packets.handshake - conn->delayed_packets.as_array;
             } else {
                 assert(!QUICLY_PACKET_IS_LONG_HEADER(delayed->packet.octets.base[0]));

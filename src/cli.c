@@ -1349,7 +1349,7 @@ static size_t determine_pn_offset(ptls_iovec_t input, size_t *packet_size, size_
     if ((input.base[0] & QUICLY_LONG_HEADER_BIT) == QUICLY_LONG_HEADER_BIT) {
 
         /* long header packet; at the moment, only Inital packets are supported */
-        if ((input.base[0] & QUICLY_PACKET_TYPE_BITMASK) != QUICLY_PACKET_TYPE_INITIAL)
+        if (!QUICLY_PACKET_IS_INITIAL(input.base[0]))
             goto UnexpectedType;
 
         if (input.len < 5)
