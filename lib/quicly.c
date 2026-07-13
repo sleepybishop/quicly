@@ -285,6 +285,16 @@ struct st_quicly_conn_path_t {
     } datagram_frame_payloads;
 };
 
+typedef struct st_quicly_pmtud_t {
+    enum { QUICLY_PMTUD_STATE_SEARCHING, QUICLY_PMTUD_STATE_SEARCH_COMPLETE } state;
+    uint16_t current_mtu;
+    uint16_t lower_bound;
+    uint16_t upper_bound;
+    uint16_t probe_size;
+    uint64_t probe_pn;
+    uint8_t lost_probes;
+    int64_t next_search_at;
+} quicly_pmtud_t;
 typedef struct st_quicly_path_space_t {
     /* monotonic path_id, never reused */
     uint32_t path_id;
@@ -327,6 +337,7 @@ typedef struct st_quicly_path_space_t {
         uint32_t new_rtt;
         uint32_t cwnd;
     } jumpstart;
+    quicly_pmtud_t pmtud;
 } quicly_path_space_t;
 
 struct st_quicly_delayed_packet_t {
@@ -2320,6 +2331,37 @@ static void stringify_address(char *buf, struct sockaddr *sa)
     sprintf(p, "%" PRIu16, port);
 }
 
+static uint16_t max_udp_payload_size_allowed_by_peer(quicly_conn_t *conn)
+{
+    uint64_t max_allowed = conn->super.remote.transport_params.max_udp_payload_size;
+    if (max_allowed == 0 || max_allowed > UINT16_MAX)
+        max_allowed = UINT16_MAX;
+    return (uint16_t)max_allowed;
+}
+
+static uint16_t pmtud_max_allowed(quicly_conn_t *conn)
+{
+    uint16_t max_allowed = max_udp_payload_size_allowed_by_peer(conn);
+    return max_allowed < 1472 ? max_allowed : 1472;
+}
+
+static void reset_pmtud_search(quicly_conn_t *conn, quicly_path_space_t *ps, uint16_t base_mtu, int64_t next_search_at)
+{
+    uint16_t max_allowed = pmtud_max_allowed(conn);
+    if (base_mtu > max_allowed)
+        base_mtu = max_allowed;
+
+    ps->pmtud.state = QUICLY_PMTUD_STATE_SEARCHING;
+    ps->pmtud.current_mtu = base_mtu;
+    ps->pmtud.lower_bound = base_mtu;
+    ps->pmtud.upper_bound = max_allowed;
+    ps->pmtud.probe_size = 0;
+    ps->pmtud.probe_pn = UINT64_MAX;
+    ps->pmtud.lost_probes = 0;
+    ps->pmtud.next_search_at = next_search_at;
+    ps->max_udp_payload_size = base_mtu;
+}
+
 static quicly_error_t alloc_path_space(quicly_conn_t *conn, size_t path_index, uint32_t path_id)
 {
     if (path_id >= sizeof(conn->abandoned_paths_mask) * 8)
@@ -2340,6 +2382,20 @@ static quicly_error_t alloc_path_space(quicly_conn_t *conn, size_t path_index, u
         ps->status_sequence = conn->path_status.sequence[path_id];
         ps->is_backup = (conn->path_status.backup_mask[path_id / 32] & ((uint32_t)1 << (path_id % 32))) != 0;
     }
+
+    uint16_t max_allowed =
+        conn->super.ctx->enable_ratio.enable_pmtud ? pmtud_max_allowed(conn) : max_udp_payload_size_allowed_by_peer(conn);
+    uint16_t base_mtu =
+        conn->super.ctx->enable_ratio.enable_pmtud && path_index > 0 ? 1200 : conn->super.ctx->initial_egress_max_udp_payload_size;
+    if (base_mtu > max_allowed)
+        base_mtu = max_allowed;
+    ps->pmtud.state = QUICLY_PMTUD_STATE_SEARCHING;
+    ps->pmtud.current_mtu = base_mtu;
+    ps->pmtud.lower_bound = base_mtu;
+    ps->pmtud.upper_bound = max_allowed;
+    ps->pmtud.probe_pn = UINT64_MAX;
+    ps->pmtud.lost_probes = 0;
+    ps->pmtud.next_search_at = 0;
 
     if (path_index > 0) {
         quicly_cid_plaintext_t new_cid = {
@@ -2373,7 +2429,7 @@ static quicly_error_t alloc_path_space(quicly_conn_t *conn, size_t path_index, u
         quicly_loss_init(&ps->loss, &conn->super.ctx->loss, initial_rtt, &conn->super.remote.transport_params.max_ack_delay,
                          &conn->super.remote.transport_params.ack_delay_exponent);
 
-        ps->max_udp_payload_size = conn->super.ctx->initial_egress_max_udp_payload_size;
+        ps->max_udp_payload_size = ps->pmtud.current_mtu;
         uint32_t initcwnd = quicly_cc_calc_initial_cwnd(conn->super.ctx->initcwnd_packets, ps->max_udp_payload_size);
         conn->super.ctx->init_cc->cb(conn->super.ctx->init_cc, &ps->cc, initcwnd, conn->stash.now);
         ps->cc.conn = conn;
@@ -2677,6 +2733,11 @@ static quicly_error_t promote_path(quicly_conn_t *conn, size_t path_index)
     get_path(conn, active_idx)->path_space = conn->path_spaces[ps_index];
     conn->path_spaces[ps_index]->addrs[cand_index] = NULL;
     conn->super.stats.num_paths.promoted += 1;
+
+    /* PMTU is a property of the address tuple. Start from QUIC's minimum datagram size after migration instead of carrying the
+     * old tuple's discovered value and any outstanding search state onto the new route. */
+    if (conn->super.ctx->enable_ratio.enable_pmtud)
+        reset_pmtud_search(conn, conn->path_spaces[ps_index], 1200, conn->stash.now);
 
     /* reset CC */
     get_cc(conn, get_path(conn, active_idx))
@@ -3597,6 +3658,41 @@ static quicly_conn_t *create_connection(quicly_context_t *ctx, uint32_t protocol
     return conn;
 }
 
+static void quicly_pmtud_on_remote_transport_params(quicly_conn_t *conn)
+{
+    if (!conn->super.ctx->enable_ratio.enable_pmtud) {
+        uint16_t max_allowed = max_udp_payload_size_allowed_by_peer(conn);
+        for (size_t i = 0; i < PTLS_ELEMENTSOF(conn->path_spaces); ++i)
+            if (conn->path_spaces[i] != NULL && conn->path_spaces[i]->max_udp_payload_size > max_allowed)
+                conn->path_spaces[i]->max_udp_payload_size = max_allowed;
+        return;
+    }
+
+    uint16_t max_allowed = pmtud_max_allowed(conn);
+    for (size_t i = 0; i < PTLS_ELEMENTSOF(conn->path_spaces); ++i) {
+        if (conn->path_spaces[i] != NULL) {
+            quicly_path_space_t *ps = conn->path_spaces[i];
+            if (ps->pmtud.current_mtu > max_allowed)
+                ps->pmtud.current_mtu = max_allowed;
+            if (ps->pmtud.lower_bound > max_allowed)
+                ps->pmtud.lower_bound = max_allowed;
+            if (ps->max_udp_payload_size > max_allowed)
+                ps->max_udp_payload_size = max_allowed;
+            ps->pmtud.upper_bound = max_allowed;
+        }
+    }
+}
+
+static void pmtud_raise_base_to_current_max(quicly_path_space_t *ps)
+{
+    if (ps->max_udp_payload_size > ps->pmtud.upper_bound)
+        ps->max_udp_payload_size = ps->pmtud.upper_bound;
+    if (ps->pmtud.current_mtu < ps->max_udp_payload_size)
+        ps->pmtud.current_mtu = ps->max_udp_payload_size;
+    if (ps->pmtud.lower_bound < ps->max_udp_payload_size)
+        ps->pmtud.lower_bound = ps->max_udp_payload_size;
+}
+
 static int client_collected_extensions(ptls_t *tls, ptls_handshake_properties_t *properties, ptls_raw_extension_t *slots)
 {
     quicly_conn_t *conn = (void *)((char *)properties - offsetof(quicly_conn_t, crypto.handshake_properties));
@@ -3666,6 +3762,7 @@ static int client_collected_extensions(ptls_t *tls, ptls_handshake_properties_t 
     /* store the results */
     conn->super.remote.transport_params = params;
     conn->super.remote.max_path_id = params.initial_max_path_id;
+    quicly_pmtud_on_remote_transport_params(conn);
     ack_frequency_set_next_update_at(conn);
 
 Exit:
@@ -3808,6 +3905,7 @@ static int server_collected_extensions(ptls_t *tls, ptls_handshake_properties_t 
             goto Exit;
         }
         conn->super.remote.max_path_id = conn->super.remote.transport_params.initial_max_path_id;
+        quicly_pmtud_on_remote_transport_params(conn);
     }
 
     /* setup ack frequency */
@@ -3824,6 +3922,8 @@ static int server_collected_extensions(ptls_t *tls, ptls_handshake_properties_t 
     }
     if (*get_max_udp_payload_size(conn, NULL) > conn->super.remote.transport_params.max_udp_payload_size)
         *get_max_udp_payload_size(conn, NULL) = conn->super.remote.transport_params.max_udp_payload_size;
+    if (conn->super.ctx->enable_ratio.enable_pmtud)
+        pmtud_raise_base_to_current_max(conn->path_spaces[0]);
 
     /* set transport_parameters extension to be sent in EE */
     assert(properties->additional_extensions == NULL);
@@ -4663,6 +4763,26 @@ int64_t quicly_get_first_timeout(quicly_conn_t *conn)
         }
     }
 
+    if (conn->super.ctx->enable_ratio.enable_pmtud && ptls_handshake_is_complete(conn->crypto.tls)) {
+        int has_non_backup = 0;
+        for (size_t i = 0; i < PTLS_ELEMENTSOF(conn->path_spaces); ++i) {
+            quicly_path_space_t *ps = conn->path_spaces[i];
+            if (ps != NULL && ps->addrs[0] != NULL && !ps->addrs[0]->abandoned && !ps->addrs[0]->probe_only &&
+                path_has_usable_dcid(ps->addrs[0]) && calc_amplification_limit_allowance(conn, ps->addrs[0]) != 0 && !ps->is_backup)
+                has_non_backup = 1;
+        }
+        for (size_t i = 0; i < PTLS_ELEMENTSOF(conn->path_spaces); ++i) {
+            quicly_path_space_t *ps = conn->path_spaces[i];
+            if (ps == NULL || ps->addrs[0] == NULL || ps->addrs[0]->abandoned || ps->addrs[0]->probe_only ||
+                !path_has_usable_dcid(ps->addrs[0]) || calc_amplification_limit_allowance(conn, ps->addrs[0]) == 0 ||
+                ps->addrs[0]->path_challenge.send_at != INT64_MAX || (has_non_backup && ps->is_backup) ||
+                ps->pmtud.probe_pn != UINT64_MAX)
+                continue;
+            if (ps->pmtud.next_search_at < at)
+                at = ps->pmtud.next_search_at;
+        }
+    }
+
     return at;
 }
 
@@ -4799,6 +4919,10 @@ struct st_quicly_send_context_t {
          * if the target datagram should be padded to full size
          */
         uint8_t full_size : 1;
+        /**
+         * when non-zero, the size to which a full-size datagram is padded instead of the path's current maximum
+         */
+        uint16_t full_size_value;
     } target;
     /**
      * output buffer into which list of datagrams is written
@@ -4874,9 +4998,10 @@ static quicly_error_t commit_send_packet(quicly_conn_t *conn, quicly_send_contex
         *s->dst++ = QUICLY_FRAME_TYPE_PADDING;
 
     if (!coalesced && s->target.full_size) {
-        assert(s->num_datagrams == 0 ||
-               s->datagrams[s->num_datagrams - 1].iov_len == *get_max_udp_payload_size(conn, get_send_path(conn, s)));
-        const size_t max_size = *get_max_udp_payload_size(conn, get_send_path(conn, s)) - QUICLY_AEAD_TAG_SIZE;
+        size_t full_size =
+            s->target.full_size_value != 0 ? s->target.full_size_value : *get_max_udp_payload_size(conn, get_send_path(conn, s));
+        assert(s->num_datagrams == 0 || s->datagrams[s->num_datagrams - 1].iov_len == full_size);
+        const size_t max_size = full_size - QUICLY_AEAD_TAG_SIZE;
         assert(s->dst - s->payload_buf.datagram <= max_size);
         memset(s->dst, QUICLY_FRAME_TYPE_PADDING, s->payload_buf.datagram + max_size - s->dst);
         s->dst = s->payload_buf.datagram + max_size;
@@ -5087,6 +5212,7 @@ static quicly_error_t do_allocate_frame(quicly_conn_t *conn, quicly_send_context
             return QUICLY_ERROR_SENDBUF_FULL;
         s->target.cipher = s->current.cipher;
         s->target.full_size = 0;
+        s->target.full_size_value = 0;
         s->dst = s->payload_buf.datagram;
         s->dst_end = s->dst + *get_max_udp_payload_size(conn, get_send_path(conn, s));
     }
@@ -5727,6 +5853,17 @@ static void on_loss_detected(quicly_loss_t *loss, const quicly_sent_packet_t *lo
 
     assert(lost_packet->cc_bytes_in_flight != 0);
 
+    int is_pmtud_probe = lost_packet->is_pmtud_probe;
+    if (is_pmtud_probe && ps != NULL && ps->pmtud.probe_pn != UINT64_MAX && lost_packet->packet_number == ps->pmtud.probe_pn) {
+        ps->pmtud.lost_probes++;
+        ps->pmtud.probe_pn = UINT64_MAX;
+        if (ps->pmtud.lost_probes >= 3) {
+            ps->pmtud.upper_bound = ps->pmtud.probe_size - 1;
+            ps->pmtud.lost_probes = 0;
+        }
+        ps->pmtud.next_search_at = conn->stash.now + 1000;
+    }
+
     ++conn->super.stats.num_packets.lost;
     if (ps->addrs[0] != NULL)
         ++ps->addrs[0]->num_packets.lost;
@@ -5738,7 +5875,8 @@ static void on_loss_detected(quicly_loss_t *loss, const quicly_sent_packet_t *lo
         PTLS_LOG_ELEMENT_UNSIGNED(pn, lost_packet->packet_number);
         PTLS_LOG_ELEMENT_UNSIGNED(packet_type, lost_packet->ack_epoch);
     });
-    notify_congestion_to_cc(conn, ps, lost_packet->cc_bytes_in_flight, lost_packet->packet_number);
+    if (!is_pmtud_probe)
+        notify_congestion_to_cc(conn, ps, lost_packet->cc_bytes_in_flight, lost_packet->packet_number);
     QUICLY_PROBE(QUICTRACE_CC_LOST, conn, conn->stash.now, &ps->loss.rtt, ps->cc.cwnd, ps->loss.sentmap.bytes_in_flight);
 }
 
@@ -6451,6 +6589,8 @@ static quicly_error_t send_path_challenge(quicly_conn_t *conn, quicly_send_conte
 
     s->dst = quicly_encode_path_challenge_frame(s->dst, is_response, data);
     s->target.full_size = 1; /* ensure that the path can transfer full-size packets */
+    if (conn->super.ctx->enable_ratio.enable_pmtud && get_send_path(conn, s)->path_challenge.send_at != INT64_MAX)
+        s->target.full_size_value = 1200;
 
     if (!is_response) {
         ++conn->super.stats.num_frames_sent.path_challenge;
@@ -6685,6 +6825,111 @@ static quicly_error_t send_other_control_frames(quicly_conn_t *conn, quicly_send
     return 0;
 }
 
+static quicly_error_t send_pmtud_probe(quicly_conn_t *conn, quicly_send_context_t *s)
+{
+    if (!conn->super.ctx->enable_ratio.enable_pmtud)
+        return 0;
+
+    quicly_path_space_t *ps = get_path_space_by_path(conn, get_send_path(conn, s));
+    if (ps == NULL)
+        return 0;
+
+    /* Only send a probe if no packet has been started in this call, to avoid GSO size mismatch and ensure that the probe is a
+     * standalone packet. The caller gives due probes priority over ordinary 1-RTT traffic. */
+    if (s->num_datagrams > 0 || s->target.first_byte_at != NULL || get_send_path(conn, s)->path_response.send_)
+        return 0;
+
+    /* don't send multiple probes in flight */
+    if (ps->pmtud.probe_pn != UINT64_MAX)
+        return 0;
+
+    /* don't send probes before handshake is complete or the path is validated */
+    if (!ptls_handshake_is_complete(conn->crypto.tls) || get_send_path(conn, s)->path_challenge.send_at != INT64_MAX)
+        return 0;
+
+    /* limit probing frequency. we can retry every 3 pto's if a probe is lost, or we can just send it if no probe is in flight */
+    if (conn->stash.now < ps->pmtud.next_search_at)
+        return 0;
+
+    if (ps->pmtud.state == QUICLY_PMTUD_STATE_SEARCH_COMPLETE) {
+        ps->pmtud.state = QUICLY_PMTUD_STATE_SEARCHING;
+        ps->pmtud.lower_bound = ps->pmtud.current_mtu;
+        ps->pmtud.upper_bound = pmtud_max_allowed(conn);
+        ps->pmtud.lost_probes = 0;
+    }
+
+    uint16_t next_probe_size = (ps->pmtud.lower_bound + ps->pmtud.upper_bound + 1) / 2;
+    if (ps->pmtud.upper_bound - ps->pmtud.lower_bound < 10) {
+        /* stop searching */
+        ps->pmtud.state = QUICLY_PMTUD_STATE_SEARCH_COMPLETE;
+        ps->pmtud.next_search_at = conn->stash.now + 600 * 1000; /* Search again in 600s */
+        return 0;
+    }
+
+    /* A probe consumes congestion and pacing windows. Defer without leaving an expired timer armed if there is not enough room for
+     * the complete probe. An ACK or another input event can cause an earlier retry. */
+    if (s->send_window < next_probe_size) {
+        ps->pmtud.next_search_at = conn->stash.now + 1000;
+        return 0;
+    }
+
+    /* We have a probe size! Let's temporarily override max_udp_payload_size and allocate a packet */
+    uint16_t orig_max = ps->max_udp_payload_size;
+    ps->max_udp_payload_size = next_probe_size;
+
+    quicly_error_t ret;
+
+    /* Allocate the probe packet */
+    if ((ret = do_allocate_frame(conn, s, 1, ALLOCATE_FRAME_TYPE_ACK_ELICITING)) != 0) {
+        ps->max_udp_payload_size = orig_max;
+        if (ret == QUICLY_ERROR_SENDBUF_FULL) {
+            ps->pmtud.next_search_at = conn->stash.now + 1000;
+            return 0;
+        }
+        return ret;
+    }
+
+    /* Add PING frame */
+    *s->dst++ = QUICLY_FRAME_TYPE_PING;
+    ++conn->super.stats.num_frames_sent.ping;
+    s->target.ack_eliciting = 1;
+    s->target.full_size = 1;
+
+    /* Remember next PN to be assigned to this probe */
+    uint64_t probe_pn = *get_next_packet_number(conn, get_send_path(conn, s));
+    assert(quicly_sentmap_is_open(&ps->loss.sentmap));
+    ps->loss.sentmap._pending_packet->data.packet.is_pmtud_probe = 1;
+
+    /* Commit the probe packet! */
+    if ((ret = commit_send_packet(conn, s, 0)) != 0) {
+        ps->max_udp_payload_size = orig_max;
+        return ret;
+    }
+
+    /* Record probe info */
+    ps->pmtud.probe_pn = probe_pn;
+    ps->pmtud.probe_size = next_probe_size;
+
+    /* Restore max_udp_payload_size to the current verified MTU! */
+    ps->max_udp_payload_size = orig_max;
+
+    return 0;
+}
+
+static int has_plpmtu_sized_inflight_packets(quicly_loss_t *loss, uint16_t plpmtu, uint64_t probe_pn)
+{
+    quicly_sentmap_iter_t iter;
+    const quicly_sent_packet_t *sent;
+
+    quicly_sentmap_init_iter(&loss->sentmap, &iter);
+    while ((sent = quicly_sentmap_get(&iter))->packet_number != UINT64_MAX) {
+        if (sent->packet_number != probe_pn && sent->cc_bytes_in_flight >= plpmtu)
+            return 1;
+        quicly_sentmap_skip(&iter);
+    }
+    return 0;
+}
+
 static quicly_error_t do_send(quicly_conn_t *conn, quicly_send_context_t *s)
 {
     int restrict_sending = 0, ack_only = 0;
@@ -6701,7 +6946,12 @@ static quicly_error_t do_send(quicly_conn_t *conn, quicly_send_context_t *s)
         assert(min_packets_to_send <= s->max_datagrams);
 
         if (restrict_sending) {
-
+            quicly_path_space_t *ps = get_path_space_by_path(conn, get_send_path(conn, s));
+            if (conn->super.ctx->enable_ratio.enable_pmtud && ps != NULL &&
+                get_loss(conn, get_send_path(conn, s))->pto_count >= 2 && ps->pmtud.current_mtu > 1200 &&
+                has_plpmtu_sized_inflight_packets(get_loss(conn, get_send_path(conn, s)), ps->pmtud.current_mtu,
+                                                  ps->pmtud.probe_pn))
+                reset_pmtud_search(conn, ps, 1200, conn->stash.now + 5000);
             /* PTO: when handshake is in progress, send from the very first unacknowledged byte so as to maximize the chance of
              * making progress. When handshake is complete, transmit new data if any, else retransmit the oldest unacknowledged data
              * that is considered inflight. */
@@ -6771,6 +7021,14 @@ static quicly_error_t do_send(quicly_conn_t *conn, quicly_send_context_t *s)
     /* setup 0-RTT or 1-RTT send context (as the availability of the two epochs are mutually exclusive, we can try 1-RTT first as an
      * optimization), then send application data if that succeeds */
     if (setup_send_space(conn, QUICLY_EPOCH_1RTT, s) != NULL || setup_send_space(conn, QUICLY_EPOCH_0RTT, s) != NULL) {
+        /* A due PMTUD probe must be emitted before ordinary traffic so that a continuously backlogged connection cannot starve the
+         * search. The probe commits itself as a standalone datagram, so stop building packets for this call when one is sent. */
+        if (conn->application->one_rtt_writable) {
+            if ((ret = send_pmtud_probe(conn, s)) != 0)
+                goto Exit;
+            if (s->num_datagrams != 0)
+                goto Exit;
+        }
         { /* path_challenge / response */
             struct st_quicly_conn_path_t *path = get_path(conn, s->path_index);
             assert(path != NULL);
@@ -6800,6 +7058,10 @@ static quicly_error_t do_send(quicly_conn_t *conn, quicly_send_context_t *s)
                 }
             }
         }
+        /* A validation packet constrained to QUIC's 1200-byte base must remain probe-only. In particular, do not let multipath
+         * stream or control frames grow the packet past the explicit padding target. */
+        if (s->target.full_size_value != 0)
+            goto Exit;
         /* non probing frames are sent only on path zero, unless multipath is negotiated */
         if (s->path_index == 0 || quicly_is_multipath(conn)) {
             /* acks */
@@ -6963,7 +7225,8 @@ Exit:
         if ((s->payload_buf.datagram[0] & QUICLY_PACKET_TYPE_BITMASK) == QUICLY_PACKET_TYPE_INITIAL &&
             (quicly_is_client(conn) || !ack_only))
             s->target.full_size = 1;
-        commit_send_packet(conn, s, 0);
+        if ((ret = commit_send_packet(conn, s, 0)) != 0)
+            goto Exit;
     }
     if (ret == 0) {
         /* update timers, cc and delivery rate estimator states */
@@ -7386,7 +7649,32 @@ quicly_error_t quicly_send(quicly_conn_t *conn, quicly_address_t *dest, quicly_a
                 break;
         }
     }
-    /* otherwise, emit non-probing packets */
+    /* PMTUD deadlines are path-specific and must take precedence over the application path scheduler. Otherwise, ordinary traffic
+     * on a preferred path can indefinitely starve a due probe on another active path. */
+    if (s.num_datagrams == 0 && conn->super.ctx->enable_ratio.enable_pmtud && ptls_handshake_is_complete(conn->crypto.tls)) {
+        int has_non_backup = 0;
+        for (size_t i = 0; i < PTLS_ELEMENTSOF(conn->path_spaces); ++i) {
+            quicly_path_space_t *ps = conn->path_spaces[i];
+            if (ps != NULL && ps->addrs[0] != NULL && !ps->addrs[0]->abandoned && !ps->addrs[0]->probe_only &&
+                path_has_usable_dcid(ps->addrs[0]) && calc_amplification_limit_allowance(conn, ps->addrs[0]) != 0 && !ps->is_backup)
+                has_non_backup = 1;
+        }
+        for (size_t i = 0; i < PTLS_ELEMENTSOF(conn->path_spaces); ++i) {
+            quicly_path_space_t *ps = conn->path_spaces[i];
+            if (ps == NULL || ps->addrs[0] == NULL || ps->addrs[0]->abandoned || ps->addrs[0]->probe_only ||
+                !path_has_usable_dcid(ps->addrs[0]) || calc_amplification_limit_allowance(conn, ps->addrs[0]) == 0 ||
+                ps->addrs[0]->path_challenge.send_at != INT64_MAX || (has_non_backup && ps->is_backup) ||
+                ps->pmtud.probe_pn != UINT64_MAX || ps->pmtud.next_search_at > conn->stash.now)
+                continue;
+            size_t packets_sent = 0;
+            if ((ret = quicly_send_on_path(conn, &s, i, &packets_sent)) != 0)
+                goto Exit;
+            if (packets_sent != 0)
+                break;
+        }
+    }
+    /* A send call returns datagrams for one path and one GSO segment size. If a path-validation or PMTUD probe was emitted above,
+     * return it by itself instead of appending scheduler-selected traffic that might use another path or datagram size. */
     if (s.num_datagrams == 0) {
         quicly_path_scheduler_t *sched =
             conn->super.ctx->path_scheduler != NULL ? conn->super.ctx->path_scheduler : &quicly_default_path_scheduler;
@@ -7812,6 +8100,14 @@ static quicly_error_t process_ack_frame_core(quicly_conn_t *conn, struct st_quic
 
             int is_valid_pn = ack_ps->pn_path_start <= pn_acked;
             if (is_valid_pn) {
+                if (ack_ps->pmtud.probe_pn != UINT64_MAX && pn_acked == ack_ps->pmtud.probe_pn) {
+                    ack_ps->pmtud.current_mtu = ack_ps->pmtud.probe_size;
+                    ack_ps->max_udp_payload_size = ack_ps->pmtud.probe_size;
+                    ack_ps->pmtud.lower_bound = ack_ps->pmtud.probe_size;
+                    ack_ps->pmtud.probe_pn = UINT64_MAX;
+                    ack_ps->pmtud.lost_probes = 0;
+                    ack_ps->pmtud.next_search_at = conn->stash.now + 1000;
+                }
                 if (largest_newly_acked.pn == UINT64_MAX || pn_acked > largest_newly_acked.pn) {
                     largest_newly_acked.pn = pn_acked;
                     largest_newly_acked.sent_at = sent->sent_at;
