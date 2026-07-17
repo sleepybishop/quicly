@@ -43,7 +43,7 @@ extern "C" {
  * - active_connection_id_limit transport parameter advertised to the remote peer
  * - maximum number of connection IDs we issue to the remote peer at a moment
  */
-#define QUICLY_LOCAL_ACTIVE_CONNECTION_ID_LIMIT 4
+#define QUICLY_LOCAL_ACTIVE_CONNECTION_ID_LIMIT 16
 #define QUICLY_MIN_ACTIVE_CONNECTION_ID_LIMIT 2
 #define QUICLY_DEFAULT_MAX_UDP_PAYLOAD_SIZE 65527
 #define QUICLY_MIN_CLIENT_INITIAL_SIZE 1200
