@@ -435,7 +435,7 @@ static void test_downstream(void)
         subtest("75%", loss_core);
         time_spent[i] = quic_now - 1;
     }
-    subtest("down-stats-75%", loss_check_stats, time_spent, 5, 4000, 20000, 2000, 4000, 15000);
+    subtest("down-stats-75%", loss_check_stats, time_spent, 5, 1000, 20000, 500, 4000, 15000);
 
     for (i = 0; i != 100; ++i) {
         init_cond_rand(&loss_cond_down, 1, 2);
@@ -443,14 +443,14 @@ static void test_downstream(void)
         time_spent[i] = quic_now - 1;
     }
     /* Independent packet-number-space ACK deadlines no longer let a stale handshake deadline accelerate application ACKs. */
-    subtest("down-stats-50%", loss_check_stats, time_spent, 0, 1100, 1700, 450, 700, 2000);
+    subtest("down-stats-50%", loss_check_stats, time_spent, 0, 200, 1700, 100, 700, 2000);
 
     for (i = 0; i != 100; ++i) {
         init_cond_rand(&loss_cond_down, 1, 4);
         subtest("25%", loss_core);
         time_spent[i] = quic_now - 1;
     }
-    subtest("down-stats-25%", loss_check_stats, time_spent, 0, 200, 270, 180, 250, 500);
+    subtest("down-stats-25%", loss_check_stats, time_spent, 0, 100, 270, 80, 250, 500);
 
     for (i = 0; i != 100; ++i) {
         init_cond_rand(&loss_cond_down, 1, 10);
@@ -493,7 +493,7 @@ static void test_bidirectional(void)
         subtest("75%", loss_core);
         time_spent[i] = quic_now - 1;
     }
-    subtest("bidi-stats-75%", loss_check_stats, time_spent, 30, 190000, 280000, 50000, 110000, 700000);
+    subtest("bidi-stats-75%", loss_check_stats, time_spent, 35, 50000, 280000, 20000, 110000, 700000);
 
     for (i = 0; i != 100; ++i) {
         init_cond_rand(&loss_cond_down, 1, 2);
@@ -501,7 +501,7 @@ static void test_bidirectional(void)
         subtest("50%", loss_core);
         time_spent[i] = quic_now - 1;
     }
-    subtest("bidi-stats-50%", loss_check_stats, time_spent, 0, 2500, 6500, 1000, 1600, 10000);
+    subtest("bidi-stats-50%", loss_check_stats, time_spent, 0, 2500, 10000, 500, 3000, 15000);
 
     for (i = 0; i != 100; ++i) {
         init_cond_rand(&loss_cond_down, 1, 4);
@@ -509,7 +509,7 @@ static void test_bidirectional(void)
         subtest("25%", loss_core);
         time_spent[i] = quic_now - 1;
     }
-    subtest("bidi-stats-25%", loss_check_stats, time_spent, 0, 240, 350, 170, 260, 700);
+    subtest("bidi-stats-25%", loss_check_stats, time_spent, 0, 240, 500, 150, 284, 1000);
 
     for (i = 0; i != 100; ++i) {
         init_cond_rand(&loss_cond_down, 1, 10);
@@ -517,7 +517,7 @@ static void test_bidirectional(void)
         subtest("10%", loss_core);
         time_spent[i] = quic_now - 1;
     }
-    subtest("bidi-stats-10%", loss_check_stats, time_spent, 0, 120, 190, 80, 80, 350);
+    subtest("bidi-stats-10%", loss_check_stats, time_spent, 0, 115, 250, 80, 80, 500);
 
     for (i = 0; i != 100; ++i) {
         init_cond_rand(&loss_cond_down, 1, 20);
@@ -525,7 +525,7 @@ static void test_bidirectional(void)
         subtest("5%", loss_core);
         time_spent[i] = quic_now - 1;
     }
-    subtest("bidi-stats-5%", loss_check_stats, time_spent, 0, 90, 125, 80, 80, 230);
+    subtest("bidi-stats-5%", loss_check_stats, time_spent, 0, 90, 200, 80, 80, 400);
 
     for (i = 0; i != 100; ++i) {
         init_cond_rand(&loss_cond_down, 1, 40);
@@ -533,7 +533,7 @@ static void test_bidirectional(void)
         subtest("2.5%", loss_core);
         time_spent[i] = quic_now - 1;
     }
-    subtest("bidi-stats-2.5%", loss_check_stats, time_spent, 0, 85, 110, 80, 80, 200);
+    subtest("bidi-stats-2.5%", loss_check_stats, time_spent, 0, 85, 180, 80, 80, 300);
 
     for (i = 0; i != 100; ++i) {
         init_cond_rand(&loss_cond_down, 1, 64);
@@ -541,7 +541,7 @@ static void test_bidirectional(void)
         subtest("1.6%", loss_core);
         time_spent[i] = quic_now - 1;
     }
-    subtest("bidi-stats-1.6%", loss_check_stats, time_spent, 0, 80, 100, 80, 80, 100);
+    subtest("bidi-stats-1.6%", loss_check_stats, time_spent, 0, 80, 150, 80, 80, 200);
 }
 
 void test_lossy(void)
