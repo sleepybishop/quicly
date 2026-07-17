@@ -3926,10 +3926,95 @@ static void test_amplification_blocked_handshake_timeout(void)
     quic_ctx.handshake_timeout_rtt_multiplier = orig_handshake_timeout_rtt_multiplier;
 }
 
+static void test_implicit_migration_during_handshake(void)
+{
+    quicly_conn_t *client, *server;
+    const struct sockaddr_in serveraddr = {.sin_family = AF_INET, .sin_addr.s_addr = htonl(0x7f000001), .sin_port = htons(12345)},
+                             clientaddr1 = {.sin_family = AF_INET, .sin_addr.s_addr = htonl(0x7f000002), .sin_port = htons(12345)},
+                             clientaddr2 = {.sin_family = AF_INET, .sin_addr.s_addr = htonl(0x7f000003), .sin_port = htons(12345)};
+    quicly_address_t destaddr, srcaddr;
+    struct iovec datagrams[10];
+    uint8_t buf[quic_ctx.transport_params.max_udp_payload_size * 10];
+    quicly_decoded_packet_t packets[40];
+    size_t num_datagrams, num_packets;
+    quicly_error_t ret;
+
+    /* enable implicit migration */
+    unsigned orig_disable_src_ip_checks = quic_ctx.disable_src_ip_checks;
+    quic_ctx.disable_src_ip_checks = 1;
+
+    /* client sends first flight */
+    ret = quicly_connect(&client, &quic_ctx, "example.com", (void *)&serveraddr, NULL, new_master_id(), ptls_iovec_init(NULL, 0),
+                         NULL, NULL, NULL);
+    ok(ret == 0);
+    num_datagrams = 10;
+    ret = quicly_send(client, &destaddr, &srcaddr, datagrams, &num_datagrams, buf, sizeof(buf));
+    ok(ret == 0);
+    ok(num_datagrams > 0);
+
+    /* server accepts and responds */
+    num_packets = decode_packets(packets, datagrams, num_datagrams);
+    ok(num_packets == 1);
+    ret = quicly_accept(&server, &quic_ctx, &destaddr.sa, (void *)&clientaddr1, packets, NULL, new_master_id(), NULL, NULL);
+    ok(ret == 0);
+    num_datagrams = 10;
+    ret = quicly_send(server, &destaddr, &srcaddr, datagrams, &num_datagrams, buf, sizeof(buf));
+    ok(ret == 0);
+    ok(num_datagrams > 0);
+
+    /* client receives server flight */
+    num_packets = decode_packets(packets, datagrams, num_datagrams);
+    for (size_t i = 0; i < num_packets; ++i) {
+        ret = quicly_receive(client, &destaddr.sa, &srcaddr.sa, &packets[i]);
+        ok(ret == 0);
+    }
+
+    /* client sends next flight (Handshake/Finished), but we pretend it's sent from clientaddr2.
+     * we do this by generating the client datagrams, and passing them to server with src_addr = clientaddr2. */
+    num_datagrams = 10;
+    ret = quicly_send(client, &destaddr, &srcaddr, datagrams, &num_datagrams, buf, sizeof(buf));
+    ok(ret == 0);
+    ok(num_datagrams > 0);
+
+    num_packets = decode_packets(packets, datagrams, num_datagrams);
+    for (size_t i = 0; i < num_packets; ++i) {
+        /* Address-based routing rejects the changed peer by default; mesh routing still requires our CID. */
+        quic_ctx.disable_src_ip_checks = 0;
+        ok(!quicly_is_destination(server, (void *)&serveraddr, (void *)&clientaddr2, &packets[i]));
+        quic_ctx.disable_src_ip_checks = 1;
+        ok(quicly_is_destination(server, (void *)&serveraddr, (void *)&clientaddr2, &packets[i]));
+
+        /* A changed address must not take effect until the packet authenticates. */
+        uint8_t corrupted[packets[i].octets.len];
+        memcpy(corrupted, packets[i].octets.base, sizeof(corrupted));
+        corrupted[sizeof(corrupted) - 1] ^= 1;
+        quicly_decoded_packet_t invalid;
+        size_t off = 0;
+        ok(quicly_decode_packet(&quic_ctx, &invalid, corrupted, sizeof(corrupted), &off) == sizeof(corrupted));
+        quicly_address_t remote_before = get_path(server, 0)->address.remote;
+        ret = quicly_receive(server, (void *)&serveraddr, (void *)&clientaddr2, &invalid);
+        ok(ret == QUICLY_ERROR_PACKET_IGNORED);
+        ok(compare_socket_address(&get_path(server, 0)->address.remote.sa, &remote_before.sa) == 0);
+
+        /* server receives packets, but from clientaddr2 */
+        ret = quicly_receive(server, (void *)&serveraddr, (void *)&clientaddr2, &packets[i]);
+        ok(ret == 0); /* should be accepted successfully! */
+    }
+
+    /* check that server's remote address is indeed updated to clientaddr2 */
+    ok(compare_socket_address(&get_path(server, 0)->address.remote.sa, (void *)&clientaddr2) == 0);
+
+    /* clean up and disable the setting */
+    quic_ctx.disable_src_ip_checks = orig_disable_src_ip_checks;
+    quicly_free(client);
+    quicly_free(server);
+}
+
 static void test_migration_during_handshake(void)
 {
     subtest("migrate-before-2nd", do_test_migration_during_handshake, 0);
     subtest("migrate-before-3nd", do_test_migration_during_handshake, 1);
+    subtest("implicit-migration", test_implicit_migration_during_handshake);
 }
 
 static size_t test_stats_foreach_next_off;

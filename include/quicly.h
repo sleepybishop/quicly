@@ -483,6 +483,10 @@ struct st_quicly_context_t {
      */
     unsigned expand_client_hello : 1;
     /**
+     * disable source/destination IP checks during handshake for mesh bootstrap (implicit migration)
+     */
+    unsigned disable_src_ip_checks : 1;
+    /**
      * probability of using each alternative egress context, multiplied by 255; `alt_egress_ratio[i]` is the probability of using
      * `egress[i + 1]`. The sum must not exceed 255; the remainder is the probability of using `egress[0]`. All zero (default)
      * means `egress[0]` is always used.

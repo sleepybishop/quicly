@@ -92,6 +92,8 @@
 #define QUICLY_MAX_PATH_ADDRESSES QUICLY_LOCAL_ACTIVE_CONNECTION_ID_LIMIT
 #define QUICLY_MAX_PATH_INDICES (QUICLY_MAX_PATH_SPACES * QUICLY_MAX_PATH_ADDRESSES)
 
+/* if set, source/destination IP checks during handshake are bypassed and implicit migration is performed on successful decryption */
+#define QUICLY_DISABLE_SRC_IP_CHECKS (conn->super.ctx->disable_src_ip_checks)
 KHASH_MAP_INIT_INT64(quicly_stream_t, quicly_stream_t *)
 
 #if QUICLY_USE_TRACER
@@ -10325,7 +10327,7 @@ int quicly_is_destination(quicly_conn_t *conn, struct sockaddr *dest_addr, struc
 {
     if (QUICLY_PACKET_IS_LONG_HEADER(decoded->octets.base[0])) {
         /* long header: validate address, then consult the CID */
-        if (!quicly_is_multipath(conn)) {
+        if (!QUICLY_DISABLE_SRC_IP_CHECKS && !quicly_is_multipath(conn)) {
             if (compare_socket_address(&get_path(conn, 0)->address.remote.sa, src_addr) != 0)
                 return 0;
             if (get_path(conn, 0)->address.local.sa.sa_family != AF_UNSPEC &&
@@ -10337,6 +10339,21 @@ int quicly_is_destination(quicly_conn_t *conn, struct sockaddr *dest_addr, struc
             const quicly_cid_t *odcid = is_retry(conn) ? &conn->retry_scid : &conn->super.original_dcid;
             if (quicly_cid_is_equal(odcid, decoded->cid.dest.encrypted))
                 goto Found;
+        }
+    }
+
+    if (QUICLY_DISABLE_SRC_IP_CHECKS) {
+        /* check if the packet targets one of our local CIDs */
+        for (size_t p = 0; p < PTLS_ELEMENTSOF(conn->path_spaces); ++p) {
+            quicly_path_space_t *ps = conn->path_spaces[p];
+            if (ps != NULL) {
+                for (size_t i = 0; i < ps->local_cid_set._size; ++i) {
+                    if (ps->local_cid_set.cids[i].state != QUICLY_LOCAL_CID_STATE_IDLE &&
+                        quicly_cid_is_equal(&ps->local_cid_set.cids[i].cid, decoded->cid.dest.encrypted)) {
+                        goto Found;
+                    }
+                }
+            }
         }
     }
 
@@ -11287,13 +11304,13 @@ static quicly_error_t do_receive(quicly_conn_t *conn, struct sockaddr *dest_addr
      * socket option being used */
     if (!quicly_is_multipath(conn)) {
         if (quicly_is_client(conn)) {
-            if (compare_socket_address(src_addr, &get_path(conn, 0)->address.remote.sa) != 0) {
+            if (!QUICLY_DISABLE_SRC_IP_CHECKS && compare_socket_address(src_addr, &get_path(conn, 0)->address.remote.sa) != 0) {
                 ret = QUICLY_ERROR_PACKET_IGNORED;
                 goto Exit;
             }
         } else if (dest_addr != NULL && dest_addr->sa_family != AF_UNSPEC) {
             assert(get_path(conn, 0)->address.local.sa.sa_family != AF_UNSPEC);
-            if (compare_socket_address(dest_addr, &get_path(conn, 0)->address.local.sa) != 0) {
+            if (!QUICLY_DISABLE_SRC_IP_CHECKS && compare_socket_address(dest_addr, &get_path(conn, 0)->address.local.sa) != 0) {
                 ret = QUICLY_ERROR_PACKET_IGNORED;
                 goto Exit;
             }
@@ -11316,6 +11333,9 @@ static quicly_error_t do_receive(quicly_conn_t *conn, struct sockaddr *dest_addr
         if (candidate != NULL && (!use_cid_path_id || candidate->path_id == cid_path_id) &&
             path_matches_address(candidate, src_addr, dest_addr))
             break;
+    }
+    if (QUICLY_DISABLE_SRC_IP_CHECKS && !quicly_is_multipath(conn)) {
+        path_index = 0;
     }
     if (path_index != 0 && !quicly_is_client(conn) &&
         (QUICLY_PACKET_IS_LONG_HEADER(packet->octets.base[0]) || !conn->super.remote.address_validation.validated)) {
@@ -11533,6 +11553,17 @@ static quicly_error_t do_receive(quicly_conn_t *conn, struct sockaddr *dest_addr
     }
     if ((*space)->next_expected_packet_number <= pn)
         (*space)->next_expected_packet_number = pn + 1;
+
+    if (QUICLY_DISABLE_SRC_IP_CHECKS && !quicly_is_multipath(conn)) {
+        struct st_quicly_conn_path_t *path = get_path(conn, 0);
+        if (compare_socket_address(src_addr, &path->address.remote.sa) != 0) {
+            set_address(&path->address.remote, src_addr);
+        }
+        if (dest_addr != NULL && dest_addr->sa_family != AF_UNSPEC &&
+            compare_socket_address(dest_addr, &path->address.local.sa) != 0) {
+            set_address(&path->address.local, dest_addr);
+        }
+    }
 
     QUICLY_PROBE(PACKET_RECEIVED, conn, conn->stash.now, pn, payload.base, payload.len, get_epoch(packet->octets.base[0]));
     QUICLY_LOG_CONN(packet_received, conn, {
