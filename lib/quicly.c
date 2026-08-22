@@ -612,6 +612,8 @@ struct st_quicly_conn_t {
     struct {
         /* version used by the first connection attempt */
         uint32_t original;
+        /* aggregate Initial / Handshake packet count at the start of the current conceptual connection */
+        uint64_t handshake_packets_sent_at_start;
         /* true after acting on an incompatible Version Negotiation packet */
         uint8_t received : 1;
     } version_negotiation;
@@ -2203,10 +2205,15 @@ static int version_information_contains(const quicly_version_information_t *vi, 
     return 0;
 }
 
-static uint32_t select_version_from_server_information(const quicly_version_information_t *vi, uint32_t negotiated_version)
+static uint32_t select_version_from_server_information(quicly_conn_t *conn, const quicly_version_information_t *vi,
+                                                       uint32_t negotiated_version)
 {
-    for (const uint32_t *v = quicly_supported_versions; *v != 0; ++v)
-        if (*v == negotiated_version || version_information_contains(vi, *v))
+    const uint32_t *preference = conn->super.ctx->client_version_preference;
+
+    if (preference == NULL)
+        return 0;
+    for (const uint32_t *v = preference; *v != 0; ++v)
+        if (quicly_is_supported_version(*v) && (*v == negotiated_version || version_information_contains(vi, *v)))
             return *v;
     return 0;
 }
@@ -2258,7 +2265,7 @@ static quicly_error_t apply_remote_transport_params(quicly_conn_t *conn)
      * equality check above also proves that the server selected a version offered by the client. */
     if (conn->version_negotiation.received) {
         if (vi->num_available_versions == 0 ||
-            select_version_from_server_information(vi, conn->super.version) != conn->super.version)
+            select_version_from_server_information(conn, vi, conn->super.version) != conn->super.version)
             return QUICLY_TRANSPORT_ERROR_VERSION_NEGOTIATION_ERROR;
     }
 
@@ -3233,7 +3240,8 @@ static quicly_error_t apply_stream_frame(quicly_stream_t *stream, quicly_stream_
     return 0;
 }
 
-static void set_version_information(quicly_transport_parameters_t *params, uint32_t version, int is_server)
+static int set_version_information(quicly_transport_parameters_t *params, uint32_t version, int is_server,
+                                   const uint32_t *available_versions)
 {
     quicly_version_information_t *vi = &params->version_information;
     size_t count = 0;
@@ -3241,8 +3249,12 @@ static void set_version_information(quicly_transport_parameters_t *params, uint3
     *vi = (quicly_version_information_t){0};
     vi->chosen_version = version;
     if (is_server) {
-        for (const uint32_t *v = quicly_supported_versions; *v != 0; ++v) {
-            assert(count + 1 < PTLS_ELEMENTSOF(vi->available_versions));
+        /* An empty Fully Deployed Versions list is valid while versions are being removed from a deployment. */
+        if (available_versions == NULL)
+            return 0;
+        for (const uint32_t *v = available_versions; *v != 0; ++v) {
+            if (!quicly_is_supported_version(*v) || count + 1 >= PTLS_ELEMENTSOF(vi->available_versions))
+                return PTLS_ERROR_LIBRARY;
             vi->available_versions[count++] = *v;
         }
     } else {
@@ -3251,6 +3263,7 @@ static void set_version_information(quicly_transport_parameters_t *params, uint3
         vi->available_versions[count++] = version;
     }
     vi->num_available_versions = count;
+    return 0;
 }
 
 int quicly_encode_transport_parameter_list(ptls_buffer_t *buf, const quicly_transport_parameters_t *params,
@@ -3572,7 +3585,10 @@ quicly_error_t quicly_decode_transport_parameter_list(quicly_transport_parameter
                             if (params->version_information.available_versions[j] == v)
                                 break;
                         if (j == i) {
-                            assert(i + 1 < PTLS_ELEMENTSOF(params->version_information.available_versions));
+                            if (i + 1 >= PTLS_ELEMENTSOF(params->version_information.available_versions)) {
+                                ret = QUICLY_TRANSPORT_ERROR_TRANSPORT_PARAMETER;
+                                goto Exit;
+                            }
                             params->version_information.available_versions[i++] = v;
                         }
                     }
@@ -3958,7 +3974,8 @@ quicly_error_t quicly_connect(quicly_conn_t **_conn, quicly_context_t *ctx, cons
     /* handshake (we always encode authentication CIDs, as we do not (yet) regenerate ClientHello when receiving Retry) */
     ptls_buffer_init(&conn->crypto.transport_params.buf, "", 0);
     quicly_transport_parameters_t local_transport_params = conn->super.ctx->transport_params;
-    set_version_information(&local_transport_params, conn->super.version, 0);
+    if ((ret = set_version_information(&local_transport_params, conn->super.version, 0, NULL)) != 0)
+        goto Exit;
     if ((ret = quicly_encode_transport_parameter_list(
              &conn->crypto.transport_params.buf, &local_transport_params, NULL,
              &conn->path_spaces[0]->local_cid_set.cids[0].cid, NULL, NULL,
@@ -4064,7 +4081,9 @@ static int server_collected_extensions(ptls_t *tls, ptls_handshake_properties_t 
     ptls_buffer_init(&conn->crypto.transport_params.buf, "", 0);
     quicly_path_space_t *ps = conn->path_spaces[0];
     quicly_transport_parameters_t local_transport_params = conn->super.ctx->transport_params;
-    set_version_information(&local_transport_params, conn->super.version, 1);
+    if ((ret = set_version_information(&local_transport_params, conn->super.version, 1,
+                                       conn->super.ctx->server_fully_deployed_versions)) != 0)
+        goto Exit;
     assert(ps->local_cid_set.cids[0].sequence == 0 && "make sure that local_cid is in expected state before sending SRT");
     if ((ret = quicly_encode_transport_parameter_list(
              &conn->crypto.transport_params.buf, &local_transport_params,
@@ -7084,7 +7103,6 @@ static quicly_error_t do_send(quicly_conn_t *conn, quicly_send_context_t *s)
     size_t min_packets_to_send = 0, orig_bytes_inflight = 0;
     quicly_error_t ret = 0;
 
-
     if (get_loss(conn, get_send_path(conn, s))->alarm_at <= conn->stash.now) {
         if ((ret = quicly_loss_on_alarm(
                  get_loss(conn, get_send_path(conn, s)), conn->stash.now, conn->super.remote.transport_params.max_ack_delay,
@@ -7684,6 +7702,8 @@ quicly_error_t quicly_send(quicly_conn_t *conn, quicly_address_t *dest, quicly_a
         goto CloseNow;
     }
     uint64_t initial_handshake_sent = conn->super.stats.num_packets.initial_sent + conn->super.stats.num_packets.handshake_sent;
+    assert(initial_handshake_sent >= conn->version_negotiation.handshake_packets_sent_at_start);
+    initial_handshake_sent -= conn->version_negotiation.handshake_packets_sent_at_start;
     if (initial_handshake_sent > conn->super.ctx->max_initial_handshake_packets) {
         QUICLY_PROBE(INITIAL_HANDSHAKE_PACKET_EXCEED, conn, conn->stash.now, initial_handshake_sent);
         QUICLY_LOG_CONN(initial_handshake_packet_exceed, conn, { PTLS_LOG_ELEMENT_UNSIGNED(num_packets, initial_handshake_sent); });
@@ -8686,10 +8706,42 @@ static quicly_error_t restart_client_handshake(quicly_conn_t *conn, uint32_t ver
     conn->delayed_packets.num_packets = 0;
     conn->delayed_packets.slots_newly_processible = 0;
 
-    /* Incompatible negotiation is conceptually a new connection, including fresh packet number spaces. */
+    /* Incompatible negotiation is conceptually a new connection. Reset every transport limit whose history can affect whether or
+     * when the replacement first flight is sent, while retaining aggregate statistics for observability. */
+    conn->created_at = conn->stash.now;
+    conn->version_negotiation.handshake_packets_sent_at_start =
+        conn->super.stats.num_packets.initial_sent + conn->super.stats.num_packets.handshake_sent;
+    conn->super.stats.handshake_confirmed_msec = UINT64_MAX;
     conn->path_spaces[0]->packet_number = 0;
     conn->path_spaces[0]->next_pn_to_skip = 0;
     conn->path_spaces[0]->pn_path_start = 0;
+    conn->path_spaces[0]->last_retransmittable_sent_at = 0;
+    conn->egress.ack_frequency.update_at = INT64_MAX;
+    conn->egress.ack_frequency.sequence = 0;
+    conn->egress.send_ack_at = INT64_MAX;
+    conn->egress.send_probe_at = INT64_MAX;
+
+    conn->super.version = version;
+    conn->super.remote.transport_params = default_transport_params;
+
+    quicly_loss_dispose(&conn->path_spaces[0]->loss);
+    quicly_loss_init(&conn->path_spaces[0]->loss, &conn->super.ctx->loss, conn->super.ctx->loss.default_initial_rtt,
+                     &conn->super.remote.transport_params.max_ack_delay, &conn->super.remote.transport_params.ack_delay_exponent);
+    conn->super.ctx->init_cc->cb(conn->super.ctx->init_cc, &conn->path_spaces[0]->cc,
+                                 quicly_cc_calc_initial_cwnd(conn->super.ctx->initcwnd_packets,
+                                                             conn->path_spaces[0]->max_udp_payload_size),
+                                 conn->stash.now);
+    conn->path_spaces[0]->cc.conn = conn;
+    if (conn->super.stats.num_rapid_start != 0 && conn->path_spaces[0]->cc.type->enable_rapid_start != NULL)
+        conn->path_spaces[0]->cc.type->enable_rapid_start(&conn->path_spaces[0]->cc, conn->stash.now);
+    if (conn->path_spaces[0]->pacer != NULL)
+        quicly_pacer_reset(conn->path_spaces[0]->pacer);
+    memset(conn->egress.ecn.counts, 0, sizeof(conn->egress.ecn.counts));
+    conn->egress.ecn.state = enable_with_ratio255(conn->super.ctx->enable_ratio.ecn, conn->super.ctx->tls->random_bytes)
+                                 ? QUICLY_ECN_PROBING
+                                 : QUICLY_ECN_OFF;
+    quicly_ratemeter_init(&conn->path_spaces[0]->ratemeter);
+    conn->path_spaces[0]->try_jumpstart = 1;
 
     ptls_free(conn->crypto.tls);
     conn->crypto.tls = new_tls;
@@ -8701,8 +8753,6 @@ static quicly_error_t restart_client_handshake(quicly_conn_t *conn, uint32_t ver
     conn->crypto.handshake_properties.collect_extension = collect_transport_parameters;
     conn->crypto.handshake_properties.collected_extensions = client_collected_extensions;
 
-    conn->super.version = version;
-    conn->super.remote.transport_params = default_transport_params;
     conn->egress.max_data.permitted = 0;
     conn->egress.max_data.sent = 0;
     conn->egress.data_blocked = QUICLY_SENDER_STATE_NONE;
@@ -8745,7 +8795,8 @@ static quicly_error_t restart_client_handshake(quicly_conn_t *conn, uint32_t ver
     ptls_buffer_dispose(&conn->crypto.transport_params.buf);
     ptls_buffer_init(&conn->crypto.transport_params.buf, "", 0);
     quicly_transport_parameters_t local_transport_params = conn->super.ctx->transport_params;
-    set_version_information(&local_transport_params, version, 0);
+    if ((ret = set_version_information(&local_transport_params, version, 0, NULL)) != 0)
+        goto Exit;
     if ((ret = quicly_encode_transport_parameter_list(
              &conn->crypto.transport_params.buf, &local_transport_params, NULL, &conn->path_spaces[0]->local_cid_set.cids[0].cid, NULL, NULL,
              conn->super.ctx->expand_client_hello ? conn->super.ctx->initial_egress_max_udp_payload_size : 0)) != 0)
@@ -8763,6 +8814,7 @@ static quicly_error_t restart_client_handshake(quicly_conn_t *conn, uint32_t ver
         goto ExitTLSBuf;
     if ((ret = write_crypto_data(conn, &tlsbuf, epoch_offsets)) != 0)
         goto ExitTLSBuf;
+    setup_next_send(conn);
     ret = 0;
 
 ExitTLSBuf:
@@ -8781,12 +8833,21 @@ static quicly_error_t negotiate_using_version(quicly_conn_t *conn, uint32_t vers
     return restart_client_handshake(conn, version);
 }
 
+static int encoded_version_list_contains(const uint8_t *src, const uint8_t *end, uint32_t version)
+{
+    while (src != end)
+        if (quicly_decode32(&src) == version)
+            return 1;
+    return 0;
+}
+
 static quicly_error_t handle_version_negotiation_packet(quicly_conn_t *conn, quicly_decoded_packet_t *packet)
 {
     const uint8_t *src = packet->octets.base + packet->encrypted_off, *end = packet->octets.base + packet->octets.len;
     uint32_t selected_version = 0;
 
-    if (!quicly_is_client(conn) || conn->version_negotiation.received)
+    /* Retry is another successfully processed server packet, after which RFC 9000 requires the client to ignore VN. */
+    if (!quicly_is_client(conn) || conn->version_negotiation.received || is_retry(conn))
         return QUICLY_ERROR_PACKET_IGNORED;
     if (!quicly_cid_is_equal(&conn->super.local.long_header_src_cid, packet->cid.dest.encrypted) ||
         !quicly_cid_is_equal(&conn->super.remote.cid_set.cids[0].cid, packet->cid.src))
@@ -8794,23 +8855,20 @@ static quicly_error_t handle_version_negotiation_packet(quicly_conn_t *conn, qui
     if (src == end || (end - src) % 4 != 0)
         return QUICLY_ERROR_PACKET_IGNORED;
 
-    /* select in the precedence of V1 -> draft29 -> draft27 -> fail */
-    while (src != end) {
-        uint32_t supported_version = quicly_decode32(&src);
-        if (supported_version == conn->version_negotiation.original)
+    /* The Original Version authenticates the VN packet by causing it to be ignored. */
+    for (const uint8_t *p = src; p != end;) {
+        if (quicly_decode32(&p) == conn->version_negotiation.original)
             return QUICLY_ERROR_PACKET_IGNORED;
-        switch (supported_version) {
-        case QUICLY_PROTOCOL_VERSION_1:
-            selected_version = QUICLY_PROTOCOL_VERSION_1;
-            break;
-        case QUICLY_PROTOCOL_VERSION_DRAFT29:
-            if (selected_version == 0 || selected_version == QUICLY_PROTOCOL_VERSION_DRAFT27)
-                selected_version = QUICLY_PROTOCOL_VERSION_DRAFT29;
-            break;
-        case QUICLY_PROTOCOL_VERSION_DRAFT27:
-            if (selected_version == 0)
-                selected_version = QUICLY_PROTOCOL_VERSION_DRAFT27;
-            break;
+    }
+
+    /* Use application policy, rather than transport support alone, because the replacement connection restarts ALPN and every
+     * selected version must be valid for the protocols being offered. */
+    if (conn->super.ctx->client_version_preference != NULL) {
+        for (const uint32_t *v = conn->super.ctx->client_version_preference; *v != 0; ++v) {
+            if (quicly_is_supported_version(*v) && encoded_version_list_contains(src, end, *v)) {
+                selected_version = *v;
+                break;
+            }
         }
     }
     if (selected_version == 0)
@@ -10762,6 +10820,7 @@ void quicly__debug_printf(quicly_conn_t *conn, const char *function, int line, c
 
 const uint32_t quicly_supported_versions[] = {QUICLY_PROTOCOL_VERSION_1, QUICLY_PROTOCOL_VERSION_DRAFT29,
                                               QUICLY_PROTOCOL_VERSION_DRAFT27, 0};
+const uint32_t quicly_default_version_preference[] = {QUICLY_PROTOCOL_VERSION_1, 0};
 
 int quicly_get_path_tuple(quicly_conn_t *conn, size_t path_index, quicly_tuple_t *tuple)
 {

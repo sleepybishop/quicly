@@ -349,6 +349,17 @@ struct st_quicly_context_t {
      */
     uint32_t initial_version;
     /**
+     * (client-only) zero-terminated list of versions that may be selected after receiving an incompatible Version Negotiation
+     * packet, in descending preference order. Applications MUST limit this list to versions that can carry the application
+     * protocols offered by the connection. NULL disables incompatible version selection.
+     */
+    const uint32_t *client_version_preference;
+    /**
+     * (server-only) zero-terminated list of Fully Deployed Versions advertised in Version Information. This is deployment policy,
+     * and therefore can be narrower than `quicly_supported_versions` during a staged rollout. NULL advertises an empty list.
+     */
+    const uint32_t *server_fully_deployed_versions;
+    /**
      * (server-only) amplification limit before the peer address is validated
      */
     uint16_t pre_validation_amplification_limit;
@@ -1224,6 +1235,10 @@ struct st_quicly_address_token_plaintext_t {
  * zero-terminated list of protocol versions being supported by quicly
  */
 extern const uint32_t quicly_supported_versions[];
+/**
+ * conservative default version policy; contains QUIC v1 only
+ */
+extern const uint32_t quicly_default_version_preference[];
 /**
  * returns a boolean indicating if given protocol version is supported
  */
