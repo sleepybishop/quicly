@@ -48,6 +48,10 @@ SET(PICOTLS_OPENSSL_FILES
 
 SET(QUICLY_LIBRARY_FILES
     lib/frame.c
+    lib/flexicast.c
+    lib/flexicast_cc.c
+    lib/flexicast_cc_multicast.c
+    lib/flexicast_cc_adaptive.c
     lib/cc-reno.c
     lib/cc-cubic.c
     lib/cc-pico.c
@@ -67,6 +71,7 @@ SET(QUICLY_LIBRARY_FILES
 SET(UNITTEST_SOURCE_FILES
     deps/picotest/picotest.c
     t/cc.c
+    t/flexicast.c
     t/frame.c
     t/jumpstart.c
     t/local_cid.c
@@ -118,6 +123,9 @@ TARGET_LINK_LIBRARIES(cli ${OPENSSL_CRYPTO_LIBRARIES} ${CMAKE_DL_LIBS} m)
 ADD_EXECUTABLE(test.t ${PICOTLS_OPENSSL_FILES} ${UNITTEST_SOURCE_FILES})
 TARGET_LINK_LIBRARIES(test.t quicly ${OPENSSL_CRYPTO_LIBRARIES} ${CMAKE_DL_LIBS})
 
+ADD_EXECUTABLE(flexicast-test.t ${PICOTLS_OPENSSL_FILES} deps/picotest/picotest.c t/flexicast.c t/flexicast-main.c)
+TARGET_LINK_LIBRARIES(flexicast-test.t quicly ${OPENSSL_CRYPTO_LIBRARIES} ${CMAKE_DL_LIBS})
+
 ADD_EXECUTABLE(simulator ${PICOTLS_OPENSSL_FILES} ${QUICLY_LIBRARY_FILES} t/simulator.c)
 TARGET_LINK_LIBRARIES(simulator ${OPENSSL_CRYPTO_LIBRARIES} ${CMAKE_DL_LIBS} m)
 
@@ -133,7 +141,7 @@ ADD_CUSTOM_TARGET(check
          WITH_DTRACE=${WITH_DTRACE} \
          exec prove --exec 'sh -c' -v ${CMAKE_CURRENT_BINARY_DIR}/*.t t/*.t"
     WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}
-    DEPENDS cli udpfw test.t
+    DEPENDS cli udpfw test.t flexicast-test.t
     VERBATIM)
 
 ADD_CUSTOM_TARGET(format clang-format -i `git ls-files include lib src t | egrep '\\.[ch]$$'`)
