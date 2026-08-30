@@ -482,6 +482,70 @@ static void test_transport_parameters(void)
         ok(decoded.initial_max_path_id == 0);
     }
 
+    { /* Flexicast address-family support is layered on MPQUIC. */
+        static const uint8_t flexicast[] = {
+            QUICLY_TRANSPORT_PARAMETER_ID_INITIAL_MAX_PATH_ID, 1, 0, 0x80, 0x00, 0xed, 0xf3, 2, 1, 1};
+        memset(&decoded, 0x55, sizeof(decoded));
+        ok(quicly_decode_transport_parameter_list(&decoded, NULL, NULL, NULL, NULL, flexicast, flexicast + sizeof(flexicast)) == 0);
+        ok(decoded.enable_multipath);
+        ok(decoded.flexicast_support.ipv4);
+        ok(decoded.flexicast_support.ipv6);
+    }
+
+    { /* Flexicast is ignored without MPQUIC; malformed values and duplicates are invalid. */
+        static const uint8_t without_multipath[] = {0x80, 0x00, 0xed, 0xf3, 2, 1, 1};
+        static const uint8_t nonempty[] = {QUICLY_TRANSPORT_PARAMETER_ID_INITIAL_MAX_PATH_ID, 1, 0, 0x80, 0x00, 0xed, 0xf3, 1, 1};
+        static const uint8_t duplicate[] = {QUICLY_TRANSPORT_PARAMETER_ID_INITIAL_MAX_PATH_ID,
+                                            1,
+                                            0,
+                                            0x80,
+                                            0x00,
+                                            0xed,
+                                            0xf3,
+                                            2,
+                                            1,
+                                            0,
+                                            0x80,
+                                            0x00,
+                                            0xed,
+                                            0xf3,
+                                            2,
+                                            1,
+                                            0};
+        ok(quicly_decode_transport_parameter_list(&decoded, NULL, NULL, NULL, NULL, without_multipath,
+                                                  without_multipath + sizeof(without_multipath)) == 0);
+        ok(!decoded.flexicast_support.ipv4);
+        ok(!decoded.flexicast_support.ipv6);
+        ok(quicly_decode_transport_parameter_list(&decoded, NULL, NULL, NULL, NULL, nonempty, nonempty + sizeof(nonempty)) ==
+           QUICLY_TRANSPORT_ERROR_TRANSPORT_PARAMETER);
+        ok(quicly_decode_transport_parameter_list(&decoded, NULL, NULL, NULL, NULL, duplicate, duplicate + sizeof(duplicate)) ==
+           QUICLY_TRANSPORT_ERROR_TRANSPORT_PARAMETER);
+    }
+
+    { /* Advertising neither address family is a Flexicast protocol violation. */
+        static const uint8_t no_address_family[] = {
+            QUICLY_TRANSPORT_PARAMETER_ID_INITIAL_MAX_PATH_ID, 1, 0, 0x80, 0x00, 0xed, 0xf3, 2, 0, 0};
+        ok(quicly_decode_transport_parameter_list(&decoded, NULL, NULL, NULL, NULL, no_address_family,
+                                                  no_address_family + sizeof(no_address_family)) ==
+           QUICLY_TRANSPORT_ERROR_PROTOCOL_VIOLATION);
+    }
+
+    { /* The encoder and decoder round-trip both extension advertisements. */
+        quicly_transport_parameters_t params = quicly_spec_context.transport_params;
+        ptls_buffer_t encoded;
+        params.enable_multipath = 1;
+        params.initial_max_path_id = 0;
+        params.flexicast_support.ipv4 = 1;
+        params.flexicast_support.ipv6 = 1;
+        ptls_buffer_init(&encoded, "", 0);
+        ok(quicly_encode_transport_parameter_list(&encoded, &params, NULL, NULL, NULL, NULL, 0) == 0);
+        ok(quicly_decode_transport_parameter_list(&decoded, NULL, NULL, NULL, NULL, encoded.base, encoded.base + encoded.off) == 0);
+        ok(decoded.enable_multipath);
+        ok(decoded.flexicast_support.ipv4);
+        ok(decoded.flexicast_support.ipv6);
+        ptls_buffer_dispose(&encoded);
+    }
+
     static const uint8_t dup_bytes[] = {0x05, 0x04, 0x80, 0x10, 0x00, 0x00, 0x05, 0x04, 0x80, 0x10, 0x00, 0x00};
     memset(&decoded, 0x55, sizeof(decoded));
     ok(quicly_decode_transport_parameter_list(&decoded, NULL, NULL, NULL, NULL, dup_bytes, dup_bytes + sizeof(dup_bytes)) ==
@@ -3105,6 +3169,7 @@ int main(int argc, char **argv)
     subtest("jumpstart", test_jumpstart);
     subtest("ack-frequency", test_ack_frequency);
     subtest("cc", test_cc);
+    subtest("flexicast", test_flexicast);
 
     subtest("state-exhaustion", test_state_exhaustion);
     subtest("amplification-blocked-handshake-timeout", test_amplification_blocked_handshake_timeout);
