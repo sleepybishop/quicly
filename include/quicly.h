@@ -89,6 +89,46 @@ typedef union st_quicly_address_t {
     struct sockaddr_in6 sin6;
 } quicly_address_t;
 
+#define QUICLY_FLEXICAST_MAX_FLOW_ID_SIZE 20
+
+typedef struct st_quicly_flexicast_flow_id_t {
+    uint8_t len;
+    uint8_t bytes[QUICLY_FLEXICAST_MAX_FLOW_ID_SIZE];
+} quicly_flexicast_flow_id_t;
+
+typedef struct st_quicly_flexicast_announce_frame_t {
+    quicly_flexicast_flow_id_t flow_id;
+    uint64_t sequence;
+    uint8_t ip_version;
+    uint8_t source_ip[16];
+    uint8_t group_ip[16];
+    uint16_t udp_port;
+    uint64_t ack_delay_msec;
+} quicly_flexicast_announce_frame_t;
+
+typedef struct st_quicly_flexicast_state_frame_t {
+    quicly_flexicast_flow_id_t flow_id;
+    uint64_t sequence;
+    uint64_t action;
+} quicly_flexicast_state_frame_t;
+
+typedef struct st_quicly_flexicast_key_frame_t {
+    quicly_flexicast_flow_id_t flow_id;
+    uint64_t sequence;
+    uint64_t first_packet_number;
+    ptls_iovec_t key;
+    uint64_t algorithm;
+} quicly_flexicast_key_frame_t;
+
+typedef struct st_quicly_flexicast_frame_t {
+    uint64_t type;
+    union {
+        quicly_flexicast_announce_frame_t announce;
+        quicly_flexicast_state_frame_t state;
+        quicly_flexicast_key_frame_t key;
+    } data;
+} quicly_flexicast_frame_t;
+
 typedef struct st_quicly_context_t quicly_context_t;
 typedef struct st_quicly_stream_t quicly_stream_t;
 typedef struct st_quicly_send_context_t quicly_send_context_t;
@@ -146,6 +186,10 @@ QUICLY_CALLBACK_TYPE(quicly_error_t, stream_open, quicly_stream_t *stream);
  *
  */
 QUICLY_CALLBACK_TYPE(void, receive_datagram_frame, quicly_conn_t *conn, ptls_iovec_t payload);
+/** Called synchronously for FC control frames. Borrowed fields are valid only during the callback. */
+QUICLY_CALLBACK_TYPE(quicly_error_t, receive_flexicast_frame, quicly_conn_t *conn, const quicly_flexicast_frame_t *frame);
+/** Receives a PATH_ACK whose path_id identifies a negotiated Flexicast flow. */
+QUICLY_CALLBACK_TYPE(quicly_error_t, receive_flexicast_ack, quicly_conn_t *conn, uint64_t flow_id, const quicly_ack_frame_t *frame);
 /**
  * Called when the connection is closed (i.e., when entering the closing or draining state). Otherwise the callback is not called;
  * e.g., when `quicly_free` is called directly while the connection is in the connected state. Call `quicly_get_close_reason` to
@@ -297,6 +341,11 @@ typedef struct st_quicly_transport_parameters_t {
     uint8_t enable_multipath : 1;
     /** multipath extension maximum path ID */
     uint64_t initial_max_path_id;
+    /** address families supported by draft-navarre-quic-flexicast-02 */
+    struct {
+        uint8_t ipv4 : 1;
+        uint8_t ipv6 : 1;
+    } flexicast_support;
     /* grease_quic_bit (RFC 9287) */
     uint8_t grease_quic_bit : 1;
     /* version information (RFC 9368) */
@@ -455,6 +504,10 @@ struct st_quicly_context_t {
      * callback for receiving datagram frame
      */
     quicly_receive_datagram_frame_t *receive_datagram_frame;
+    /** callback for draft-navarre-quic-flexicast control frames */
+    quicly_receive_flexicast_frame_t *receive_flexicast_frame;
+    /** callback for PATH_ACK feedback referring to a Flexicast Flow ID */
+    quicly_receive_flexicast_ack_t *receive_flexicast_ack;
     /**
      * callback called when a connection enters closing or draining
      */
@@ -646,7 +699,7 @@ struct st_quicly_conn_streamgroup_state_t {
             max_streams_bidi, max_streams_uni, data_blocked, stream_data_blocked, streams_blocked, new_connection_id,              \
             retire_connection_id, path_challenge, path_response, transport_close, application_close, handshake_done, datagram,     \
             ack_frequency, immediate_ack, path_ack, path_abandon, path_status, path_new_connection_id, path_retire_connection_id,  \
-            max_path_id, paths_blocked, path_cids_blocked;                                                                         \
+            max_path_id, paths_blocked, path_cids_blocked, fc_announce, fc_state, fc_key;                                          \
     } num_frames_received, num_frames_sent;                                                                                        \
     struct {                                                                                                                       \
         /**                                                                                                                        \
@@ -862,7 +915,10 @@ typedef struct st_quicly_path_stats_t {
     QUICLY_STATS__DO_FOREACH_NUM_FRAMES(path_retire_connection_id, dir, apply)                                                      \
     QUICLY_STATS__DO_FOREACH_NUM_FRAMES(max_path_id, dir, apply)                                                                   \
     QUICLY_STATS__DO_FOREACH_NUM_FRAMES(paths_blocked, dir, apply)                                                                 \
-    QUICLY_STATS__DO_FOREACH_NUM_FRAMES(path_cids_blocked, dir, apply)
+    QUICLY_STATS__DO_FOREACH_NUM_FRAMES(path_cids_blocked, dir, apply)                                                             \
+    QUICLY_STATS__DO_FOREACH_NUM_FRAMES(fc_announce, dir, apply)                                                                   \
+    QUICLY_STATS__DO_FOREACH_NUM_FRAMES(fc_state, dir, apply)                                                                      \
+    QUICLY_STATS__DO_FOREACH_NUM_FRAMES(fc_key, dir, apply)
 
 #define QUICLY_STATS_FOREACH_TRANSPORT_COUNTERS(apply)                                                                             \
     apply(num_paths.created, "num-paths.created")                                                                                  \

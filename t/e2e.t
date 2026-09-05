@@ -71,9 +71,20 @@ subtest "hello" => sub {
     subtest "initial-ncid" => sub {
         my $events = slurp_file("$tempdir/events");
         complex $events, sub {
+            my $events_str = $_;
             my @seen;
-            my @expected = (0, 1, 1, 1); # expecting to see sequence=1,2,3 as we set active_connection_id_limit to 4
-            foreach (split(/\n/)) {
+            my $limit = 4;
+            if (open my $fh, "<", "include/quicly/constants.h") {
+                while (my $line = <$fh>) {
+                    if ($line =~ /#define\s+QUICLY_LOCAL_ACTIVE_CONNECTION_ID_LIMIT\s+(\d+)/) {
+                        $limit = $1;
+                        last;
+                    }
+                }
+                close $fh;
+            }
+            my @expected = (0, (1) x ($limit - 1));
+            foreach (split(/\n/, $events_str)) {
                 if ( /"type":"new_connection_id_receive",.*"sequence":([0-9]+),/ ) {
                     # $1 contains sequence number
                     $seen[$1] = 1;

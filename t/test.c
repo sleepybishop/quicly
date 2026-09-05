@@ -481,6 +481,70 @@ static void test_transport_parameters(void)
         ok(decoded.initial_max_path_id == 0);
     }
 
+    { /* Flexicast address-family support is layered on MPQUIC. */
+        static const uint8_t flexicast[] = {
+            QUICLY_TRANSPORT_PARAMETER_ID_INITIAL_MAX_PATH_ID, 1, 0, 0x80, 0x00, 0xed, 0xf3, 2, 1, 1};
+        memset(&decoded, 0x55, sizeof(decoded));
+        ok(quicly_decode_transport_parameter_list(&decoded, NULL, NULL, NULL, NULL, flexicast, flexicast + sizeof(flexicast)) == 0);
+        ok(decoded.enable_multipath);
+        ok(decoded.flexicast_support.ipv4);
+        ok(decoded.flexicast_support.ipv6);
+    }
+
+    { /* Flexicast is ignored without MPQUIC; malformed values and duplicates are invalid. */
+        static const uint8_t without_multipath[] = {0x80, 0x00, 0xed, 0xf3, 2, 1, 1};
+        static const uint8_t nonempty[] = {QUICLY_TRANSPORT_PARAMETER_ID_INITIAL_MAX_PATH_ID, 1, 0, 0x80, 0x00, 0xed, 0xf3, 1, 1};
+        static const uint8_t duplicate[] = {QUICLY_TRANSPORT_PARAMETER_ID_INITIAL_MAX_PATH_ID,
+                                            1,
+                                            0,
+                                            0x80,
+                                            0x00,
+                                            0xed,
+                                            0xf3,
+                                            2,
+                                            1,
+                                            0,
+                                            0x80,
+                                            0x00,
+                                            0xed,
+                                            0xf3,
+                                            2,
+                                            1,
+                                            0};
+        ok(quicly_decode_transport_parameter_list(&decoded, NULL, NULL, NULL, NULL, without_multipath,
+                                                  without_multipath + sizeof(without_multipath)) == 0);
+        ok(!decoded.flexicast_support.ipv4);
+        ok(!decoded.flexicast_support.ipv6);
+        ok(quicly_decode_transport_parameter_list(&decoded, NULL, NULL, NULL, NULL, nonempty, nonempty + sizeof(nonempty)) ==
+           QUICLY_TRANSPORT_ERROR_TRANSPORT_PARAMETER);
+        ok(quicly_decode_transport_parameter_list(&decoded, NULL, NULL, NULL, NULL, duplicate, duplicate + sizeof(duplicate)) ==
+           QUICLY_TRANSPORT_ERROR_TRANSPORT_PARAMETER);
+    }
+
+    { /* Advertising neither address family is a Flexicast protocol violation. */
+        static const uint8_t no_address_family[] = {
+            QUICLY_TRANSPORT_PARAMETER_ID_INITIAL_MAX_PATH_ID, 1, 0, 0x80, 0x00, 0xed, 0xf3, 2, 0, 0};
+        ok(quicly_decode_transport_parameter_list(&decoded, NULL, NULL, NULL, NULL, no_address_family,
+                                                  no_address_family + sizeof(no_address_family)) ==
+           QUICLY_TRANSPORT_ERROR_PROTOCOL_VIOLATION);
+    }
+
+    { /* The encoder and decoder round-trip both extension advertisements. */
+        quicly_transport_parameters_t params = quicly_spec_context.transport_params;
+        ptls_buffer_t encoded;
+        params.enable_multipath = 1;
+        params.initial_max_path_id = 0;
+        params.flexicast_support.ipv4 = 1;
+        params.flexicast_support.ipv6 = 1;
+        ptls_buffer_init(&encoded, "", 0);
+        ok(quicly_encode_transport_parameter_list(&encoded, &params, NULL, NULL, NULL, NULL, 0) == 0);
+        ok(quicly_decode_transport_parameter_list(&decoded, NULL, NULL, NULL, NULL, encoded.base, encoded.base + encoded.off) == 0);
+        ok(decoded.enable_multipath);
+        ok(decoded.flexicast_support.ipv4);
+        ok(decoded.flexicast_support.ipv6);
+        ptls_buffer_dispose(&encoded);
+    }
+
     static const uint8_t dup_bytes[] = {0x05, 0x04, 0x80, 0x10, 0x00, 0x00, 0x05, 0x04, 0x80, 0x10, 0x00, 0x00};
     memset(&decoded, 0x55, sizeof(decoded));
     ok(quicly_decode_transport_parameter_list(&decoded, NULL, NULL, NULL, NULL, dup_bytes, dup_bytes + sizeof(dup_bytes)) ==
@@ -2241,7 +2305,7 @@ static size_t transmit_multipath(quicly_conn_t *src, quicly_conn_t *dst)
 static void test_multipath_active_use(void)
 {
     uint64_t orig_initial_max_path_id = quic_ctx.transport_params.initial_max_path_id;
-    quic_ctx.transport_params.initial_max_path_id = 4; /* enable multipath negotiation */
+    quic_ctx.transport_params.initial_max_path_id = QUICLY_LOCAL_ACTIVE_CONNECTION_ID_LIMIT;
 
     quicly_path_scheduler_t *orig_path_scheduler = quic_ctx.path_scheduler;
     quic_ctx.path_scheduler = &quicly_round_robin_path_scheduler;
@@ -2265,9 +2329,10 @@ static void test_multipath_active_use(void)
     /* Verify path 0 is active */
     ok(get_path(client, 0) != NULL);
 
-    /* Setup 3 additional loopback paths on client to server */
-    struct sockaddr_in remote_addrs[3], local_addrs[3];
-    for (size_t i = 0; i < 3; ++i) {
+    /* Fill the bounded path-space table with additional loopback paths. */
+    struct sockaddr_in remote_addrs[QUICLY_LOCAL_ACTIVE_CONNECTION_ID_LIMIT - 1];
+    struct sockaddr_in local_addrs[QUICLY_LOCAL_ACTIVE_CONNECTION_ID_LIMIT - 1];
+    for (size_t i = 0; i < PTLS_ELEMENTSOF(remote_addrs); ++i) {
         memset(&remote_addrs[i], 0, sizeof(remote_addrs[i]));
         remote_addrs[i].sin_family = AF_INET;
         remote_addrs[i].sin_port = htons((uint16_t)(10000 + i));
@@ -2284,13 +2349,13 @@ static void test_multipath_active_use(void)
     }
 
     /* Exchange packets until all paths are validated */
-    for (size_t i = 0; i < 20; ++i) {
+    for (size_t i = 0; i < QUICLY_LOCAL_ACTIVE_CONNECTION_ID_LIMIT * 4; ++i) {
         transmit_multipath(client, server);
         transmit_multipath(server, client);
     }
 
     /* Verify that all paths have been created on the server and are validated (not probe_only) */
-    for (size_t i = 0; i < 4; ++i) {
+    for (size_t i = 0; i < QUICLY_LOCAL_ACTIVE_CONNECTION_ID_LIMIT; ++i) {
         ok(get_path(client, i) != NULL);
         ok(!get_path(client, i)->probe_only);
         ok(get_path(server, i) != NULL);
@@ -2298,15 +2363,15 @@ static void test_multipath_active_use(void)
     }
 
     /* Record the packet count on each path before sending stream data */
-    uint64_t sent_before[4];
-    for (size_t i = 0; i < 4; ++i)
+    uint64_t sent_before[QUICLY_LOCAL_ACTIVE_CONNECTION_ID_LIMIT];
+    for (size_t i = 0; i < PTLS_ELEMENTSOF(sent_before); ++i)
         sent_before[i] = get_path(client, i)->num_packets.sent;
 
     /* Send stream data */
     quicly_stream_t *stream;
     quicly_error_t ret = quicly_open_stream(client, &stream, 0);
     ok(ret == 0);
-    for (size_t i = 0; i < 20; ++i) {
+    for (size_t i = 0; i < QUICLY_LOCAL_ACTIVE_CONNECTION_ID_LIMIT * 4; ++i) {
         quicly_streambuf_egress_write(stream, "hello multipath test", 20);
         transmit_multipath(client, server);
         transmit_multipath(server, client);
@@ -2314,7 +2379,7 @@ static void test_multipath_active_use(void)
 
     /* Verify that additional packets were sent on all paths */
     int all_paths_used_for_data = 1;
-    for (size_t i = 0; i < 4; ++i) {
+    for (size_t i = 0; i < PTLS_ELEMENTSOF(sent_before); ++i) {
         if (get_path(client, i)->num_packets.sent <= sent_before[i]) {
             all_paths_used_for_data = 0;
         }
@@ -2326,7 +2391,8 @@ static void test_multipath_active_use(void)
     for (size_t i = 0; i < PTLS_ELEMENTSOF(established_path_ids); ++i)
         established_path_ids[i] = client->path_spaces[i]->path_id;
     size_t ignored_path_index;
-    ret = open_path(client, &ignored_path_index, 4, (struct sockaddr *)&remote_addrs[0], (struct sockaddr *)&local_addrs[0]);
+    ret = open_path(client, &ignored_path_index, QUICLY_LOCAL_ACTIVE_CONNECTION_ID_LIMIT,
+                    (struct sockaddr *)&remote_addrs[0], (struct sockaddr *)&local_addrs[0]);
     ok(ret == QUICLY_ERROR_PACKET_IGNORED);
     for (size_t i = 0; i < PTLS_ELEMENTSOF(established_path_ids); ++i)
         ok(client->path_spaces[i] != NULL && client->path_spaces[i]->path_id == established_path_ids[i]);
@@ -3336,6 +3402,7 @@ int main(int argc, char **argv)
     subtest("jumpstart", test_jumpstart);
     subtest("ack-frequency", test_ack_frequency);
     subtest("cc", test_cc);
+    subtest("flexicast", test_flexicast);
 
     subtest("state-exhaustion", test_state_exhaustion);
     subtest("amplification-blocked-handshake-timeout", test_amplification_blocked_handshake_timeout);
