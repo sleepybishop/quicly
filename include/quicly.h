@@ -397,6 +397,10 @@ struct st_quicly_context_t {
          * if CC should take app-limited into consideration
          */
         uint8_t respect_app_limited;
+        /**
+         * if RFC 8899 DPLPMTUD should be enabled
+         */
+        uint8_t enable_pmtud;
     } enable_ratio;
     /**
      * expand client hello so that it does not fit into one datagram

@@ -77,6 +77,11 @@ typedef struct st_quicly_sent_packet_t {
      */
     uint8_t ecn_marked : 1;
     /**
+     * if the packet is a DPLPMTUD probe; retained until the sentmap entry is discarded so that later resets of the PMTUD search do
+     * not cause probe loss to be reported as congestion
+     */
+    uint8_t is_pmtud_probe : 1;
+    /**
      * number of bytes in-flight for the packet, from the context of CC (becomes zero when deemed lost, but not when PTO fires)
      */
     uint16_t cc_bytes_in_flight;

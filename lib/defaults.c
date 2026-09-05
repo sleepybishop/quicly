@@ -67,6 +67,7 @@ const quicly_context_t quicly_spec_context = {
             .ecn = 255,
             .pacing = 0, /* off by default */
             .respect_app_limited = 255,
+            .enable_pmtud = 0,
         },
     .stream_scheduler = &quicly_default_stream_scheduler,
     .now = &quicly_default_now,
@@ -108,6 +109,7 @@ const quicly_context_t quicly_performant_context = {
             .ecn = 255,
             .pacing = 0, /* off by default */
             .respect_app_limited = 255,
+            .enable_pmtud = 0,
         },
     .stream_scheduler = &quicly_default_stream_scheduler,
     .now = &quicly_default_now,

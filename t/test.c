@@ -115,7 +115,6 @@ static void test_random_bytes(void *buf, size_t len)
         len -= chunk;
     }
 }
-
 static void test_error_codes(void)
 {
     quicly_error_t a;
@@ -2295,6 +2294,277 @@ static void test_multipath_path_management(void)
     quic_now = orig_now;
 }
 
+static void test_multipath_pmtud(void)
+{
+    uint64_t orig_initial_max_path_id = quic_ctx.transport_params.initial_max_path_id;
+    quic_ctx.transport_params.initial_max_path_id = 4; /* enable multipath negotiation */
+
+    uint8_t orig_enable_pmtud = quic_ctx.enable_ratio.enable_pmtud;
+    quic_ctx.enable_ratio.enable_pmtud = 1; /* enable DPLPMTUD */
+
+    /* Set up cid_encryptor for the test context */
+    quicly_cid_encryptor_t *orig_cid_encryptor = quic_ctx.cid_encryptor;
+    char cid_key[] = "0123456789abcdef";
+    quic_ctx.cid_encryptor = quicly_new_default_cid_encryptor(&ptls_openssl_quiclb, &ptls_openssl_aes128ecb, &ptls_openssl_sha256,
+                                                              ptls_iovec_init(cid_key, strlen(cid_key)));
+    ok(quic_ctx.cid_encryptor != NULL);
+
+    quicly_conn_t *client, *server;
+    test_setup_connected_peers(&client, &server);
+
+    /* Initialize path 0 addresses to fake_address to avoid family 0 asserts */
+    get_path(client, 0)->address.local = fake_address;
+    get_path(client, 0)->address.remote = fake_address;
+    get_path(server, 0)->address.local = fake_address;
+    get_path(server, 0)->address.remote = fake_address;
+
+    /* Verify PMTUD structure on client path 0 is initialized */
+    quicly_path_space_t *ps = client->path_spaces[0];
+    ok(ps != NULL);
+    ok(ps->pmtud.state == QUICLY_PMTUD_STATE_SEARCHING);
+    ok(ps->pmtud.lower_bound == 1376);
+    ok(ps->pmtud.upper_bound == 1472);
+
+    { /* PMTUD-disabled connections retain an explicitly configured datagram size above the probing ceiling. */
+        quicly_pmtud_t saved_pmtud = ps->pmtud;
+        uint16_t saved_max_udp_payload_size = ps->max_udp_payload_size;
+        uint64_t saved_peer_max_udp_payload_size = client->super.remote.transport_params.max_udp_payload_size;
+        quic_ctx.enable_ratio.enable_pmtud = 0;
+        client->super.remote.transport_params.max_udp_payload_size = 9000;
+        ps->pmtud.current_mtu = 9000;
+        ps->pmtud.lower_bound = 9000;
+        ps->max_udp_payload_size = 9000;
+        quicly_pmtud_on_remote_transport_params(client);
+        ok(ps->pmtud.current_mtu == 9000);
+        ok(ps->max_udp_payload_size == 9000);
+        quic_ctx.enable_ratio.enable_pmtud = 1;
+        client->super.remote.transport_params.max_udp_payload_size = saved_peer_max_udp_payload_size;
+        ps->pmtud = saved_pmtud;
+        ps->max_udp_payload_size = saved_max_udp_payload_size;
+    }
+
+    { /* Raising the server's path-specific maximum also raises the PMTUD base, preventing a smaller probe from reducing it. */
+        quicly_pmtud_t saved_pmtud = ps->pmtud;
+        uint16_t saved_max_udp_payload_size = ps->max_udp_payload_size;
+        ps->pmtud.current_mtu = 1280;
+        ps->pmtud.lower_bound = 1280;
+        ps->max_udp_payload_size = 1450;
+        pmtud_raise_base_to_current_max(ps);
+        ok(ps->pmtud.current_mtu == 1450);
+        ok(ps->pmtud.lower_bound == 1450);
+        ps->max_udp_payload_size = 9000;
+        pmtud_raise_base_to_current_max(ps);
+        ok(ps->max_udp_payload_size == ps->pmtud.upper_bound);
+        ok(ps->pmtud.current_mtu == ps->pmtud.upper_bound);
+        ps->pmtud = saved_pmtud;
+        ps->max_udp_payload_size = saved_max_udp_payload_size;
+    }
+
+    { /* A peer limit below the configured initial size must not invert the search interval. */
+        uint16_t original_peer_max = client->super.remote.transport_params.max_udp_payload_size;
+        client->super.remote.transport_params.max_udp_payload_size = 1200;
+        ps->pmtud.current_mtu = 1376;
+        ps->pmtud.lower_bound = 1376;
+        ps->max_udp_payload_size = 1376;
+        quicly_pmtud_on_remote_transport_params(client);
+        ok(ps->pmtud.current_mtu == 1200);
+        ok(ps->pmtud.lower_bound == 1200);
+        ok(ps->pmtud.upper_bound == 1200);
+        ok(ps->max_udp_payload_size == 1200);
+        client->super.remote.transport_params.max_udp_payload_size = original_peer_max;
+        reset_pmtud_search(client, ps, 1376, 0);
+    }
+
+    /* Exchange packets until handshake is completed and connections are idle */
+    exchange_until_idle(client, server);
+
+    { /* Congestion-blocked probes rearm their timer rather than leaving an immediate timeout that spins the event loop. */
+        quicly_send_context_t s;
+        struct iovec datagram;
+        uint8_t buf[quic_ctx.transport_params.max_udp_payload_size];
+        reset_pmtud_search(client, ps, 1376, quic_now);
+        test_setup_send_context(client, &s, &datagram, buf, sizeof(buf));
+        s.send_window = 0;
+        ok(send_pmtud_probe(client, &s) == 0);
+        ok(s.num_datagrams == 0);
+        ok(ps->pmtud.next_search_at == quic_now + 1000);
+        unlock_now(client);
+    }
+
+    { /* A due probe takes priority over continuously backlogged stream data. */
+        quicly_stream_t *stream;
+        ok(quicly_open_stream(client, &stream, 0) == 0);
+        quicly_streambuf_egress_write(stream, "backlogged PMTUD data", 21);
+        reset_pmtud_search(client, ps, 1376, quic_now);
+        ok(transmit(client, server) == 1);
+        ok(ps->pmtud.probe_pn != UINT64_MAX);
+        exchange_until_idle(server, client);
+    }
+
+    { /* A due PMTUD timer must not wake the sender for a path that cannot carry the probe. */
+        reset_pmtud_search(client, ps, 1376, quic_now);
+        ok(quicly_get_first_timeout(client) <= quic_now);
+        get_path(client, 0)->probe_only = 1;
+        ok(quicly_get_first_timeout(client) > quic_now);
+        get_path(client, 0)->probe_only = 0;
+
+        quicly_path_space_t *server_ps = server->path_spaces[0];
+        reset_pmtud_search(server, server_ps, 1376, quic_now);
+        server->super.remote.address_validation.validated = 0;
+        get_path(server, 0)->bytes_received = 0;
+        get_path(server, 0)->bytes_sent = 0;
+        ok(quicly_get_first_timeout(server) > quic_now);
+        server->super.remote.address_validation.validated = 1;
+    }
+
+    { /* Retrying the same candidate preserves its accumulated loss count until it is acknowledged or rejected. */
+        reset_pmtud_search(client, ps, 1376, quic_now);
+        ps->pmtud.lost_probes = 2;
+        ok(transmit(client, server) != 0);
+        ok(ps->pmtud.probe_pn != UINT64_MAX);
+        ok(ps->pmtud.lost_probes == 2);
+        exchange_until_idle(server, client);
+        ok(ps->pmtud.lost_probes == 0);
+    }
+
+    { /* PMTUD probe losses update search state without reducing the congestion window. */
+        reset_pmtud_search(client, ps, 1376, quic_now);
+        ps->pmtud.probe_size = 1460;
+        uint32_t cwnd = ps->cc.cwnd;
+        for (size_t i = 0; i != 3; ++i) {
+            quicly_sent_packet_t lost = {
+                .packet_number = ps->packet_number + 100 + i,
+                .ack_epoch = QUICLY_EPOCH_1RTT,
+                .path_id = ps->path_id,
+                .ack_eliciting = 1,
+                .is_pmtud_probe = 1,
+                .cc_bytes_in_flight = 1460,
+            };
+            ps->pmtud.probe_pn = lost.packet_number;
+            on_loss_detected(&ps->loss, &lost, 1);
+            ok(ps->cc.cwnd == cwnd);
+            if (i != 2) {
+                ok(ps->pmtud.lost_probes == i + 1);
+                ok(ps->pmtud.upper_bound == 1472);
+            }
+        }
+        ok(ps->pmtud.lost_probes == 0);
+        ok(ps->pmtud.upper_bound == 1459);
+        reset_pmtud_search(client, ps, 1376, quic_now);
+    }
+
+    { /* Resetting PMTUD while a probe is outstanding must not turn later probe loss into congestion loss. */
+        quicly_sent_packet_t lost = {
+            .packet_number = ps->packet_number + 200,
+            .ack_epoch = QUICLY_EPOCH_1RTT,
+            .path_id = ps->path_id,
+            .ack_eliciting = 1,
+            .is_pmtud_probe = 1,
+            .cc_bytes_in_flight = 1460,
+        };
+        ps->pmtud.probe_pn = lost.packet_number;
+        reset_pmtud_search(client, ps, 1200, quic_now + 5000);
+        uint32_t cwnd = ps->cc.cwnd;
+        uint32_t num_loss_episodes = ps->cc.num_loss_episodes;
+        on_loss_detected(&ps->loss, &lost, 1);
+        ok(ps->cc.cwnd == cwnd);
+        ok(ps->cc.num_loss_episodes == num_loss_episodes);
+        ok(ps->pmtud.lost_probes == 0);
+        reset_pmtud_search(client, ps, 1376, quic_now);
+    }
+
+    { /* Only current-PLPMTU packets, excluding the upward probe, are black-hole evidence. */
+        quicly_loss_t loss = {0};
+        quicly_sentmap_init(&loss.sentmap);
+        ok(quicly_sentmap_prepare(&loss.sentmap, 1, quic_now, QUICLY_EPOCH_1RTT) == 0);
+        quicly_sentmap_commit(&loss.sentmap, 1460, 0, 0);
+        ok(!has_plpmtu_sized_inflight_packets(&loss, 1376, 1));
+        ok(quicly_sentmap_prepare(&loss.sentmap, 2, quic_now, QUICLY_EPOCH_1RTT) == 0);
+        quicly_sentmap_commit(&loss.sentmap, 1300, 0, 0);
+        ok(!has_plpmtu_sized_inflight_packets(&loss, 1376, 1));
+        ok(quicly_sentmap_prepare(&loss.sentmap, 3, quic_now, QUICLY_EPOCH_1RTT) == 0);
+        quicly_sentmap_commit(&loss.sentmap, 1376, 0, 0);
+        ok(has_plpmtu_sized_inflight_packets(&loss, 1376, 1));
+        quicly_sentmap_dispose(&loss.sentmap);
+    }
+
+    /* Loop to advance time and drive search to completion */
+    size_t loop_count = 0;
+    while (ps->pmtud.state == QUICLY_PMTUD_STATE_SEARCHING && loop_count < 10) {
+        quic_now += 1000;
+        exchange_until_idle(client, server);
+        loop_count++;
+    }
+
+    /* Verify search completed successfully at max MTU 1466 */
+    ok(ps->pmtud.state == QUICLY_PMTUD_STATE_SEARCH_COMPLETE);
+    ok(ps->pmtud.lower_bound == 1466);
+    ok(ps->max_udp_payload_size == 1466);
+
+    { /* Expiry of the PMTU raise timer reopens the search interval. */
+        ps->pmtud.state = QUICLY_PMTUD_STATE_SEARCH_COMPLETE;
+        ps->pmtud.current_mtu = 1400;
+        ps->pmtud.lower_bound = 1400;
+        ps->pmtud.upper_bound = 1400;
+        ps->max_udp_payload_size = 1400;
+        ps->pmtud.next_search_at = quic_now;
+        exchange_until_idle(client, server);
+        ok(ps->pmtud.current_mtu > 1400);
+        ok(ps->pmtud.lower_bound == ps->pmtud.current_mtu);
+    }
+
+    { /* Validate a fresh path at 1200 bytes, then ensure its due PMTUD probe wins over backlogged traffic on path zero. */
+        struct sockaddr_in remote_addr = {0}, local_addr = {0};
+        remote_addr.sin_family = AF_INET;
+        remote_addr.sin_port = htons(31000);
+        remote_addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+        local_addr.sin_family = AF_INET;
+        local_addr.sin_port = htons(32000);
+        local_addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+        quicly_stream_t *validation_backlog;
+        ok(quicly_open_stream(client, &validation_backlog, 0) == 0);
+        quicly_streambuf_egress_write(validation_backlog, "must not join validation probe", 30);
+        ok(quicly_open_path(client, (struct sockaddr *)&remote_addr, (struct sockaddr *)&local_addr) == 0);
+        ok(client->path_spaces[1]->pmtud.current_mtu == 1200);
+        ok(client->path_spaces[1]->max_udp_payload_size == 1200);
+
+        quicly_address_t destaddr, srcaddr;
+        struct iovec datagrams[8];
+        uint8_t datagramsbuf[PTLS_ELEMENTSOF(datagrams) * quic_ctx.transport_params.max_udp_payload_size];
+        size_t num_datagrams = PTLS_ELEMENTSOF(datagrams);
+        ok(quicly_send(client, &destaddr, &srcaddr, datagrams, &num_datagrams, datagramsbuf, sizeof(datagramsbuf)) == 0);
+        ok(num_datagrams == 1);
+        ok(datagrams[0].iov_len == 1200);
+        quicly_decoded_packet_t decoded[2];
+        size_t num_packets = decode_packets(decoded, datagrams, num_datagrams);
+        for (size_t i = 0; i != num_packets; ++i)
+            ok(quicly_receive(server, &destaddr.sa, &srcaddr.sa, decoded + i) == 0);
+
+        for (size_t i = 0; i != 20 && get_path(client, 1)->path_challenge.send_at != INT64_MAX; ++i) {
+            transmit_multipath(server, client);
+            transmit_multipath(client, server);
+        }
+        ok(get_path(client, 1)->path_challenge.send_at == INT64_MAX);
+
+        quicly_path_space_t *secondary_ps = client->path_spaces[1];
+        ps->pmtud.next_search_at = quic_now + 10000;
+        reset_pmtud_search(client, secondary_ps, 1200, quic_now);
+        quicly_stream_t *stream;
+        ok(quicly_open_stream(client, &stream, 0) == 0);
+        quicly_streambuf_egress_write(stream, "secondary path PMTUD", 20);
+        ok(transmit_multipath(client, server) == 1);
+        ok(secondary_ps->pmtud.probe_pn != UINT64_MAX);
+    }
+
+    quicly_free_default_cid_encryptor(quic_ctx.cid_encryptor);
+    quic_ctx.cid_encryptor = orig_cid_encryptor;
+    quic_ctx.transport_params.initial_max_path_id = orig_initial_max_path_id;
+    quic_ctx.enable_ratio.enable_pmtud = orig_enable_pmtud;
+
+    quicly_free(client);
+    quicly_free(server);
+}
+
 static void test_multipath_stream_affinity(void)
 {
     uint64_t orig_initial_max_path_id = quic_ctx.transport_params.initial_max_path_id;
@@ -2709,6 +2979,7 @@ int main(int argc, char **argv)
     subtest("multipath-key-update-delay", test_multipath_key_update_delay);
     subtest("multipath-active-use", test_multipath_active_use);
     subtest("multipath-path-management", test_multipath_path_management);
+    subtest("multipath-pmtud", test_multipath_pmtud);
     subtest("multipath-stream-affinity", test_multipath_stream_affinity);
     subtest("multipath-zero-length-cid", test_multipath_zero_length_cid);
     subtest("multipath-path-loss", test_multipath_path_loss);
