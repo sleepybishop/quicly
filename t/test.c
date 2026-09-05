@@ -104,7 +104,7 @@ static ptls_cipher_context_t *test_random_cipher;
 
 /* Keep protocol-level random choices reproducible; cryptographic primitives are tested separately. */
 static void test_random_bytes(void *buf, size_t len)
-{
+    {
     static const uint8_t zeroes[64] = {0};
 
     assert(test_random_cipher != NULL);
@@ -434,6 +434,23 @@ static void test_retry_aead(void)
     ptls_aead_free(retry_aead);
 }
 
+static int encode_version_information_for_test(ptls_buffer_t *buf, size_t num_unknown_versions)
+{
+    int ret;
+
+    ptls_buffer_push_quicint(buf, QUICLY_TRANSPORT_PARAMETER_ID_VERSION_INFORMATION);
+    ptls_buffer_push_block(buf, -1, {
+        ptls_buffer_push32(buf, QUICLY_PROTOCOL_VERSION_1);
+        for (size_t i = 0; i != num_unknown_versions; ++i)
+            ptls_buffer_push32(buf, 0x12340001u + (uint32_t)i);
+        ptls_buffer_push32(buf, QUICLY_PROTOCOL_VERSION_1);
+    });
+    ret = 0;
+
+Exit:
+    return ret;
+}
+
 static void test_transport_parameters(void)
 {
     quicly_transport_parameters_t decoded;
@@ -468,6 +485,72 @@ static void test_transport_parameters(void)
     memset(&decoded, 0x55, sizeof(decoded));
     ok(quicly_decode_transport_parameter_list(&decoded, NULL, NULL, NULL, NULL, dup_bytes, dup_bytes + sizeof(dup_bytes)) ==
        QUICLY_TRANSPORT_ERROR_TRANSPORT_PARAMETER);
+
+{
+    /* Unknown and reserved versions do not crowd a later locally-supported version out of the bounded decoded list. The wire
+     * count is retained separately for validation of an explicitly empty Available Versions list. */
+    ptls_buffer_t tp_buf;
+    ptls_buffer_init(&tp_buf, "", 0);
+    ok(encode_version_information_for_test(&tp_buf, 20) == 0);
+    ok(quicly_decode_transport_parameter_list(&decoded, NULL, NULL, NULL, NULL, tp_buf.base, tp_buf.base + tp_buf.off) == 0);
+    ok(decoded.version_information.chosen_version == QUICLY_PROTOCOL_VERSION_1);
+    ok(decoded.version_information.num_available_versions == 21);
+    ok(decoded.version_information.available_versions[0] == QUICLY_PROTOCOL_VERSION_1);
+    ok(decoded.version_information.available_versions[1] == 0);
+    ptls_buffer_dispose(&tp_buf);
+
+    static const uint8_t zero_version_bytes[] = {0x11, 0x08, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00};
+    ok(quicly_decode_transport_parameter_list(&decoded, NULL, NULL, NULL, NULL, zero_version_bytes,
+                                              zero_version_bytes + sizeof(zero_version_bytes)) ==
+       QUICLY_TRANSPORT_ERROR_TRANSPORT_PARAMETER);
+
+    /* Clients advertise only the chosen version, because compatible first-flight conversion is not implemented. */
+    quicly_transport_parameters_t encode_params = quicly_spec_context.transport_params;
+    ok(set_version_information(&encode_params, QUICLY_PROTOCOL_VERSION_1, 0, NULL) == 0);
+    ptls_buffer_init(&tp_buf, "", 0);
+    ok(quicly_encode_transport_parameter_list(&tp_buf, &encode_params, NULL, NULL, NULL, NULL, 0) == 0);
+    ok(quicly_decode_transport_parameter_list(&decoded, NULL, NULL, NULL, NULL, tp_buf.base, tp_buf.base + tp_buf.off) == 0);
+    ok(decoded.version_information.num_available_versions == 1);
+    ok(decoded.version_information.available_versions[0] == QUICLY_PROTOCOL_VERSION_1);
+    ok(decoded.version_information.available_versions[1] == 0);
+    ptls_buffer_dispose(&tp_buf);
+
+    ok(set_version_information(&encode_params, QUICLY_PROTOCOL_VERSION_1, 1, quicly_supported_versions) == 0);
+    ptls_buffer_init(&tp_buf, "", 0);
+    ok(quicly_encode_transport_parameter_list(&tp_buf, &encode_params, NULL, NULL, NULL, NULL, 0) == 0);
+    ok(quicly_decode_transport_parameter_list(&decoded, NULL, NULL, NULL, NULL, tp_buf.base, tp_buf.base + tp_buf.off) == 0);
+    size_t num_supported_versions = 0;
+    while (quicly_supported_versions[num_supported_versions] != 0)
+        ++num_supported_versions;
+    ok(decoded.version_information.num_available_versions == num_supported_versions);
+    for (size_t i = 0; i != num_supported_versions; ++i)
+        ok(decoded.version_information.available_versions[i] == quicly_supported_versions[i]);
+    ok(decoded.version_information.available_versions[num_supported_versions] == 0);
+    ptls_buffer_dispose(&tp_buf);
+
+    /* The server advertises deployment policy, which can intentionally be narrower than transport support and need not contain
+     * the Chosen Version. */
+    static const uint32_t fully_deployed_versions[] = {QUICLY_PROTOCOL_VERSION_DRAFT29, 0};
+    ok(set_version_information(&encode_params, QUICLY_PROTOCOL_VERSION_1, 1, fully_deployed_versions) == 0);
+    ptls_buffer_init(&tp_buf, "", 0);
+    ok(quicly_encode_transport_parameter_list(&tp_buf, &encode_params, NULL, NULL, NULL, NULL, 0) == 0);
+    ok(quicly_decode_transport_parameter_list(&decoded, NULL, NULL, NULL, NULL, tp_buf.base, tp_buf.base + tp_buf.off) == 0);
+    ok(decoded.version_information.chosen_version == QUICLY_PROTOCOL_VERSION_1);
+    ok(decoded.version_information.num_available_versions == 1);
+    ok(decoded.version_information.available_versions[0] == QUICLY_PROTOCOL_VERSION_DRAFT29);
+    ok(decoded.version_information.available_versions[1] == 0);
+    ptls_buffer_dispose(&tp_buf);
+
+    /* A server can advertise an empty Fully Deployed Versions list during version-removal staging. */
+    ok(set_version_information(&encode_params, QUICLY_PROTOCOL_VERSION_1, 1, NULL) == 0);
+    ptls_buffer_init(&tp_buf, "", 0);
+    ok(quicly_encode_transport_parameter_list(&tp_buf, &encode_params, NULL, NULL, NULL, NULL, 0) == 0);
+    ok(quicly_decode_transport_parameter_list(&decoded, NULL, NULL, NULL, NULL, tp_buf.base, tp_buf.base + tp_buf.off) == 0);
+    ok(decoded.version_information.chosen_version == QUICLY_PROTOCOL_VERSION_1);
+    ok(decoded.version_information.num_available_versions == 0);
+    ok(decoded.version_information.available_versions[0] == 0);
+    ptls_buffer_dispose(&tp_buf);
+    }
 
     /* grease_quic_bit tests (RFC 9287) */
     static const uint8_t grease_quic_bit_bytes[] = {0x6a, 0xb2, 0x00};
@@ -2935,6 +3018,238 @@ static void test_multipath_path_loss(void)
     quic_ctx.transport_params.initial_max_path_id = orig_initial_max_path_id;
 }
 
+static void test_version_negotiation(void)
+{
+    quicly_conn_t *conn, *server, *vn_conn;
+    quicly_stream_t *early_bidi_stream, *early_uni_stream;
+    quicly_error_t ret;
+    const uint32_t *original_client_version_preference = quic_ctx.client_version_preference;
+
+    /* This test exercises legacy draft selection explicitly. The default application policy only permits QUIC v1. */
+    quic_ctx.client_version_preference = quicly_supported_versions;
+
+    /* VN packets containing the Original Version are ignored. Once the client acts on VN, it starts fresh packet number spaces
+     * and ignores every subsequent VN packet. */
+    ret = quicly_connect(&vn_conn, &quic_ctx, "example.com", &fake_address.sa, NULL, new_master_id(), ptls_iovec_init(NULL, 0),
+                         NULL, NULL, NULL);
+    ok(ret == 0);
+    uint8_t vn_versions[8];
+    quicly_encode32(vn_versions, QUICLY_PROTOCOL_VERSION_1);
+    quicly_encode32(vn_versions + 4, QUICLY_PROTOCOL_VERSION_DRAFT29);
+    quicly_decoded_packet_t vn_packet = {0};
+    vn_packet.octets = ptls_iovec_init(vn_versions, sizeof(vn_versions));
+    vn_packet.cid.dest.encrypted =
+        ptls_iovec_init(vn_conn->super.local.long_header_src_cid.cid, vn_conn->super.local.long_header_src_cid.len);
+    vn_packet.cid.src =
+        ptls_iovec_init(vn_conn->super.remote.cid_set.cids[0].cid.cid, vn_conn->super.remote.cid_set.cids[0].cid.len);
+    lock_now(vn_conn, 0);
+
+    /* Both connection IDs must echo the client's Initial. */
+    ptls_iovec_t valid_dcid = vn_packet.cid.dest.encrypted, valid_scid = vn_packet.cid.src;
+    vn_packet.cid.dest.encrypted = ptls_iovec_init(NULL, 0);
+    ok(handle_version_negotiation_packet(vn_conn, &vn_packet) == QUICLY_ERROR_PACKET_IGNORED);
+    ok(!vn_conn->version_negotiation.received);
+    vn_packet.cid.dest.encrypted = valid_dcid;
+    vn_packet.cid.src = ptls_iovec_init(NULL, 0);
+    ok(handle_version_negotiation_packet(vn_conn, &vn_packet) == QUICLY_ERROR_PACKET_IGNORED);
+    ok(!vn_conn->version_negotiation.received);
+    vn_packet.cid.src = valid_scid;
+
+    /* Empty and truncated VN version lists are ignored rather than closing the connection. */
+    vn_packet.octets.len = 0;
+    ok(handle_version_negotiation_packet(vn_conn, &vn_packet) == QUICLY_ERROR_PACKET_IGNORED);
+    ok(!vn_conn->version_negotiation.received);
+    vn_packet.octets.len = 3;
+    ok(handle_version_negotiation_packet(vn_conn, &vn_packet) == QUICLY_ERROR_PACKET_IGNORED);
+    ok(!vn_conn->version_negotiation.received);
+
+    vn_packet.octets = ptls_iovec_init(vn_versions, sizeof(vn_versions));
+    ok(handle_version_negotiation_packet(vn_conn, &vn_packet) == QUICLY_ERROR_PACKET_IGNORED);
+    ok(!vn_conn->version_negotiation.received);
+
+    /* A successfully processed Retry is another server packet, so every later VN packet must be ignored. */
+    vn_packet.octets = ptls_iovec_init(vn_versions + 4, 4);
+    vn_conn->retry_scid.len = 0;
+    ok(handle_version_negotiation_packet(vn_conn, &vn_packet) == QUICLY_ERROR_PACKET_IGNORED);
+    ok(!vn_conn->version_negotiation.received);
+    vn_conn->retry_scid.len = UINT8_MAX;
+
+    /* Simulate remembered 0-RTT limits and an application stream opened under those limits. */
+    vn_conn->super.remote.transport_params.max_data = 1024;
+    vn_conn->super.remote.transport_params.max_stream_data.bidi_remote = 1024;
+    vn_conn->super.remote.transport_params.max_stream_data.uni = 1024;
+    vn_conn->super.remote.transport_params.max_streams_bidi = 4;
+    vn_conn->super.remote.transport_params.max_streams_uni = 4;
+    ok(apply_remote_transport_params(vn_conn) == 0);
+    ok(quicly_open_stream(vn_conn, &early_bidi_stream, 0) == 0);
+    ok(quicly_open_stream(vn_conn, &early_uni_stream, 1) == 0);
+    ok(!early_bidi_stream->streams_blocked);
+    ok(!early_uni_stream->streams_blocked);
+    ok(early_bidi_stream->_send_aux.max_stream_data == 1024);
+    ok(early_uni_stream->_send_aux.max_stream_data == 1024);
+    early_bidi_stream->sendstate.size_inflight = 1;
+    early_uni_stream->sendstate.size_inflight = 1;
+    vn_conn->egress.max_data.sent = 2;
+
+    vn_packet.octets = ptls_iovec_init(vn_versions + 4, 4);
+    vn_conn->created_at = vn_conn->stash.now - 1000;
+    vn_conn->super.stats.num_packets.initial_sent = quic_ctx.max_initial_handshake_packets;
+    vn_conn->path_spaces[0]->loss.rtt.smoothed = 1;
+    vn_conn->path_spaces[0]->cc.cwnd = 1;
+    vn_conn->path_spaces[0]->packet_number = 7;
+    ok(handle_version_negotiation_packet(vn_conn, &vn_packet) == 0);
+    ok(vn_conn->version_negotiation.received);
+    ok(vn_conn->super.version == QUICLY_PROTOCOL_VERSION_DRAFT29);
+    ok(vn_conn->created_at == vn_conn->stash.now);
+    ok(vn_conn->version_negotiation.handshake_packets_sent_at_start == quic_ctx.max_initial_handshake_packets);
+    ok(vn_conn->path_spaces[0]->loss.rtt.smoothed == quic_ctx.loss.default_initial_rtt);
+    ok(vn_conn->path_spaces[0]->cc.cwnd ==
+       quicly_cc_calc_initial_cwnd(quic_ctx.initcwnd_packets, vn_conn->path_spaces[0]->max_udp_payload_size));
+    ok(vn_conn->path_spaces[0]->loss.alarm_at != INT64_MAX);
+    ok(vn_conn->path_spaces[0]->packet_number == 0);
+    ok(vn_conn->egress.max_data.permitted == 0);
+    ok(vn_conn->egress.max_data.sent == 0);
+    ok(vn_conn->egress.max_streams.bidi.count == 0);
+    ok(vn_conn->egress.max_streams.uni.count == 0);
+    ok(early_bidi_stream->streams_blocked);
+    ok(early_uni_stream->streams_blocked);
+    ok(early_bidi_stream->_send_aux.max_stream_data == 0);
+    ok(early_uni_stream->_send_aux.max_stream_data == 0);
+    ok(early_bidi_stream->sendstate.size_inflight == 0);
+    ok(early_uni_stream->sendstate.size_inflight == 0);
+
+    /* The old attempt exhausted its packet budget above; the replacement connection must still be able to send its first flight. */
+    unlock_now(vn_conn);
+    quicly_address_t send_dest, send_src;
+    struct iovec sent_datagram;
+    uint8_t sent_datagram_buf[quic_ctx.transport_params.max_udp_payload_size];
+    size_t num_sent_datagrams = 1;
+    ok(quicly_send(vn_conn, &send_dest, &send_src, &sent_datagram, &num_sent_datagrams, sent_datagram_buf,
+                   sizeof(sent_datagram_buf)) == 0);
+    ok(num_sent_datagrams == 1);
+    lock_now(vn_conn, 0);
+
+    /* Fresh authenticated limits replace, rather than merely increase, the remembered limits. */
+    vn_conn->super.remote.transport_params.max_data = 8;
+    vn_conn->super.remote.transport_params.max_stream_data.bidi_remote = 8;
+    vn_conn->super.remote.transport_params.max_stream_data.uni = 8;
+    vn_conn->super.remote.transport_params.max_streams_bidi = 1;
+    vn_conn->super.remote.transport_params.max_streams_uni = 1;
+    vn_conn->super.remote.transport_params.version_information.chosen_version = QUICLY_PROTOCOL_VERSION_DRAFT29;
+    vn_conn->super.remote.transport_params.version_information.available_versions[0] = QUICLY_PROTOCOL_VERSION_DRAFT29;
+    vn_conn->super.remote.transport_params.version_information.available_versions[1] = 0;
+    vn_conn->super.remote.transport_params.version_information.num_available_versions = 1;
+    ok(apply_remote_transport_params(vn_conn) == 0);
+    open_blocked_streams(vn_conn, 0);
+    open_blocked_streams(vn_conn, 1);
+    ok(!early_bidi_stream->streams_blocked);
+    ok(!early_uni_stream->streams_blocked);
+    ok(early_bidi_stream->_send_aux.max_stream_data == 8);
+    ok(early_uni_stream->_send_aux.max_stream_data == 8);
+    ok(handle_version_negotiation_packet(vn_conn, &vn_packet) == QUICLY_ERROR_PACKET_IGNORED);
+    unlock_now(vn_conn);
+    quicly_free(vn_conn);
+
+    /* create client connection */
+    ret = quicly_connect(&conn, &quic_ctx, "example.com", &fake_address.sa, NULL, new_master_id(), ptls_iovec_init(NULL, 0), NULL,
+                         NULL, NULL);
+    ok(ret == 0);
+
+    /* Chosen Version must match the negotiated version. */
+    conn->super.remote.transport_params.version_information.chosen_version = 0x12345678;
+    conn->super.remote.transport_params.version_information.available_versions[0] = 0x12345678;
+    conn->super.remote.transport_params.version_information.available_versions[1] = 0;
+    conn->super.remote.transport_params.version_information.num_available_versions = 1;
+
+    ret = apply_remote_transport_params(conn);
+    ok(ret == QUICLY_TRANSPORT_ERROR_VERSION_NEGOTIATION_ERROR);
+
+    /* A client does not require the server's Chosen Version to occur in the server's Available Versions. The TLS context callback
+     * is deliberately non-NULL to ensure that endpoint role is obtained from the connection, not the shared context. */
+    ptls_on_client_hello_t *old_on_client_hello = quic_ctx.tls->on_client_hello;
+    quic_ctx.tls->on_client_hello = (ptls_on_client_hello_t *)1;
+    conn->super.remote.transport_params.version_information.chosen_version = conn->super.version;
+    conn->super.remote.transport_params.version_information.available_versions[0] = QUICLY_PROTOCOL_VERSION_DRAFT29;
+    conn->super.remote.transport_params.version_information.available_versions[1] = 0;
+    conn->super.remote.transport_params.version_information.num_available_versions = 1;
+
+    ret = apply_remote_transport_params(conn);
+    ok(ret == 0);
+    quic_ctx.tls->on_client_hello = old_on_client_hello;
+
+    /* Client preference is application policy, not the library's compiled-version order. */
+    static const uint32_t draft_preference[] = {QUICLY_PROTOCOL_VERSION_DRAFT27, QUICLY_PROTOCOL_VERSION_DRAFT29, 0};
+    conn->super.remote.transport_params.version_information.available_versions[0] = QUICLY_PROTOCOL_VERSION_DRAFT29;
+    conn->super.remote.transport_params.version_information.available_versions[1] = QUICLY_PROTOCOL_VERSION_DRAFT27;
+    conn->super.remote.transport_params.version_information.available_versions[2] = 0;
+    conn->super.remote.transport_params.version_information.num_available_versions = 2;
+    quic_ctx.client_version_preference = draft_preference;
+    ok(select_version_from_server_information(conn, &conn->super.remote.transport_params.version_information,
+                                              QUICLY_PROTOCOL_VERSION_DRAFT29) == QUICLY_PROTOCOL_VERSION_DRAFT27);
+    quic_ctx.client_version_preference = quicly_default_version_preference;
+    ok(select_version_from_server_information(conn, &conn->super.remote.transport_params.version_information,
+                                              QUICLY_PROTOCOL_VERSION_DRAFT29) == 0);
+    quic_ctx.client_version_preference = quicly_supported_versions;
+
+    /* After incompatible VN, reconstructing the choice from the authenticated server list must produce the negotiated version. */
+    conn->version_negotiation.original = 0x0a0a0a0a;
+    conn->version_negotiation.received = 1;
+    conn->super.version = QUICLY_PROTOCOL_VERSION_DRAFT29;
+    conn->super.remote.transport_params.version_information.chosen_version = QUICLY_PROTOCOL_VERSION_DRAFT29;
+    conn->super.remote.transport_params.version_information.available_versions[0] = QUICLY_PROTOCOL_VERSION_DRAFT29;
+    conn->super.remote.transport_params.version_information.available_versions[1] = QUICLY_PROTOCOL_VERSION_1;
+    conn->super.remote.transport_params.version_information.available_versions[2] = 0;
+    conn->super.remote.transport_params.version_information.num_available_versions = 2;
+
+    ret = apply_remote_transport_params(conn);
+    ok(ret == QUICLY_TRANSPORT_ERROR_VERSION_NEGOTIATION_ERROR);
+
+    /* An explicitly empty server Available Versions list is invalid after VN. */
+    conn->super.version = QUICLY_PROTOCOL_VERSION_1;
+    conn->super.remote.transport_params.version_information.chosen_version = QUICLY_PROTOCOL_VERSION_1;
+    conn->super.remote.transport_params.version_information.available_versions[0] = 0;
+    conn->super.remote.transport_params.version_information.num_available_versions = 0;
+
+    ret = apply_remote_transport_params(conn);
+    ok(ret == QUICLY_TRANSPORT_ERROR_VERSION_NEGOTIATION_ERROR);
+
+    /* QUIC v1 supplies the RFC 9368 fallback when Version Information is missing after VN. */
+    conn->super.remote.transport_params.version_information = (quicly_version_information_t){0};
+    ret = apply_remote_transport_params(conn);
+    ok(ret == 0);
+    ok(conn->super.remote.transport_params.version_information.chosen_version == QUICLY_PROTOCOL_VERSION_1);
+
+    /* Other versions require authenticated Version Information after VN. */
+    conn->super.version = QUICLY_PROTOCOL_VERSION_DRAFT29;
+    conn->super.remote.transport_params.version_information = (quicly_version_information_t){0};
+    ret = apply_remote_transport_params(conn);
+    ok(ret == QUICLY_TRANSPORT_ERROR_VERSION_NEGOTIATION_ERROR);
+    quicly_free(conn);
+
+    /* A server requires the client's Chosen Version to occur in the client's Available Versions. */
+    ptls_iovec_t remote_cid = ptls_iovec_init("", 0);
+    server = create_connection(
+        &quic_ctx, QUICLY_PROTOCOL_VERSION_1, NULL, &fake_address.sa, NULL, &remote_cid, new_master_id(), NULL, NULL,
+        quicly_cc_calc_initial_cwnd(quic_ctx.initcwnd_packets, quic_ctx.transport_params.max_udp_payload_size));
+    ok(server != NULL);
+    unlock_now(server);
+    ok(!quicly_is_client(server));
+    server->super.remote.transport_params.version_information.chosen_version = QUICLY_PROTOCOL_VERSION_1;
+    server->super.remote.transport_params.version_information.available_versions[0] = QUICLY_PROTOCOL_VERSION_DRAFT29;
+    server->super.remote.transport_params.version_information.available_versions[1] = 0;
+    server->super.remote.transport_params.version_information.num_available_versions = 1;
+
+    ret = apply_remote_transport_params(server);
+    ok(ret == QUICLY_TRANSPORT_ERROR_TRANSPORT_PARAMETER);
+
+    server->super.remote.transport_params.version_information.available_versions[0] = QUICLY_PROTOCOL_VERSION_1;
+    ret = apply_remote_transport_params(server);
+    ok(ret == 0);
+    quicly_free(server);
+
+    quic_ctx.client_version_preference = original_client_version_preference;
+}
+
 int main(int argc, char **argv)
 {
     static ptls_iovec_t cert;
@@ -3009,6 +3324,7 @@ int main(int argc, char **argv)
     subtest("multipath-nonce", test_multipath_nonce);
     subtest("grease-quic-bit", test_grease_quic_bit);
     subtest("cid", test_cid);
+    subtest("version-negotiation", test_version_negotiation);
     subtest("simple", test_simple);
     subtest("stream-concurrency", test_stream_concurrency);
     subtest("lossy", test_lossy);
