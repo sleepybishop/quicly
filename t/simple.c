@@ -25,6 +25,11 @@
 
 static quicly_conn_t *client, *server;
 
+static void zero_random_bytes(void *buf, size_t len)
+{
+    memset(buf, 0, len);
+}
+
 static void test_handshake(void)
 {
     quicly_address_t dest, src;
@@ -52,13 +57,25 @@ static void test_handshake(void)
     ok(ret == 0);
     ok(quicly_get_state(server) == QUICLY_STATE_CONNECTED);
     ok(quicly_connection_is_ready(server));
+    void (*random_bytes)(void *, size_t) = quic_ctx.tls->random_bytes;
+    quic_ctx.tls->random_bytes = zero_random_bytes;
     num_packets = PTLS_ELEMENTSOF(packets);
     ret = quicly_send(server, &dest, &src, packets, &num_packets, packetsbuf, sizeof(packetsbuf));
+    quic_ctx.tls->random_bytes = random_bytes;
     ok(ret == 0);
     ok(num_packets != 0);
 
     /* receive server flight upto ServerFinished, send ClientFinished */
     num_decoded = decode_packets(decoded, packets, num_packets);
+    int saw_initial = 0;
+    for (i = 0; i != num_decoded; ++i) {
+        ok((decoded[i].octets.base[0] & QUICLY_QUIC_BIT) == 0);
+        if (QUICLY_PACKET_IS_INITIAL(decoded[i].octets.base[0])) {
+            saw_initial = 1;
+            ok(decoded[i].datagram_size >= QUICLY_MIN_CLIENT_INITIAL_SIZE);
+        }
+    }
+    ok(saw_initial);
     for (i = 0; i != num_decoded; ++i) {
         ret = quicly_receive(client, NULL, &fake_address.sa, decoded + i);
         ok(ret == 0);
