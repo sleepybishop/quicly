@@ -1946,6 +1946,35 @@ static void test_prague_ecn_disabled(void)
     ok(cc.cwnd == (uint32_t)(before * (QUICLY_USE_ABE ? QUICLY_BETA_ECN : QUICLY_BETA_LOSS)));
 }
 
+static void test_persistent_congestion_cwnd(void)
+{
+    quicly_loss_t loss = {.rtt = {.latest = 100, .smoothed = 100, .minimum = 100, .variance = 0}};
+    quicly_init_cc_t *types[] = {&quicly_cc_reno_init, &quicly_cc_cubic_init, &quicly_cc_cubic_legacy_init, &quicly_cc_pico_init,
+                                 &quicly_cc_cuback_init};
+    uint32_t mtu = 1350;
+    quicly_cc_conf_t conf = quicly_spec_context.egress[0].cc;
+    conf.initcwnd_packets = 10;
+    conf.normalize_mtu = 0;
+
+    for (size_t i = 0; i != PTLS_ELEMENTSOF(types); ++i) {
+        quicly_cc_t cc;
+        types[i]->cb(types[i], &cc, &conf, mtu, 0);
+        cc.type->cc_on_lost(&cc, &loss, mtu, 10, 20, 1000, mtu);
+        uint32_t ssthresh = cc.ssthresh;
+        ok(ssthresh > 2 * mtu);
+        cc.type->cc_on_persistent_congestion(&cc, &loss, 1100, mtu);
+        ok(cc.cwnd == 2 * mtu);
+        ok(cc.ssthresh == ssthresh);
+        /* Persistent congestion exits recovery, allowing later ACKs to resume growth from the minimum window. */
+        ok(cc.recovery_end == 0);
+        cc.type->cc_on_acked(&cc, &loss, mtu, 19, mtu, 1, 20, 1200, mtu, NULL);
+        ok(cc.cwnd > 2 * mtu);
+        ok(cc.cwnd_minimum == 2 * mtu);
+        if (cc.type != &quicly_cc_type_cubic_legacy)
+            ok(cc.state.pico.undo.num_packets_lost == 0);
+    }
+}
+
 void test_cc(void)
 {
     subtest("prague-estimator", test_prague_estimator);
@@ -1983,4 +2012,5 @@ void test_cc(void)
     subtest("pico-undo-jumpstart-loss", test_pico_undo_jumpstart_loss);
     subtest("pico-ecn", test_pico_ecn);
     subtest("pico-ecn-rapid-start", test_pico_ecn_rapid_start);
+    subtest("persistent-congestion-cwnd", test_persistent_congestion_cwnd);
 }
