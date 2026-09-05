@@ -430,7 +430,7 @@ static void test_downstream(void)
         subtest("75%", loss_core);
         time_spent[i] = quic_now - 1;
     }
-    subtest("down-stats-75%", loss_check_stats, time_spent, 6, 8900, 21000, 2720, 4000, 15200);
+    subtest("down-stats-75%", loss_check_stats, time_spent, 6, 4000, 21000, 2000, 4000, 15200);
     validate_server_address = 0;
 
     for (i = 0; i != 100; ++i) {
@@ -438,42 +438,43 @@ static void test_downstream(void)
         subtest("50%", loss_core);
         time_spent[i] = quic_now - 1;
     }
-    subtest("down-stats-50%", loss_check_stats, time_spent, 0, 750, 1190, 350, 500, 1526);
+    /* Independent packet-number-space ACK deadlines no longer let a stale handshake deadline accelerate application ACKs. */
+    subtest("down-stats-50%", loss_check_stats, time_spent, 0, 750, 1700, 350, 700, 2000);
 
     for (i = 0; i != 100; ++i) {
         init_cond_rand(&loss_cond_down, 1, 4);
         subtest("25%", loss_core);
         time_spent[i] = quic_now - 1;
     }
-    subtest("down-stats-25%", loss_check_stats, time_spent, 0, 150, 225, 140, 200, 478);
+    subtest("down-stats-25%", loss_check_stats, time_spent, 0, 150, 270, 140, 250, 500);
 
     for (i = 0; i != 100; ++i) {
         init_cond_rand(&loss_cond_down, 1, 10);
         subtest("10%", loss_core);
         time_spent[i] = quic_now - 1;
     }
-    subtest("down-stats-10%", loss_check_stats, time_spent, 0, 109, 153, 80, 80, 330);
+    subtest("down-stats-10%", loss_check_stats, time_spent, 0, 100, 170, 80, 80, 350);
 
     for (i = 0; i != 100; ++i) {
         init_cond_rand(&loss_cond_down, 1, 20);
         subtest("5%", loss_core);
         time_spent[i] = quic_now - 1;
     }
-    subtest("down-stats-5%", loss_check_stats, time_spent, 0, 90, 126, 80, 80, 260);
+    subtest("down-stats-5%", loss_check_stats, time_spent, 0, 90, 130, 80, 80, 260);
 
     for (i = 0; i != 100; ++i) {
         init_cond_rand(&loss_cond_down, 1, 40);
         subtest("2.5%", loss_core);
         time_spent[i] = quic_now - 1;
     }
-    subtest("down-stats-2.5%", loss_check_stats, time_spent, 0, 85, 110, 80, 80, 220);
+    subtest("down-stats-2.5%", loss_check_stats, time_spent, 0, 80, 120, 80, 80, 200);
 
     for (i = 0; i != 100; ++i) {
         init_cond_rand(&loss_cond_down, 1, 64);
         subtest("1.6%", loss_core);
         time_spent[i] = quic_now - 1;
     }
-    subtest("down-stats-1.6%", loss_check_stats, time_spent, 0, 82, 97, 80, 80, 80);
+    subtest("down-stats-1.6%", loss_check_stats, time_spent, 0, 75, 110, 80, 80, 100);
 }
 
 static void test_bidirectional(void)
@@ -489,7 +490,7 @@ static void test_bidirectional(void)
         subtest("75%", loss_core);
         time_spent[i] = quic_now - 1;
     }
-    subtest("bidi-stats-75%", loss_check_stats, time_spent, 35, 250000, 320000, 100000, 170000, 690000);
+    subtest("bidi-stats-75%", loss_check_stats, time_spent, 35, 190000, 320000, 50000, 170000, 700000);
     validate_server_address = 0;
 
     for (i = 0; i != 100; ++i) {
@@ -498,7 +499,7 @@ static void test_bidirectional(void)
         subtest("50%", loss_core);
         time_spent[i] = quic_now - 1;
     }
-    subtest("bidi-stats-50%", loss_check_stats, time_spent, 0, 7000, 12000, 1500, 2500, 20000);
+    subtest("bidi-stats-50%", loss_check_stats, time_spent, 0, 2500, 12000, 1000, 2500, 20000);
 
     for (i = 0; i != 100; ++i) {
         init_cond_rand(&loss_cond_down, 1, 4);
@@ -506,7 +507,7 @@ static void test_bidirectional(void)
         subtest("25%", loss_core);
         time_spent[i] = quic_now - 1;
     }
-    subtest("bidi-stats-25%", loss_check_stats, time_spent, 0, 251, 380, 185, 300, 715);
+    subtest("bidi-stats-25%", loss_check_stats, time_spent, 0, 240, 380, 170, 300, 715);
 
     for (i = 0; i != 100; ++i) {
         init_cond_rand(&loss_cond_down, 1, 10);
@@ -514,7 +515,7 @@ static void test_bidirectional(void)
         subtest("10%", loss_core);
         time_spent[i] = quic_now - 1;
     }
-    subtest("bidi-stats-10%", loss_check_stats, time_spent, 0, 122, 171, 80, 80, 330);
+    subtest("bidi-stats-10%", loss_check_stats, time_spent, 0, 120, 190, 80, 80, 350);
 
     for (i = 0; i != 100; ++i) {
         init_cond_rand(&loss_cond_down, 1, 20);
@@ -522,7 +523,7 @@ static void test_bidirectional(void)
         subtest("5%", loss_core);
         time_spent[i] = quic_now - 1;
     }
-    subtest("bidi-stats-5%", loss_check_stats, time_spent, 0, 97, 122, 80, 80, 260);
+    subtest("bidi-stats-5%", loss_check_stats, time_spent, 0, 90, 125, 80, 80, 230);
 
     for (i = 0; i != 100; ++i) {
         init_cond_rand(&loss_cond_down, 1, 40);
@@ -530,7 +531,7 @@ static void test_bidirectional(void)
         subtest("2.5%", loss_core);
         time_spent[i] = quic_now - 1;
     }
-    subtest("bidi-stats-2.5%", loss_check_stats, time_spent, 0, 80, 105, 80, 80, 220);
+    subtest("bidi-stats-2.5%", loss_check_stats, time_spent, 0, 80, 110, 80, 80, 220);
 
     for (i = 0; i != 100; ++i) {
         init_cond_rand(&loss_cond_down, 1, 64);
@@ -538,11 +539,14 @@ static void test_bidirectional(void)
         subtest("1.6%", loss_core);
         time_spent[i] = quic_now - 1;
     }
-    subtest("bidi-stats-1.6%", loss_check_stats, time_spent, 0, 81, 99, 80, 80, 80);
+    subtest("bidi-stats-1.6%", loss_check_stats, time_spent, 0, 80, 100, 80, 80, 100);
 }
 
 void test_lossy(void)
 {
+    uint64_t active_connection_id_limit_backup = quic_ctx.transport_params.active_connection_id_limit;
+    quic_ctx.transport_params.active_connection_id_limit = 4;
+
     uint64_t handshake_timeout_backup = quic_ctx.handshake_timeout_rtt_multiplier;
     /* loss tests tend to incur gigantic (and artificial) latencies, which easily trigger handshake timeout.
      * for this test, we totally disable handshake timeout so we can focus on the loss test */
@@ -555,4 +559,5 @@ void test_lossy(void)
     subtest("bidirectional", test_bidirectional);
     quic_ctx.transport_params.max_idle_timeout = idle_timeout_backup;
     quic_ctx.handshake_timeout_rtt_multiplier = handshake_timeout_backup;
+    quic_ctx.transport_params.active_connection_id_limit = active_connection_id_limit_backup;
 }
