@@ -61,6 +61,14 @@ typedef struct st_quicly_sent_packet_t {
      */
     uint8_t promoted_path : 1;
     /**
+     * if the packet was protected using 1-RTT keys (as opposed to 0-RTT, which shares the same packet number space)
+     */
+    uint8_t is_1rtt : 1;
+    /**
+     * if the packet was sent with an ECN-capable codepoint
+     */
+    uint8_t ecn_marked : 1;
+    /**
      * number of bytes in-flight for the packet, from the context of CC (becomes zero when deemed lost, but not when PTO fires)
      */
     uint16_t cc_bytes_in_flight;
@@ -224,6 +232,10 @@ struct st_quicly_sentmap_t {
      */
     size_t bytes_in_flight;
     /**
+     * bytes in-flight by packet number space
+     */
+    size_t bytes_in_flight_by_epoch[QUICLY_NUM_EPOCHS];
+    /**
      * is non-NULL between prepare and commit, pointing to the packet header that is being written to
      */
     quicly_sent_t *_pending_packet;
@@ -304,6 +316,7 @@ inline void quicly_sentmap_commit(quicly_sentmap_t *map, uint16_t bytes_in_fligh
         map->_pending_packet->data.packet.ack_eliciting = 1;
         map->_pending_packet->data.packet.cc_bytes_in_flight = bytes_in_flight;
         map->bytes_in_flight += bytes_in_flight;
+        map->bytes_in_flight_by_epoch[map->_pending_packet->data.packet.ack_epoch] += bytes_in_flight;
     }
     map->_pending_packet->data.packet.frames_in_flight = 1;
     if (promoted_path)

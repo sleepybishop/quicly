@@ -1483,6 +1483,7 @@ static void test_resume_sendrate(void)
     }
 }
 
+
 static void test_jumpstart_cwnd(void)
 {
     ok(derive_jumpstart_cwnd(UINT32_MAX, 1200, 250, 1000000, 250) == 250000);
