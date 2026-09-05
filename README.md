@@ -1,61 +1,13 @@
-quicly [![CI](https://github.com/h2o/quicly/actions/workflows/ci.yml/badge.svg)](https://github.com/h2o/quicly/actions/workflows/ci.yml)
-===
+# quicly
 
-Quicly is an IETF [QUIC](https://quicwg.github.io/) protocol implementation, written from the ground up to be used primarily within the H2O HTTP server.
+This is a fork of [h2o/quicly](https://github.com/h2o/quicly) with support for additional RFCs and Internet-Drafts.
 
-The software is licensed under the MIT License.
+Implemented specifications:
 
-How to build
----
+- [RFC 8899 — Packetization Layer Path MTU Discovery for Datagram Transports](https://datatracker.ietf.org/doc/html/rfc8899)
+- [RFC 9287 — Greasing the QUIC Bit](https://datatracker.ietf.org/doc/html/rfc9287)
+- [RFC 9368 — Compatible Version Negotiation for QUIC](https://datatracker.ietf.org/doc/html/rfc9368)
+- [Multipath QUIC draft-21 — Managing Multiple Paths for a QUIC Connection](https://datatracker.ietf.org/doc/html/draft-ietf-quic-multipath-21)
+- [Flexicast QUIC draft-02 — Combining Unicast and Multicast in a Single QUIC Connection](https://datatracker.ietf.org/doc/html/draft-navarre-quic-flexicast-02)
 
-```
-% git submodule update --init --recursive
-% cmake .
-% make
-```
-
-Building the software requires OpenSSL 1.0.2 or above.
-If you have OpenSSL installed in a non-standard directory, you can pass the location using the `PKG_CONFIG_PATH` environment variable.
-
-```
-% PKG_CONFIG_PATH=/path/to/openssl/lib/pkgconfig cmake .
-```
-
-How to test
----
-
-Install dependencies first:
-
-```
-# If you use system perl, use --sudo
-% curl -sL https://cpanmin.us | perl - --sudo --self-upgrade
-% cpanm --installdeps --notest --sudo .
-
-# Otherwise, you'd better omit --sudo
-% curl -sL https://cpanmin.us | perl - --self-upgrade
-% cpanm --installdeps --notest .
-```
-
-Then, run the tests:
-```
-% make check
-```
-
-Running quicly
----
-
-A command-line program (named `cli`) that runs either as a server or a client `cli` is provided.
-
-To run the command as a client, specify the peer hostname and port number as the arguments.
-
-```
-% ./cli host port
-```
-
-To run the command as a server, specify the files that contain the certificate and private key, as well as the hostname and the port number to which the server should bind.
-
-```
-% ./cli -c server.crt -k server.key 0.0.0.0 4433
-```
-
-For more options, please refer to `./cli --help`.
+The fork also includes miscellaneous RFC 9000 and RFC 9002 compliance fixes.
