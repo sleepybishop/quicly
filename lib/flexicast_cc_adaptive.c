@@ -462,14 +462,13 @@ static void adaptive_on_feedback(void *_state, const quicly_flexicast_feedback_t
             }
         }
     }
-    /* Completion of repair work can acknowledge an old original packet, so
-     * its RTT includes repair scheduling age and is not a fresh path-queue
-     * sample. Explicit ECN remains authoritative. While generic external work
-     * is outstanding, hold delay-based decisions and preserve enough service
-     * rate for that work to drain; otherwise repair-aged ACKs can drive a
-     * circular reduction to the floor. */
+    /* External work shares this pacer, but each Flexicast ACK still measures
+     * the physical packet acknowledged, including a repair packet. External
+     * load freezes growth; it does not invalidate corroborated path evidence.
+     * The aggregate RTT episode below prevents correlated member feedback
+     * from multiplying one queue event into a trip to the floor. */
     congested = feedback->ecn_ce_count != 0 ||
-                (!state->external_load_seen && delay_grew && has_delivery_sample && delivery_ratio_degraded(member));
+                (delay_grew && has_delivery_sample && delivery_ratio_degraded(member));
 
     if (state->floor_recovery_epochs != 0) {
         if (feedback->ecn_ce_count != 0) {
@@ -523,7 +522,7 @@ static void adaptive_on_feedback(void *_state, const quicly_flexicast_feedback_t
         }
         reason |= feedback->ecn_ce_count != 0 ? QUICLY_FLEXICAST_CC_REASON_ECN : QUICLY_FLEXICAST_CC_REASON_RTT;
         member->flat_loss_epochs = 0;
-    } else if (!state->external_load_seen && delay_grew) {
+    } else if (delay_grew) {
         /* A standing TDMA or local pacing queue can raise RTT while delivered
          * throughput remains stable. Hold growth, but require the learned
          * delivery ratio to degrade before treating delay as congestion. */

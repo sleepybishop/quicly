@@ -614,7 +614,7 @@ static void test_builtin_controllers(void)
         quicly_flexicast_cc_on_feedback(cc, &feedback);
     }
     quicly_flexicast_cc_get_output(cc, &output);
-    ok(output.rate_bytes_per_second == 100000); /* repair-aged ACK delay is not fresh queue evidence */
+    ok(output.rate_bytes_per_second == 100000); /* delay without degraded delivery is not enough */
     ok(output.rtt_reduction_events == 0);
     for (uint64_t epoch = 2; epoch <= 32; ++epoch) {
         hints.external_load_epoch = epoch;
@@ -623,7 +623,8 @@ static void test_builtin_controllers(void)
     quicly_flexicast_cc_get_output(cc, &output);
     ok(output.rate_bytes_per_second == 100000); /* repair pressure cannot ratchet the path rate to its floor */
     feedback.latest_rtt_msec = 20;
-    feedback.now = 220;
+    feedback.epoch = 5;
+    feedback.now = 3500;
     quicly_flexicast_cc_on_feedback(cc, &feedback);
     quicly_flexicast_cc_get_output(cc, &output);
     ok(output.rate_bytes_per_second == 100000); /* debt freezes growth */
@@ -632,12 +633,46 @@ static void test_builtin_controllers(void)
         hints = (quicly_flexicast_cc_hints_t){.external_load_epoch = epoch};
         quicly_flexicast_cc_set_hints(cc, &hints, 200 + (int64_t)epoch * 100);
     }
-    feedback.epoch = 5;
-    feedback.now = 520;
+    feedback.epoch = 6;
+    feedback.now = 3700;
     quicly_flexicast_cc_on_feedback(cc, &feedback);
     quicly_flexicast_cc_get_output(cc, &output);
     ok(output.rate_bytes_per_second > 100000); /* sustained low load resumes growth */
     ok(output.rate_increase_events == 1 && output.ack_growth_events == 1);
+    quicly_flexicast_cc_free(cc);
+
+    /* Repair load freezes growth but does not hide corroborated queue
+     * congestion. Correlated feedback remains one aggregate RTT episode. */
+    cc = NULL;
+    ok(quicly_flexicast_cc_create(&cc, &quicly_flexicast_cc_type_adaptive, &config, 100) == 0);
+    quicly_flexicast_cc_on_member_added(cc, 101, 100);
+    hints = (quicly_flexicast_cc_hints_t){.external_load_epoch = 1,
+                                          .external_load_queued_bytes = 4800,
+                                          .external_load_oldest_age_msec = 100,
+                                          .external_load_fraction_ppm = 500000};
+    quicly_flexicast_cc_set_hints(cc, &hints, 110);
+    feedback = (quicly_flexicast_feedback_t){.member_id = 101,
+                                             .acked_packets = 2,
+                                             .delivery_rate_bytes_per_second = 20000,
+                                             .minimum_rtt_msec = 20,
+                                             .latest_rtt_msec = 80,
+                                             .smoothed_rtt_msec = 40};
+    for (uint64_t epoch = 1; epoch <= 3; ++epoch) {
+        feedback.epoch = epoch;
+        feedback.now = 110 + (int64_t)epoch * 10;
+        quicly_flexicast_cc_on_feedback(cc, &feedback);
+    }
+    quicly_flexicast_cc_get_output(cc, &output);
+    uint64_t repair_congested_rate = output.rate_bytes_per_second;
+    ok(repair_congested_rate < config.startup_rate_bytes_per_second);
+    for (uint64_t epoch = 4; epoch <= 20; ++epoch) {
+        feedback.epoch = epoch;
+        feedback.now = 110 + (int64_t)epoch * 10;
+        quicly_flexicast_cc_on_feedback(cc, &feedback);
+    }
+    quicly_flexicast_cc_get_output(cc, &output);
+    ok(output.rate_bytes_per_second == repair_congested_rate);
+    ok(output.rtt_reduction_events == 1);
     quicly_flexicast_cc_free(cc);
 
     config.startup_rate_bytes_per_second = 8000;
