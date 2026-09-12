@@ -3315,6 +3315,7 @@ static void test_version_negotiation(void)
 
     quic_ctx.client_version_preference = original_client_version_preference;
 }
+#include "datagram-queue.h"
 
 int main(int argc, char **argv)
 {
@@ -3392,6 +3393,8 @@ int main(int argc, char **argv)
     subtest("cid", test_cid);
     subtest("version-negotiation", test_version_negotiation);
     subtest("simple", test_simple);
+    subtest("datagram-queue", test_datagram_queue);
+    subtest("sparse-datagram-queues", test_sparse_datagram_queues);
     subtest("stream-concurrency", test_stream_concurrency);
     subtest("lossy", test_lossy);
     subtest("test-nondecryptable-initial", test_nondecryptable_initial);
