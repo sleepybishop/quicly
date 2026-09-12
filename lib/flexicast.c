@@ -694,6 +694,14 @@ int quicly_flexicast_get_member_stats(const quicly_flexicast_flow_t *flow, uint6
     return QUICLY_FLEXICAST_OK;
 }
 
+size_t quicly_flexicast_datagram_size(const quicly_flexicast_flow_t *flow, size_t payload_size)
+{
+    if (flow == NULL || payload_size > QUICLY_FLEXICAST_MAX_DATAGRAM_SIZE)
+        return 0;
+    return 1 + QUICLY_FLEXICAST_FLOW_ID_SIZE + QUICLY_SEND_PN_SIZE +
+           quicly_datagram_frame_capacity(ptls_iovec_init(NULL, payload_size)) + flow->egress.aead->algo->tag_size;
+}
+
 int quicly_flexicast_send_datagram_at(quicly_flexicast_flow_t *flow, ptls_iovec_t payload, uint8_t *packet, size_t packet_capacity,
                                       size_t *packet_size, uint64_t *packet_number, int64_t now)
 {
