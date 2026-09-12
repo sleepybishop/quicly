@@ -53,6 +53,9 @@ extern "C" {
  * format is intentionally private until Flexicast QUIC wire details settle. */
 typedef struct st_quicly_flexicast_flow_t quicly_flexicast_flow_t;
 
+/* Exact protected packet size; zero for an unsupported payload size. */
+size_t quicly_flexicast_datagram_size(const quicly_flexicast_flow_t *flow, size_t payload_size);
+
 typedef enum en_quicly_flexicast_result_t {
     QUICLY_FLEXICAST_OK = 0,
     QUICLY_FLEXICAST_ERROR_INVALID = -1,
