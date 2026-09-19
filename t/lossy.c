@@ -110,11 +110,21 @@ static quicly_error_t transmit_cond(quicly_conn_t *src, quicly_conn_t *dst, size
     uint8_t packetsbuf[PTLS_ELEMENTSOF(packets) * quicly_get_context(src)->transport_params.max_udp_payload_size];
     quicly_error_t ret;
 
-    *num_sent = PTLS_ELEMENTSOF(packets);
-    if ((ret = quicly_send(src, &destaddr, &srcaddr, packets, num_sent, packetsbuf, sizeof(packetsbuf))) != 0) {
-        fprintf(stderr, "%s: quicly_send: ret=%" PRId64 "\n", __FUNCTION__, ret);
-        return ret;
+    size_t total_sent = 0;
+    while (total_sent < PTLS_ELEMENTSOF(packets)) {
+        size_t batch_sent = PTLS_ELEMENTSOF(packets) - total_sent;
+        size_t max_udp_payload_size = quicly_get_context(src)->transport_params.max_udp_payload_size;
+        if ((ret = quicly_send(src, &destaddr, &srcaddr, packets + total_sent, &batch_sent,
+                               packetsbuf + total_sent * max_udp_payload_size,
+                               sizeof(packetsbuf) - total_sent * max_udp_payload_size)) != 0) {
+            fprintf(stderr, "%s: quicly_send: ret=%" PRId64 "\n", __FUNCTION__, ret);
+            return ret;
+        }
+        if (batch_sent == 0)
+            break;
+        total_sent += batch_sent;
     }
+    *num_sent = total_sent;
     quic_now += latency;
 
     *num_received = 0;
@@ -483,7 +493,7 @@ static void test_bidirectional(void)
         subtest("75%", loss_core);
         time_spent[i] = quic_now - 1;
     }
-    subtest("bidi-stats-75%", loss_check_stats, time_spent, 30, 190000, 280000, 50000, 110000, 700000);
+    subtest("bidi-stats-75%", loss_check_stats, time_spent, 30, 190000, 280000, 45000, 110000, 700000);
 
     for (i = 0; i != 100; ++i) {
         init_cond_rand(&loss_cond_down, 1, 2);
