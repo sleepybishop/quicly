@@ -489,6 +489,10 @@ struct st_quicly_context_t {
          */
         uint8_t ecn : 2;
         /**
+         * if RFC 8899 DPLPMTUD should be enabled
+         */
+        uint8_t enable_pmtud : 1;
+        /**
          * if pacing should be used
          */
         uint8_t pacing : 1;
