@@ -71,6 +71,7 @@ const quicly_context_t quicly_spec_context = {
             .pacing_multiplier = QUICLY_DEFAULT_PACING_MULTIPLIER,
             .pacing_multiplier_l4s = QUICLY_DEFAULT_PACING_MULTIPLIER_L4S,
             .ecn = QUICLY_ECN_MODE_CLASSIC,
+            .enable_pmtud = 0,
             .respect_app_limited = 1,
         },
 };
@@ -113,6 +114,7 @@ const quicly_context_t quicly_performant_context = {
             .pacing_multiplier = QUICLY_DEFAULT_PACING_MULTIPLIER,
             .pacing_multiplier_l4s = QUICLY_DEFAULT_PACING_MULTIPLIER_L4S,
             .ecn = QUICLY_ECN_MODE_CLASSIC,
+            .enable_pmtud = 0,
             .respect_app_limited = 1,
         },
 };
