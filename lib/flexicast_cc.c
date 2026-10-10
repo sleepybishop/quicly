@@ -19,7 +19,7 @@
  * FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS
  * IN THE SOFTWARE.
  */
-#include "quicly/flexicast_cc.h"
+#include "flexicast_cc_internal.h"
 
 #include <stdlib.h>
 #include <string.h>
@@ -31,15 +31,6 @@ struct st_quicly_flexicast_cc_t {
     quicly_flexicast_cc_hints_t hints;
     quicly_flexicast_cc_output_t output;
 };
-
-static uint64_t clamp_rate(const quicly_flexicast_cc_config_t *config, uint64_t rate)
-{
-    if (rate < config->minimum_rate_bytes_per_second)
-        rate = config->minimum_rate_bytes_per_second;
-    if (config->maximum_rate_bytes_per_second != 0 && rate > config->maximum_rate_bytes_per_second)
-        rate = config->maximum_rate_bytes_per_second;
-    return rate;
-}
 
 static void normalize_output(quicly_flexicast_cc_t *cc)
 {
@@ -64,22 +55,14 @@ static void record_transition(quicly_flexicast_cc_t *cc, uint64_t previous_rate)
         else
             ++cc->output.other_growth_events;
     } else if (rate < previous_rate) {
-        int classified = 0;
         ++cc->output.rate_reduction_events;
-#define COUNT_REDUCTION(reason_bit, counter)                                                                                       \
-    do {                                                                                                                           \
-        if ((reason & (reason_bit)) != 0) {                                                                                        \
-            ++cc->output.counter;                                                                                                  \
-            classified = 1;                                                                                                        \
-        }                                                                                                                          \
-    } while (0)
-        COUNT_REDUCTION(QUICLY_FLEXICAST_CC_REASON_LOSS, loss_reduction_events);
-        COUNT_REDUCTION(QUICLY_FLEXICAST_CC_REASON_RTT, rtt_reduction_events);
-        COUNT_REDUCTION(QUICLY_FLEXICAST_CC_REASON_ECN, ecn_reduction_events);
-        COUNT_REDUCTION(QUICLY_FLEXICAST_CC_REASON_TIMEOUT, timeout_reduction_events);
-        COUNT_REDUCTION(QUICLY_FLEXICAST_CC_REASON_RATE_LIMIT, rate_limit_reduction_events);
-#undef COUNT_REDUCTION
-        if (!classified)
+        cc->output.loss_reduction_events += (reason & QUICLY_FLEXICAST_CC_REASON_LOSS) != 0;
+        cc->output.rtt_reduction_events += (reason & QUICLY_FLEXICAST_CC_REASON_RTT) != 0;
+        cc->output.ecn_reduction_events += (reason & QUICLY_FLEXICAST_CC_REASON_ECN) != 0;
+        cc->output.timeout_reduction_events += (reason & QUICLY_FLEXICAST_CC_REASON_TIMEOUT) != 0;
+        cc->output.rate_limit_reduction_events += (reason & QUICLY_FLEXICAST_CC_REASON_RATE_LIMIT) != 0;
+        if ((reason & (QUICLY_FLEXICAST_CC_REASON_LOSS | QUICLY_FLEXICAST_CC_REASON_RTT | QUICLY_FLEXICAST_CC_REASON_ECN |
+                       QUICLY_FLEXICAST_CC_REASON_TIMEOUT | QUICLY_FLEXICAST_CC_REASON_RATE_LIMIT)) == 0)
             ++cc->output.other_reduction_events;
     }
     if (!previous_at_floor && at_floor)
@@ -96,8 +79,7 @@ int quicly_flexicast_cc_create(quicly_flexicast_cc_t **cc, quicly_flexicast_cc_t
 {
     quicly_flexicast_cc_t *new_cc;
 
-    if (cc == NULL || type == NULL || type->name == NULL || config == NULL || config->maximum_datagram_size == 0 ||
-        config->maximum_members > QUICLY_FLEXICAST_CC_HARD_MAX_MEMBERS)
+    if (cc == NULL || type == NULL || type->name == NULL || !valid_cc_config(config))
         return -1;
     *cc = NULL;
     if ((new_cc = calloc(1, sizeof(*new_cc))) == NULL)
@@ -110,6 +92,8 @@ int quicly_flexicast_cc_create(quicly_flexicast_cc_t **cc, quicly_flexicast_cc_t
     new_cc->config = *config;
     if (new_cc->config.maximum_members == 0)
         new_cc->config.maximum_members = QUICLY_FLEXICAST_CC_DEFAULT_MAX_MEMBERS;
+    if (new_cc->config.feedback_timeout_msec == 0)
+        new_cc->config.feedback_timeout_msec = 1000;
     new_cc->output.rate_bytes_per_second = config->startup_rate_bytes_per_second;
     new_cc->output.burst_bytes = (uint64_t)config->maximum_datagram_size * 4;
     new_cc->output.next_timeout = INT64_MAX;
@@ -129,7 +113,6 @@ void quicly_flexicast_cc_free(quicly_flexicast_cc_t *cc)
     if (cc->type->dispose != NULL)
         cc->type->dispose(cc->state);
     free(cc->state);
-    memset(cc, 0, sizeof(*cc));
     free(cc);
 }
 
@@ -139,6 +122,7 @@ void quicly_flexicast_cc_on_member_added(quicly_flexicast_cc_t *cc, uint64_t mem
     if (cc == NULL || member_id == 0)
         return;
     previous_rate = cc->output.rate_bytes_per_second;
+    cc->output.reason = QUICLY_FLEXICAST_CC_REASON_NONE;
     if (cc->type->on_member_added != NULL)
         cc->type->on_member_added(cc->state, member_id, now, &cc->output);
     normalize_output(cc);
@@ -151,6 +135,7 @@ void quicly_flexicast_cc_on_member_removed(quicly_flexicast_cc_t *cc, uint64_t m
     if (cc == NULL || member_id == 0)
         return;
     previous_rate = cc->output.rate_bytes_per_second;
+    cc->output.reason = QUICLY_FLEXICAST_CC_REASON_NONE;
     if (cc->type->on_member_removed != NULL)
         cc->type->on_member_removed(cc->state, member_id, now, &cc->output);
     normalize_output(cc);
@@ -163,6 +148,7 @@ void quicly_flexicast_cc_on_epoch_reset(quicly_flexicast_cc_t *cc, int64_t now)
     if (cc == NULL)
         return;
     previous_rate = cc->output.rate_bytes_per_second;
+    cc->output.reason = QUICLY_FLEXICAST_CC_REASON_NONE;
     if (cc->type->on_epoch_reset != NULL)
         cc->type->on_epoch_reset(cc->state, now, &cc->output);
     normalize_output(cc);
@@ -172,9 +158,10 @@ void quicly_flexicast_cc_on_epoch_reset(quicly_flexicast_cc_t *cc, int64_t now)
 void quicly_flexicast_cc_on_feedback(quicly_flexicast_cc_t *cc, const quicly_flexicast_feedback_t *feedback)
 {
     uint64_t previous_rate;
-    if (cc == NULL || feedback == NULL)
+    if (cc == NULL || feedback == NULL || feedback->member_id == 0)
         return;
     previous_rate = cc->output.rate_bytes_per_second;
+    cc->output.reason = QUICLY_FLEXICAST_CC_REASON_NONE;
     if (cc->type->on_feedback != NULL)
         cc->type->on_feedback(cc->state, feedback, &cc->output);
     normalize_output(cc);
@@ -187,6 +174,7 @@ void quicly_flexicast_cc_on_timeout(quicly_flexicast_cc_t *cc, int64_t now)
     if (cc == NULL)
         return;
     previous_rate = cc->output.rate_bytes_per_second;
+    cc->output.reason = QUICLY_FLEXICAST_CC_REASON_NONE;
     if (cc->type->on_timeout != NULL)
         cc->type->on_timeout(cc->state, now, &cc->output);
     normalize_output(cc);
@@ -199,6 +187,7 @@ void quicly_flexicast_cc_set_hints(quicly_flexicast_cc_t *cc, const quicly_flexi
     if (cc == NULL || hints == NULL)
         return;
     previous_rate = cc->output.rate_bytes_per_second;
+    cc->output.reason = QUICLY_FLEXICAST_CC_REASON_NONE;
     cc->hints = *hints;
     if (cc->type->set_hints != NULL)
         cc->type->set_hints(cc->state, &cc->hints, now, &cc->output);

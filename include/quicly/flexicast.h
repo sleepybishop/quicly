@@ -31,8 +31,8 @@ extern "C" {
 #include "quicly.h"
 
 #define QUICLY_FLEXICAST_FLOW_ID_SIZE 8
-#define QUICLY_FLEXICAST_DEFAULT_MAX_MEMBERS 64
-#define QUICLY_FLEXICAST_HARD_MAX_MEMBERS 16384
+#define QUICLY_FLEXICAST_DEFAULT_MAX_MEMBERS QUICLY_FLEXICAST_CC_DEFAULT_MAX_MEMBERS
+#define QUICLY_FLEXICAST_HARD_MAX_MEMBERS QUICLY_FLEXICAST_CC_HARD_MAX_MEMBERS
 #define QUICLY_FLEXICAST_SENT_WINDOW 2048
 #define QUICLY_FLEXICAST_REPLAY_WINDOW 64
 #define QUICLY_FLEXICAST_MAX_DATAGRAM_SIZE 65535
@@ -52,9 +52,6 @@ extern "C" {
 /* This is an experimental DATAGRAM-only shared-path primitive. Its packet
  * format is intentionally private until Flexicast QUIC wire details settle. */
 typedef struct st_quicly_flexicast_flow_t quicly_flexicast_flow_t;
-
-/* Exact protected packet size; zero for an unsupported payload size. */
-size_t quicly_flexicast_datagram_size(const quicly_flexicast_flow_t *flow, size_t payload_size);
 
 typedef enum en_quicly_flexicast_result_t {
     QUICLY_FLEXICAST_OK = 0,
@@ -148,6 +145,8 @@ void quicly_flexicast_flow_free(quicly_flexicast_flow_t *flow);
 uint64_t quicly_flexicast_get_flow_id(const quicly_flexicast_flow_t *flow);
 uint64_t quicly_flexicast_get_next_packet_number(const quicly_flexicast_flow_t *flow);
 
+/* member IDs are nonzero; attach is idempotent; after rekey it reactivates a
+ * known member while retaining its statistics and controller history */
 int quicly_flexicast_attach(quicly_flexicast_flow_t *flow, uint64_t member_id);
 int quicly_flexicast_attach_at(quicly_flexicast_flow_t *flow, uint64_t member_id, int64_t now);
 int quicly_flexicast_detach(quicly_flexicast_flow_t *flow, uint64_t member_id);
@@ -155,6 +154,9 @@ int quicly_flexicast_detach_at(quicly_flexicast_flow_t *flow, uint64_t member_id
 size_t quicly_flexicast_num_members(const quicly_flexicast_flow_t *flow);
 int quicly_flexicast_get_member_stats(const quicly_flexicast_flow_t *flow, uint64_t member_id,
                                       quicly_flexicast_member_stats_t *stats);
+
+/* exact protected packet size; zero for a NULL flow or unsupported payload size */
+size_t quicly_flexicast_datagram_size(const quicly_flexicast_flow_t *flow, size_t payload_size);
 
 /* Builds one protected short-header packet containing exactly one DATAGRAM
  * frame. The same returned bytes may be sent to every attached member. */

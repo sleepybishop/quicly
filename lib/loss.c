@@ -27,7 +27,7 @@ quicly_error_t quicly_loss_init_sentmap_iter(quicly_loss_t *loss, quicly_sentmap
 {
     quicly_sentmap_init_iter(&loss->sentmap, iter);
 
-    int64_t retire_before = now - quicly_loss_get_sentmap_expiration_time(loss, max_ack_delay);
+    double retire_before = now - quicly_loss_get_sentmap_expiration_time(loss, max_ack_delay);
 
     /* Retire entries older than the time specified, unless the connection is alive and the number of packets in the sentmap is
      * below 32 packets. This exception (the threshold of 32) exists to be capable of recognizing excessively late-ACKs when under
@@ -72,12 +72,12 @@ static int has_ack_between(const quicly_loss_t *loss, size_t *range_index, uint6
 static void detect_persistent_congestion(quicly_loss_t *loss, uint32_t max_ack_delay,
                                          quicly_loss_on_persistent_congestion_cb on_persistent_congestion)
 {
-    int64_t start_at = INT64_MAX;
+    double start_at = INFINITY;
     uint64_t previous_lost_pn = UINT64_MAX, detected_pn = UINT64_MAX;
     size_t ack_range_index = 0;
     quicly_sentmap_iter_t iter;
     const quicly_sent_packet_t *sent;
-    int64_t congestion_period = 3 * (int64_t)quicly_rtt_get_pto(&loss->rtt, max_ack_delay, loss->conf->min_pto);
+    double congestion_period = 3 * quicly_rtt_get_pto(&loss->rtt, max_ack_delay, loss->conf->min_pto);
 
     quicly_sentmap_init_iter(&loss->sentmap, &iter);
     while ((sent = quicly_sentmap_get(&iter))->packet_number != UINT64_MAX) {
@@ -85,7 +85,7 @@ static void detect_persistent_congestion(quicly_loss_t *loss, uint32_t max_ack_d
             sent->cc_bytes_in_flight == 0) {
             /* ACKed entries have already left the sentmap, so consult the retained ACK history for gaps. An outstanding packet
              * does not interrupt the period; RFC 9002 Section 7.6.2 only excludes periods containing an acknowledged packet. */
-            if (start_at == INT64_MAX || has_ack_between(loss, &ack_range_index, previous_lost_pn, sent->packet_number))
+            if (start_at == INFINITY || has_ack_between(loss, &ack_range_index, previous_lost_pn, sent->packet_number))
                 start_at = sent->sent_at;
             previous_lost_pn = sent->packet_number;
             if (start_at < sent->sent_at && sent->sent_at - start_at > congestion_period)
@@ -109,14 +109,18 @@ quicly_error_t quicly_loss_detect_loss_after_ack(quicly_loss_t *loss, int64_t no
     /* This function ensures that the value returned in loss_time is when the next application timer should be set for loss
      * detection. if no timer is required, loss_time is set to INT64_MAX. */
 
-    const float rtt_for_threshold = loss->rtt.latest > loss->rtt.smoothed ? (float)loss->rtt.latest : loss->rtt.smoothed;
-    const uint32_t delay_until_lost = (uint32_t)ceilf(rtt_for_threshold * (1024 + loss->thresholds.time_based_percentile) / 1024);
+    const float rtt_for_threshold = loss->rtt.latest > loss->rtt.smoothed ? loss->rtt.latest : loss->rtt.smoothed;
+    double delay_until_lost = (double)rtt_for_threshold * (1024 + loss->thresholds.time_based_percentile) / 1024;
+    if (delay_until_lost < 1)
+        delay_until_lost = 1;
     quicly_sentmap_iter_t iter;
     const quicly_sent_packet_t *sent;
     quicly_error_t ret;
     int newly_lost_ack_eliciting = 0;
 
-#define CHECK_TIME_THRESHOLD(sent) ((sent)->sent_at <= now - delay_until_lost)
+    /* Share the deadline calculation between loss detection and timer scheduling to keep floating-point rounding consistent. */
+#define LOSS_DEADLINE(sent) ((sent)->sent_at + delay_until_lost)
+#define CHECK_TIME_THRESHOLD(sent) (LOSS_DEADLINE(sent) <= now)
 #define CHECK_PACKET_THRESHOLD(sent)                                                                                               \
     (loss->thresholds.use_packet_based &&                                                                                          \
      (int64_t)(sent)->packet_number <= largest_acked_signed - QUICLY_LOSS_DEFAULT_PACKET_THRESHOLD)
@@ -159,15 +163,17 @@ quicly_error_t quicly_loss_detect_loss_after_ack(quicly_loss_t *loss, int64_t no
     }
 
     /* schedule time-threshold alarm if there is a packet outstanding that is smaller than largest_acked */
-    while (sent->sent_at != INT64_MAX && sent->packet_number + 1 < loss->largest_acked_packet_plus1.per_epoch[sent->ack_epoch]) {
+    while (sent->sent_at != INFINITY && sent->packet_number + 1 < loss->largest_acked_packet_plus1.per_epoch[sent->ack_epoch]) {
         if (sent->cc_bytes_in_flight != 0) {
-            assert(now < sent->sent_at + delay_until_lost);
-            loss->loss_time = sent->sent_at + delay_until_lost;
+            assert(now < LOSS_DEADLINE(sent));
+            loss->loss_time = ceil(LOSS_DEADLINE(sent));
             break;
         }
         quicly_sentmap_skip(&iter);
         sent = quicly_sentmap_get(&iter);
     }
+
+#undef LOSS_DEADLINE
 
     if (newly_lost_ack_eliciting)
         detect_persistent_congestion(loss, max_ack_delay, on_persistent_congestion);

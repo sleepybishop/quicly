@@ -489,7 +489,8 @@ inline quicly_error_t quicly_decode_reset_stream_frame(const uint8_t **src, cons
         goto Error;
     if ((frame->app_error_code = quicly_decodev(src, end)) == UINT64_MAX)
         goto Error;
-    frame->final_size = quicly_decodev(src, end);
+    if ((frame->final_size = quicly_decodev(src, end)) == UINT64_MAX)
+        goto Error;
     return 0;
 Error:
     return QUICLY_TRANSPORT_ERROR_FRAME_ENCODING;
@@ -733,12 +734,14 @@ inline quicly_error_t quicly_decode_new_connection_id_frame(const uint8_t **src,
     /* The Retire Prior To field MUST be less than or equal to the Sequence Number field. */
     if (frame->sequence < frame->retire_prior_to)
         goto Fail;
-    if (end - *src < 1)
-        goto Fail;
 
     { /* cid */
+        if (end - *src < 1)
+            goto Fail;
         uint8_t cid_len = *(*src)++;
         if (!(1 <= cid_len && cid_len <= QUICLY_MAX_CID_LEN_V1))
+            goto Fail;
+        if (end - *src < cid_len)
             goto Fail;
         frame->cid = ptls_iovec_init(*src, cid_len);
         *src += cid_len;
@@ -825,7 +828,8 @@ inline uint8_t *quicly_encode_datagram_frame(uint8_t *dst, ptls_iovec_t payload)
 {
     dst = quicly_encodev(dst, QUICLY_FRAME_TYPE_DATAGRAM_WITHLEN);
     dst = quicly_encodev(dst, payload.len);
-    memcpy(dst, payload.base, payload.len);
+    if (payload.len != 0)
+        memcpy(dst, payload.base, payload.len);
     dst += payload.len;
     return dst;
 }

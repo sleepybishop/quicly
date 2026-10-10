@@ -26,7 +26,7 @@ static int has_pending(quicly_local_cid_set_t *set)
     return set->cids[0].state == QUICLY_LOCAL_CID_STATE_PENDING;
 }
 
-/*
+/**
  * generates a new CID and increments sequence. returns true if successfully generated.
  */
 static int generate_cid(quicly_local_cid_set_t *set, size_t idx)
@@ -49,7 +49,7 @@ static void swap_cids(quicly_local_cid_t *a, quicly_local_cid_t *b)
     *a = tmp;
 }
 
-/*
+/**
  * change the state of a CID to PENDING, and move it forward so CIDs in pending state form FIFO
  */
 static void do_mark_pending(quicly_local_cid_set_t *set, size_t idx)

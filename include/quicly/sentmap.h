@@ -41,9 +41,9 @@ typedef struct st_quicly_sent_packet_t {
      */
     uint64_t packet_number;
     /**
-     *
+     * time at which the packet was sent (or INFINITY for the end-of-iteration sentinel)
      */
-    int64_t sent_at;
+    double sent_at;
     /**
      * epoch to be acked in
      */
@@ -85,6 +85,11 @@ typedef struct st_quicly_sent_packet_t {
      * number of bytes in-flight for the packet, from the context of CC (becomes zero when deemed lost, but not when PTO fires)
      */
     uint16_t cc_bytes_in_flight;
+    /**
+     * UDP payload size for PMTU confirmation and black-hole detection. Set on the last ack-eliciting packet in each datagram
+     * only, so that loss of coalesced packets counts as a single lost datagram.
+     */
+    uint16_t pmtud_datagram_size;
 } quicly_sent_packet_t;
 
 typedef enum en_quicly_sentmap_event_t {
@@ -300,7 +305,7 @@ static int quicly_sentmap_is_open(quicly_sentmap_t *map);
 /**
  * prepares a write
  */
-quicly_error_t quicly_sentmap_prepare(quicly_sentmap_t *map, uint64_t packet_number, int64_t now, uint8_t ack_epoch);
+quicly_error_t quicly_sentmap_prepare(quicly_sentmap_t *map, uint64_t packet_number, double now, uint8_t ack_epoch);
 /**
  * commits a write
  */

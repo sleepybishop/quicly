@@ -72,6 +72,9 @@ typedef struct st_quicly_remote_cid_t {
 
 #define QUICLY_REMOTE_ACTIVE_CONNECTION_ID_LIMIT (QUICLY_LOCAL_ACTIVE_CONNECTION_ID_LIMIT * 4)
 
+/**
+ * structure to hold active connection IDs received from the remote peer
+ */
 typedef struct st_quicly_remote_cid_set_t {
     /**
      * We retain QUICLY_REMOTE_ACTIVE_CONNECTION_ID_LIMIT active connection IDs. `cids[0]` used to retain the current DCID, but it
@@ -93,7 +96,9 @@ typedef struct st_quicly_remote_cid_set_t {
 } quicly_remote_cid_set_t;
 
 /**
- * initializes connection ID set
+ * Initializes the set. If `initial_cid` is NULL, the first value is automatically generated so that the endpoint running as client
+ * can use it. Stateless reset token of the initial CID is set to a random value so that it would not match against any value being
+ * received.
  */
 void quicly_remote_cid_init_set(quicly_remote_cid_set_t *set, ptls_iovec_t *initial_cid, void (*random_bytes)(void *, size_t));
 /**
@@ -102,6 +107,10 @@ void quicly_remote_cid_init_set(quicly_remote_cid_set_t *set, ptls_iovec_t *init
  */
 quicly_error_t quicly_remote_cid_register(quicly_remote_cid_set_t *set, uint64_t sequence, const uint8_t *cid, size_t cid_len,
                                           const uint8_t srt[QUICLY_STATELESS_RESET_TOKEN_LEN], uint64_t retire_prior_to);
+/**
+ * Unregisters specified CID from the store, pushing the unregistered CID onto the retired queue. The former always succeeds, while
+ * the latter might fail due to state exhaustion, in which case an error is returned.
+ */
 int quicly_remote_cid_unregister(quicly_remote_cid_set_t *set, uint64_t sequence);
 /**
  * pushes a CID sequence number to the retired queue

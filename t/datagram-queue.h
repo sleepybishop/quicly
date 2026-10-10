@@ -47,9 +47,6 @@ static void test_sparse_datagram_queues(void)
     quicly_path_space_t ps = {0};
     struct st_quicly_conn_path_t path = {0};
     ok(!quicly_has_datagram_frames(&conn));
-    conn.egress.datagram_frame_payloads.count = 1;
-    ok(quicly_has_datagram_frames(&conn));
-    conn.egress.datagram_frame_payloads.count = 0;
     /* Holes and the highest candidate index must not hide queued work.
      * Abandoned paths retain their queues until the normal cleanup runs. */
     for (size_t i = 0; i < PTLS_ELEMENTSOF(conn.path_spaces); ++i) {

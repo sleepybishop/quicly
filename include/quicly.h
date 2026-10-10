@@ -46,6 +46,13 @@ extern "C" {
 #include "quicly/cid.h"
 #include "quicly/remote_cid.h"
 
+/**
+ * Compatibility when updating from the pre-multipath API: rebuild consumers against matching headers and library. Path
+ * scheduler structures include optional eligibility and data-readiness callbacks (initialize unused members to NULL). CID plaintext
+ * thread_id is 16 bits, reduced from 24; applications must update routing encoders and decoders together. Public connection CID
+ * sets are initial snapshots; use the CID and tuple accessors for live state. These changes are not a binary-compatible upgrade.
+ */
+
 /* invariants! */
 #define QUICLY_LONG_HEADER_BIT 0x80
 #define QUICLY_QUIC_BIT 0x40
@@ -169,10 +176,23 @@ typedef struct st_quicly_stream_scheduler_t {
  */
 typedef struct st_quicly_path_scheduler_t {
     /**
-     * Called by quicly to select which path to send data on.
+     * Called by quicly to select which path to send data on, after servicing validation and due multipath maintenance.
      * The scheduler should invoke `quicly_send_on_path` to build datagrams for the chosen path.
      */
     quicly_error_t (*do_send)(struct st_quicly_path_scheduler_t *sched, quicly_conn_t *conn, quicly_send_context_t *s);
+    /**
+     * optional physical socket/address eligibility, applied to every emission route and send deadline. NULL permits all paths.
+     * called for existing local path indices, including validation and closing. must be non-mutating and stable during a send
+     * call; may use read-only path accessors, but must not call send, receive, timeout, or eligibility callbacks recursively.
+     * the application must wake its event loop when eligibility changes. this is not a congestion or data-preference filter.
+     */
+    int (*is_path_eligible)(struct st_quicly_path_scheduler_t *sched, quicly_conn_t *conn, size_t path_index);
+    /**
+     * optional additional data-readiness filter for deadline reporting. zero means the scheduler will not place application
+     * data on this path now; maintenance remains eligible. NULL assumes any queued datagram or affinity-compatible stream can
+     * be selected. the application must arrange a wakeup when its policy changes. same callback restrictions as above.
+     */
+    int (*can_send_data)(struct st_quicly_path_scheduler_t *sched, quicly_conn_t *conn, size_t path_index);
 } quicly_path_scheduler_t;
 
 extern quicly_path_scheduler_t quicly_default_path_scheduler;
@@ -197,10 +217,10 @@ QUICLY_CALLBACK_TYPE(quicly_error_t, receive_flexicast_ack, quicly_conn_t *conn,
  */
 QUICLY_CALLBACK_TYPE(void, closed, quicly_conn_t *conn);
 /**
- * Returns current time in milliseconds. The returned value MUST monotonically increase (i.e., it is the responsibility of the
- * callback implementation to guarantee that the returned value never goes back to the past).
+ * Returns current time in milliseconds, retaining fractional milliseconds. The value MUST monotonically increase
+ * (i.e., it is the responsibility of the callback implementation to guarantee that the value never goes back to the past).
  */
-QUICLY_CALLBACK_TYPE0(int64_t, now);
+QUICLY_CALLBACK_TYPE(void, now, double *now);
 /**
  * called when a NEW_TOKEN token is received on a connection
  */
@@ -211,10 +231,9 @@ QUICLY_CALLBACK_TYPE(quicly_error_t, save_resumption_token, quicly_conn_t *conn,
 QUICLY_CALLBACK_TYPE(quicly_error_t, generate_resumption_token, quicly_conn_t *conn, ptls_buffer_t *buf,
                      quicly_address_token_plaintext_t *token);
 /**
- * called to initialize a congestion controller for a new connection.
- * should in turn call one of the quicly_cc_*_init functions from cc.h with customized parameters.
+ * called to initialize a congestion controller for a new connection or path.
  */
-QUICLY_CALLBACK_TYPE(void, init_cc, quicly_cc_t *cc, uint32_t initcwnd, int normalize_mtu, int64_t now);
+QUICLY_CALLBACK_TYPE(void, init_cc, quicly_cc_t *cc, const quicly_cc_conf_t *conf, uint16_t max_udp_payload_size, int64_t now);
 /**
  * reference counting.
  * delta must be either 1 or -1.
@@ -341,15 +360,15 @@ typedef struct st_quicly_transport_parameters_t {
     uint8_t enable_multipath : 1;
     /** multipath extension maximum path ID */
     uint64_t initial_max_path_id;
+    /* grease_quic_bit (RFC 9287) */
+    uint8_t grease_quic_bit : 1;
+    /* version information (RFC 9368) */
+    quicly_version_information_t version_information;
     /** address families supported by draft-navarre-quic-flexicast-02 */
     struct {
         uint8_t ipv4 : 1;
         uint8_t ipv6 : 1;
     } flexicast_support;
-    /* grease_quic_bit (RFC 9287) */
-    uint8_t grease_quic_bit : 1;
-    /* version information (RFC 9368) */
-    quicly_version_information_t version_information;
 } quicly_transport_parameters_t;
 
 typedef struct st_quicly_salt_t {
@@ -359,6 +378,11 @@ typedef struct st_quicly_salt_t {
         uint8_t iv[PTLS_AESGCM_IV_SIZE];
     } retry;
 } quicly_salt_t;
+
+/**
+ * number of alternative egress contexts (i.e., `quicly_context_t::egress[1..QUICLY_NUM_ALT_EGRESS]`)
+ */
+#define QUICLY_NUM_ALT_EGRESS 3
 
 struct st_quicly_context_t {
     /**
@@ -373,10 +397,6 @@ struct st_quicly_context_t {
      */
     uint16_t initial_egress_max_udp_payload_size;
     /**
-     * loss detection parameters
-     */
-    quicly_loss_conf_t loss;
-    /**
      * transport parameters
      */
     quicly_transport_parameters_t transport_params;
@@ -388,10 +408,6 @@ struct st_quicly_context_t {
      * maximum number of bytes that can be transmitted on a CRYPTO stream (per each epoch)
      */
     uint32_t max_crypto_bytes;
-    /**
-     * initial CWND in terms of packet numbers
-     */
-    uint32_t initcwnd_packets;
     /**
      * (client-only) Initial QUIC protocol version used by the client. Setting this to a greased version will enforce version
      * negotiation.
@@ -437,54 +453,6 @@ struct st_quicly_context_t {
      */
     uint64_t max_path_validation_failures;
     /**
-     * Jumpstart CWND to be used when there is no previous information. If set to zero, slow start is used. Note jumpstart is
-     * possible only when the use_pacing flag is set.
-     */
-    uint32_t default_jumpstart_cwnd_packets;
-    /**
-     * Maximum jumpstart CWND to be used for connections with previous delivery rate information (i.e., resuming connections). If
-     * set to zero, slow start is used.
-     */
-    uint32_t max_jumpstart_cwnd_packets;
-    /**
-     * Probabilities for enabling jumpstart when they are configured, multiplied by 255. 0 means never, 255 (default) means always.
-     */
-    struct {
-        struct {
-            uint8_t non_resume;
-            uint8_t resume;
-        } jumpstart;
-        /**
-         * if rapid cstart should be used
-         */
-        uint8_t rapid_start;
-        /**
-         * whether to use ECN on the send side; ECN is always on on the receive side
-         */
-        uint8_t ecn;
-        /**
-         * if pacing should be used
-         */
-        uint8_t pacing;
-        /**
-         * if CC should take app-limited into consideration
-         */
-        uint8_t respect_app_limited;
-        /**
-         * if RFC 8899 DPLPMTUD should be enabled
-         */
-        uint8_t enable_pmtud;
-    } enable_ratio;
-    /**
-     * expand client hello so that it does not fit into one datagram
-     */
-    unsigned expand_client_hello : 1;
-    /**
-     * if CC growth should be normalized to the reference packet size rather than the path's maximum UDP payload size; enabled in
-     * the default contexts
-     */
-    unsigned normalize_cc_mtu : 1;
-    /**
      *
      */
     quicly_cid_encryptor_t *cid_encryptor;
@@ -529,10 +497,6 @@ struct st_quicly_context_t {
      */
     quicly_crypto_engine_t *crypto_engine;
     /**
-     * initializes a congestion controller for given connection
-     */
-    quicly_init_cc_t *init_cc;
-    /**
      * optional refcount callback
      */
     quicly_update_open_count_t *update_open_count;
@@ -540,6 +504,65 @@ struct st_quicly_context_t {
      *
      */
     quicly_async_handshake_t *async_handshake;
+    /**
+     * expand client hello so that it does not fit into one datagram
+     */
+    unsigned expand_client_hello : 1;
+    /**
+     * probability of using each alternative egress context, multiplied by 255; `alt_egress_ratio[i]` is the probability of using
+     * `egress[i + 1]`. The sum must not exceed 255; the remainder is the probability of using `egress[0]`. All zero (default)
+     * means `egress[0]` is always used.
+     */
+    uint8_t alt_egress_ratio[QUICLY_NUM_ALT_EGRESS];
+    /**
+     * egress settings (i.e., loss recovery and congestion control); one is chosen for each connection based on `alt_egress_ratio`
+     */
+    struct st_quicly_context_egress_t {
+        /**
+         * loss detection parameters
+         */
+        quicly_loss_conf_t loss;
+        /**
+         * congestion control parameters
+         */
+        quicly_cc_conf_t cc;
+        /**
+         * Jumpstart CWND to be used when there is no previous information. If set to zero, slow start is used. Note jumpstart is
+         * possible only when the `pacing` flag is set.
+         */
+        uint32_t default_jumpstart_packets;
+        /**
+         * Maximum jumpstart CWND to be used for connections with previous delivery rate information (i.e., resuming connections).
+         * If set to zero, slow start is used.
+         */
+        uint32_t max_jumpstart_packets;
+        /**
+         * prepares jumpstart but disengages before any action; provided for A/B testing between connections eligible for jumpstart
+         */
+        uint8_t disengage_jumpstart : 1;
+        /**
+         * whether to use ECN on the send side; ECN is always on on the receive side
+         */
+        uint8_t ecn : 1;
+        /**
+         * if RFC 8899 DPLPMTUD should be enabled
+         */
+        uint8_t enable_pmtud : 1;
+        /**
+         * if pacing should be used
+         */
+        uint8_t pacing : 1;
+        /**
+         * if CC should take app-limited into consideration
+         */
+        uint8_t respect_app_limited : 1;
+    } egress[1 + QUICLY_NUM_ALT_EGRESS];
+    /**
+     * opt-in failover: consecutive ordinary PTOs before suppressing data on a path when a validated, physically eligible
+     * alternative has recent ACK progress. zero disables this policy, retaining normal retransmission and scheduler behavior.
+     * recovery requires ACKs of two separately sent, fresh ack-eliciting packets. set before creating connections.
+     */
+    unsigned multipath_failover_pto_threshold;
 };
 
 /**
@@ -752,17 +775,9 @@ struct st_quicly_conn_streamgroup_state_t {
      */                                                                                                                            \
     uint64_t num_jumpstart_applicable;                                                                                             \
     /**                                                                                                                            \
-     * Number of connections that used rapid start.                                                                                \
+     * Total number of connections that used an alternative egress context (i.e., not `egress[0]`).                                \
      */                                                                                                                            \
-    uint64_t num_rapid_start;                                                                                                      \
-    /**                                                                                                                            \
-     * Total number of connections that were paced.                                                                                \
-     */                                                                                                                            \
-    uint64_t num_paced;                                                                                                            \
-    /**                                                                                                                            \
-     * Total number of connections where app-limited state was respected by CC.                                                    \
-     */                                                                                                                            \
-    uint64_t num_respected_app_limited
+    uint64_t num_alt_egress
 
 /**
  * Stats that do not need to be gathered upon the invocation of `quicly_get_stats`. This macro is used to define the same fields in
@@ -819,7 +834,7 @@ typedef struct st_quicly_stats_t {
      */
     quicly_cc_t cc;
     /**
-     * Estimated delivery rate, in bytes/second.
+     * Estimated delivery rate of path zero, in bytes/second (not an aggregate across multipath paths).
      */
     quicly_rate_t delivery_rate;
     /**
@@ -841,6 +856,33 @@ typedef struct st_quicly_path_stats_t {
     uint32_t cwnd;
     uint32_t bytes_in_flight;
 } quicly_path_stats_t;
+
+/** optional failover policy state, separate from validation and physical availability */
+typedef enum en_quicly_path_health_state_t {
+    QUICLY_PATH_USABLE,    /* ordinary scheduling; not a guarantee of reachability */
+    QUICLY_PATH_SUSPECT,   /* application data suppressed; PTO probes continue */
+    QUICLY_PATH_RECOVERING /* fresh ACK received; ordinary flight capped at the selected egress initial window */
+} quicly_path_health_state_t;
+
+/** read-only protocol state. address-candidate indices can share a wire path ID and its RTT/PTO/peer backup state.
+ * does not incorporate application eligibility, congestion credit, pacing, or custom data preferences. */
+typedef struct st_quicly_path_health_t {
+    size_t path_index;
+    uint32_t path_id;
+    /** smoothed RTT in milliseconds, including fractional values; an initial estimate until rtt_is_sampled is set. */
+    float rtt_smoothed;
+    /** signed recovery count: negative denotes speculative tail probes, zero initial/reset state, positive ordinary PTOs.
+     * a newly acknowledged packet resets a positive count; speculative probing retains its existing loss-engine semantics. */
+    int8_t pto_count;
+    uint8_t rtt_is_sampled;
+    /** peer-advertised preference for our sends, not the status we advertised to the peer. */
+    uint8_t peer_is_backup;
+    uint8_t probe_only;
+    uint8_t abandoned;
+    uint8_t validated;
+    /** opt-in failover state; USABLE when the policy is disabled. independent of peer backup preference. */
+    quicly_path_health_state_t state;
+} quicly_path_health_t;
 
 /* clang-format off */
 
@@ -933,9 +975,7 @@ typedef struct st_quicly_path_stats_t {
     apply(num_handshake_timeouts, "num-handshake-timeouts")                                                                        \
     apply(num_initial_handshake_exceeded, "num-initial-handshake-exceeded")                                                        \
     apply(num_jumpstart_applicable, "num-jumpstart-applicable")                                                                    \
-    apply(num_rapid_start, "num-rapid-start")                                                                                      \
-    apply(num_paced, "num-paced")                                                                                                  \
-    apply(num_respected_app_limited, "num-respected-app-limited")
+    apply(num_alt_egress, "num-alt-egress")
 
 /**
  * Macro for iterating QUICLY_STATS_PREBUILT_COUNTERS.
@@ -977,6 +1017,9 @@ typedef struct st_quicly_path_stats_t {
     apply(cc.num_loss_episodes_undone, "cc.num-loss-episodes-undone")                                                              \
     apply(cc.num_loss_episodes_undone_in_startup, "cc.num-loss-episodes-undone-in-startup")                                        \
     apply(cc.num_ecn_loss_episodes, "cc.num-ecn-loss-episodes")                                                                    \
+    apply(cc.num_accel_eligible_episodes, "cc.num-accel-eligible-episodes")                                                        \
+    apply(cc.cwnd_increase_ca, "cc.cwnd-increase-ca")                                                                              \
+    apply(cc.cwnd_increase_accel, "cc.cwnd-increase-accel")                                                                        \
     apply(delivery_rate.latest, "delivery-rate.latest")                                                                            \
     apply(delivery_rate.smoothed, "delivery-rate.smoothed")                                                                        \
     apply(delivery_rate.stdev, "delivery-rate.stdev")                                                                              \
@@ -1008,7 +1051,7 @@ struct _st_quicly_conn_public_t {
     quicly_state_t state;
     struct {
         /**
-         * connection IDs being issued to the remote peer.
+         * initial local CID snapshot retained for layout compatibility and tracing; live CID state belongs to path zero.
          * `quicly_conn_public_t::local.cid_set.plaintext.master_id has to be located right after `ctx` and `state`, as probes rely
          * on that assumption.
          */
@@ -1026,7 +1069,7 @@ struct _st_quicly_conn_public_t {
     } local;
     struct {
         /**
-         * CIDs received from the remote peer
+         * initial remote CID snapshot retained for layout compatibility; use quicly_get_remote_cid for path zero's live CID state.
          */
         quicly_remote_cid_set_t cid_set;
         struct st_quicly_conn_streamgroup_state_t bidi, uni;
@@ -1100,12 +1143,13 @@ typedef struct st_quicly_stream_callbacks_t {
      */
     void (*on_send_stop)(quicly_stream_t *stream, quicly_error_t err);
     /**
-     * called when data within the receive window has been received.  Note that `off` might not exactly match the end of the data
-     * already consumed by the application, since it is up to the application when to call `quicly_stream_sync_recvbuf`.
+     * called when data is newly received.  `off` is the offset within the buffer (the beginning position changes as the application
+     * calls `quicly_stream_sync_recvbuf`.  Applications should consult `quicly_stream_t::recvstate` to see if it has contiguous
+     * input.
      */
     void (*on_receive)(quicly_stream_t *stream, size_t off, const void *src, size_t len);
     /**
-     * called when the receive side of the stream is closed by the peer
+     * called when a RESET_STREAM frame is received
      */
     void (*on_receive_reset)(quicly_stream_t *stream, quicly_error_t err);
 } quicly_stream_callbacks_t;
@@ -1354,9 +1398,10 @@ static const quicly_cid_plaintext_t *quicly_get_master_id(quicly_conn_t *conn);
  */
 static const quicly_cid_t *quicly_get_original_dcid(quicly_conn_t *conn);
 /**
- *
+ * Returns the first entry in path zero's live remote CID set, including updates during the handshake.
+ * To obtain the destination CID assigned to a specific address, use quicly_get_path_tuple.
  */
-static const quicly_cid_t *quicly_get_remote_cid(quicly_conn_t *conn);
+const quicly_cid_t *quicly_get_remote_cid(quicly_conn_t *conn);
 /**
  *
  */
@@ -1408,7 +1453,7 @@ struct sockaddr *quicly_get_peername(quicly_conn_t *conn);
  */
 quicly_error_t quicly_get_stats(quicly_conn_t *conn, quicly_stats_t *stats);
 /**
- *
+ * Returns the estimated delivery rate of path zero, in bytes/second.
  */
 quicly_error_t quicly_get_delivery_rate(quicly_conn_t *conn, quicly_rate_t *delivery_rate);
 /**
@@ -1442,11 +1487,18 @@ typedef struct st_quicly_tuple_t {
 
 /**
  * Gets the tuple (address pair + CID) for a given path index.
- * @return 0 on success.
+ * An existing path without an assigned destination CID returns a zero-length dcid. Does not assign or consume a CID.
+ * @return 0 for an existing slot, or -1 without modifying *tuple for an invalid/unused slot.
  */
 int quicly_get_path_tuple(quicly_conn_t *conn, size_t path_index, quicly_tuple_t *tuple);
 
 int quicly_get_path_stats(quicly_conn_t *conn, size_t path_index, quicly_path_stats_t *stats);
+/**
+ * returns 0 for an existing slot, including retained abandoned paths, or -1 without modifying *health for an invalid/unused slot.
+ * indices may be reused: obtain a new snapshot after path lifecycle changes and use path_id to identify the wire path.
+ * legacy quicly_path_stats_t::rtt_smoothed truncates to integer milliseconds; this accessor preserves fractional precision.
+ */
+int quicly_get_path_health(quicly_conn_t *conn, size_t path_index, quicly_path_health_t *health);
 /**
  * Opens an additional path. Only clients can initiate a path.
  */
@@ -1500,10 +1552,25 @@ quicly_error_t quicly_send_stream(quicly_stream_t *stream, quicly_send_context_t
  */
 int quicly_is_path_available(quicly_conn_t *conn, size_t path_index);
 /**
+ * returns whether the stream scheduler has data sendable under connection flow control and current application keys.
+ * does not check per-path affinity, physical eligibility, congestion credit, pacing, or queued DATAGRAM frames.
+ */
+int quicly_has_pending_stream_data(quicly_conn_t *conn);
+/**
  * Builds packets on the specified path index. Called by path scheduler.
  * Optionally populates packets_sent with the number of datagrams generated.
  */
 quicly_error_t quicly_send_on_path(quicly_conn_t *conn, quicly_send_context_t *s, size_t path_index, size_t *packets_sent);
+/**
+ * service due multipath ACKs/loss probes. quicly_send does this before invoking the path scheduler; existing schedulers may still
+ * call this helper from do_send, under quicly_send's time lock. honors is_path_eligible and protocol limits. no application STREAM
+ * or DATAGRAM payload is sent; reliable ranges made pending are subsequently placed by the data scheduler, retaining affinity.
+ * protocol control/CRYPTO may accompany probes. optional packets_sent reports the total datagrams in this send context;
+ * return on output or nonzero error.
+ * repeated calls in the same callback are supported: after output they do nothing. zero output leaves data selection available.
+ * outside negotiated multipath this is a no-op. no private connection/send-context access is required.
+ */
+quicly_error_t quicly_send_path_maintenance(quicly_conn_t *conn, quicly_send_context_t *s, size_t *packets_sent);
 /**
  * Builds a Version Negotiation packet. The generated packet might include a greasing version.
  * * @param versions  zero-terminated list of versions to advertise; use `quicly_supported_versions` for sending the list of
@@ -1663,7 +1730,10 @@ quicly_error_t quicly_get_or_open_stream(quicly_conn_t *conn, uint64_t stream_id
 void quicly_reset_stream(quicly_stream_t *stream, quicly_error_t err);
 
 /**
- * Sets the path affinity for a stream.
+ * sets the path affinity for a stream.
+ * with the built-in schedulers, explicit affinity permits using a backup path. unbound streams still prefer regular paths unless
+ * repeated PTOs indicate that a backup is healthier. affinity is retained through temporary path failure and cleared on
+ * abandonment.
  * @param stream    the stream
  * @param path_id   the path_id to bind the stream to. Set to UINT32_MAX to clear the affinity.
  * @return          0 if successful
@@ -1674,6 +1744,14 @@ int quicly_set_stream_path_affinity(quicly_stream_t *stream, uint32_t path_id);
  * Gets the current path ID being transmitted on from a send context.
  */
 uint32_t quicly_get_current_send_path_id(quicly_conn_t *conn, quicly_send_context_t *s);
+
+/**
+ * checks whether the selected send path matches a stream's affinity or, for unbound streams using a built-in path scheduler,
+ * the path preference. custom path schedulers retain their own policy for unbound streams.
+ * stream schedulers should skip streams returning zero before calling quicly_send_stream. this does not check flow control or
+ * whether stream data is pending; use quicly_stream_can_send for those checks.
+ */
+int quicly_stream_can_send_on_path(quicly_stream_t *stream, quicly_send_context_t *s);
 
 /**
  *
@@ -1730,6 +1808,10 @@ static int quicly_stream_is_self_initiated(quicly_stream_t *stream);
 void quicly_send_datagram_frames(quicly_conn_t *conn, ptls_iovec_t *datagrams, size_t num_datagrams);
 /** Returns the number of locally queued DATAGRAM frames, not delivery or ACK status. */
 size_t quicly_get_num_datagram_frames_path(quicly_conn_t *conn, size_t path_index);
+/**
+ * queues DATAGRAM frames on the specified path. built-in schedulers honor this placement even on a backup or a path with repeated
+ * PTOs; physical eligibility, validation, congestion, pacing, and SUSPECT health still gate transmission.
+ */
 void quicly_send_datagram_frames_path(quicly_conn_t *conn, size_t path_index, ptls_iovec_t *datagrams, size_t num_datagrams);
 int quicly_has_datagram_frames(quicly_conn_t *conn);
 /**
@@ -1745,6 +1827,12 @@ int quicly_is_multipath(quicly_conn_t *conn);
  */
 uint64_t quicly_calculate_total_cwnd(quicly_conn_t *conn);
 uint64_t quicly_calculate_lia_target(quicly_conn_t *conn);
+/**
+ * Returns the index of `quicly_context_t::egress[]` being used by the connection; i.e., 0 if the default egress context is being
+ * used, or a non-zero value if one of the alternatives is. The context is chosen when the connection is created, and remains
+ * unchanged for the lifetime of the connection.
+ */
+int quicly_get_alt_egress(quicly_conn_t *conn);
 /**
  *
  */
@@ -1831,10 +1919,10 @@ extern const quicly_stream_callbacks_t quicly_stream_noop_callbacks;
             break;                                                                                                                 \
         PTLS_LOG__DO_LOG(quicly, _name, conn_state, ptls_log_getsni_ptls(_tls), _c->stash.now == 0, {                              \
             if (_c->stash.now != 0)                                                                                                \
-                PTLS_LOG_ELEMENT_SIGNED(time, _c->stash.now);                                                                      \
+                PTLS_LOG_ELEMENT_NUMBER(time, _c->stash.now);                                                                      \
             PTLS_LOG_ELEMENT_PTR(conn, _c);                                                                                        \
             if (conn_state->conn_id != 0) {                                                                                        \
-                PTLS_LOG_ELEMENT_UNSIGNED(conn_id, conn_state->conn_id);                                                           \
+                PTLS_LOG_ELEMENT_NUMBER(conn_id, conn_state->conn_id);                                                             \
             }                                                                                                                      \
             do {                                                                                                                   \
                 _block                                                                                                             \
@@ -1884,12 +1972,6 @@ inline const quicly_cid_t *quicly_get_original_dcid(quicly_conn_t *conn)
 {
     struct _st_quicly_conn_public_t *c = (struct _st_quicly_conn_public_t *)conn;
     return &c->original_dcid;
-}
-
-inline const quicly_cid_t *quicly_get_remote_cid(quicly_conn_t *conn)
-{
-    struct _st_quicly_conn_public_t *c = (struct _st_quicly_conn_public_t *)conn;
-    return &c->remote.cid_set.cids[0].cid;
 }
 
 inline const quicly_transport_parameters_t *quicly_get_remote_transport_parameters(quicly_conn_t *conn)

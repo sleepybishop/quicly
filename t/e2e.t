@@ -71,20 +71,9 @@ subtest "hello" => sub {
     subtest "initial-ncid" => sub {
         my $events = slurp_file("$tempdir/events");
         complex $events, sub {
-            my $events_str = $_;
             my @seen;
-            my $limit = 4;
-            if (open my $fh, "<", "include/quicly/constants.h") {
-                while (my $line = <$fh>) {
-                    if ($line =~ /#define\s+QUICLY_LOCAL_ACTIVE_CONNECTION_ID_LIMIT\s+(\d+)/) {
-                        $limit = $1;
-                        last;
-                    }
-                }
-                close $fh;
-            }
-            my @expected = (0, (1) x ($limit - 1));
-            foreach (split(/\n/, $events_str)) {
+            my @expected = (0, 1, 1, 1); # expecting to see sequence=1,2,3 as we set active_connection_id_limit to 4
+            foreach (split(/\n/)) {
                 if ( /"type":"new_connection_id_receive",.*"sequence":([0-9]+),/ ) {
                     # $1 contains sequence number
                     $seen[$1] = 1;
@@ -620,6 +609,17 @@ subtest "reset-stream-overflow" => sub {
     my $server = spawn_server();
     my $conn = t::RawConnection->new("127.0.0.1", $port, cli => $cli);
     $conn->send("\x04\x00\x00\xff\xff\xff\xff\xff\xff\xff\xff"); # reset stream with final_size=QUICINT_MAX
+    my $received = $conn->receive_until(qr/^\x1c\x03\x04/, 2);
+    ok !$server->is_dead(), "server process must be alive";
+    like $received, qr/^\x1c\x03\x04/, "responds with CONNECTION_CLOSE(FLOW_CONTROL_ERROR) for RESET_STREAM";
+};
+
+subtest "reset-stream-overflow-connection" => sub {
+    # Two RESET_STREAMs, each with a final_size fitting the 1000-byte stream window but together overrunning the 1500-byte
+    # connection-wide limit. The limits are set explicitly, as a change in the defaults could otherwise mask the check.
+    my $server = spawn_server(qw(-M 1000 -m 1500));
+    my $conn = t::RawConnection->new("127.0.0.1", $port, cli => $cli);
+    $conn->send("\x04\x00\x00\x43\xe8" . "\x04\x04\x00\x43\xe8");
     my $received = $conn->receive_until(qr/^\x1c\x03\x04/, 2);
     ok !$server->is_dead(), "server process must be alive";
     like $received, qr/^\x1c\x03\x04/, "responds with CONNECTION_CLOSE(FLOW_CONTROL_ERROR) for RESET_STREAM";

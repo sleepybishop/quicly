@@ -41,8 +41,10 @@ typedef struct st_quicly_flexicast_cc_config_t {
     size_t maximum_members;
     uint64_t startup_rate_bytes_per_second;
     uint64_t minimum_rate_bytes_per_second;
+    /** zero means unlimited; otherwise this must be at least the minimum rate */
     uint64_t maximum_rate_bytes_per_second;
     uint32_t maximum_datagram_size;
+    /** zero selects 1000 milliseconds */
     uint32_t feedback_timeout_msec;
     uint16_t packet_reordering_threshold;
 } quicly_flexicast_cc_config_t;
@@ -118,6 +120,7 @@ typedef struct st_quicly_flexicast_cc_output_t {
 struct st_quicly_flexicast_cc_type_t {
     const char *name;
     size_t state_size;
+    /** state is zero-initialized; dispose is also called after a failed init */
     int (*init)(void *state, const quicly_flexicast_cc_config_t *config, int64_t now, quicly_flexicast_cc_output_t *output);
     void (*dispose)(void *state);
     void (*on_member_added)(void *state, uint64_t member_id, int64_t now, quicly_flexicast_cc_output_t *output);
