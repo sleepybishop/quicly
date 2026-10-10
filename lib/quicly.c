@@ -738,31 +738,30 @@ int quicly_flexicast_is_negotiated(quicly_conn_t *conn)
             conn->super.remote.transport_params.flexicast_support.ipv6);
 }
 
-static int enqueue_flexicast_control(quicly_conn_t *conn, uint64_t type, size_t encoded_size,
-                                     int (*encode)(uint8_t *, size_t, const void *, size_t *), const void *frame)
+static int alloc_flexicast_control(quicly_conn_t *conn, uint64_t type, size_t encoded_size, quicly_flexicast_control_t **control)
 {
-    quicly_flexicast_control_t *control;
-    size_t actual_size;
-    int ret;
-
-    if (conn == NULL || encoded_size == 0 || encode == NULL || frame == NULL)
+    if (conn == NULL || encoded_size == 0 || encoded_size > SIZE_MAX - offsetof(quicly_flexicast_control_t, encoded))
         return QUICLY_FLEXICAST_ERROR_INVALID;
     if (!quicly_flexicast_is_negotiated(conn))
         return QUICLY_FLEXICAST_ERROR_PROTOCOL_VIOLATION;
     if (conn->egress.flexicast_control.count >= 256 || conn->egress.flexicast_control.next_id == UINT64_MAX)
         return QUICLY_FLEXICAST_ERROR_SEND_WINDOW;
-    if ((control = malloc(offsetof(quicly_flexicast_control_t, encoded) + encoded_size)) == NULL)
+    if ((*control = malloc(offsetof(quicly_flexicast_control_t, encoded) + encoded_size)) == NULL)
         return QUICLY_FLEXICAST_ERROR_NO_MEMORY;
-    if ((ret = encode(control->encoded, encoded_size, frame, &actual_size)) != QUICLY_FLEXICAST_OK) {
+    (*control)->type = type;
+    (*control)->encoded_size = encoded_size;
+    return QUICLY_FLEXICAST_OK;
+}
+
+static int enqueue_flexicast_control(quicly_conn_t *conn, quicly_flexicast_control_t *control, int encode_result)
+{
+    if (encode_result != QUICLY_FLEXICAST_OK) {
         free(control);
-        return ret;
+        return encode_result;
     }
-    assert(actual_size == encoded_size);
     control->next = NULL;
     control->id = conn->egress.flexicast_control.next_id++;
     control->generation = 0;
-    control->type = type;
-    control->encoded_size = encoded_size;
     control->sender = QUICLY_SENDER_STATE_SEND;
     if (conn->egress.flexicast_control.tail_ref == NULL)
         conn->egress.flexicast_control.tail_ref = &conn->egress.flexicast_control.head;
@@ -773,120 +772,89 @@ static int enqueue_flexicast_control(quicly_conn_t *conn, uint64_t type, size_t 
     return QUICLY_FLEXICAST_OK;
 }
 
-static int encode_announce_erased(uint8_t *dst, size_t capacity, const void *frame, size_t *encoded_size)
-{
-    return quicly_flexicast_encode_announce_frame(dst, capacity, frame, encoded_size);
-}
-
-static int encode_state_erased(uint8_t *dst, size_t capacity, const void *frame, size_t *encoded_size)
-{
-    return quicly_flexicast_encode_state_frame(dst, capacity, frame, encoded_size);
-}
-
-static int encode_key_erased(uint8_t *dst, size_t capacity, const void *frame, size_t *encoded_size)
-{
-    return quicly_flexicast_encode_key_frame(dst, capacity, frame, encoded_size);
-}
-
-typedef struct st_quicly_flexicast_path_ack_t {
-    uint64_t flow_id;
-    uint64_t packet_number;
-} quicly_flexicast_path_ack_t;
-
-static size_t flexicast_path_ack_capacity(const quicly_flexicast_path_ack_t *frame)
-{
-    if (frame == NULL || frame->flow_id > PTLS_QUICINT_MAX || frame->packet_number > PTLS_QUICINT_MAX)
-        return 0;
-    /* PATH_ACK, path_id, largest, delay=0, range-count=0, range=0, PING. */
-    return 5 + quicly_encodev_capacity(frame->flow_id) + quicly_encodev_capacity(frame->packet_number);
-}
-
-static int encode_path_ack_erased(uint8_t *dst, size_t capacity, const void *_frame, size_t *encoded_size)
-{
-    const quicly_flexicast_path_ack_t *frame = _frame;
-    size_t required = flexicast_path_ack_capacity(frame);
-    if (dst == NULL || encoded_size == NULL || required == 0)
-        return QUICLY_FLEXICAST_ERROR_INVALID;
-    if (capacity < required)
-        return QUICLY_FLEXICAST_ERROR_BUFFER_TOO_SMALL;
-    *dst++ = QUICLY_FRAME_TYPE_PATH_ACK;
-    dst = quicly_encodev(dst, frame->flow_id);
-    dst = quicly_encodev(dst, frame->packet_number);
-    *dst++ = 0;                      /* ACK delay */
-    *dst++ = 0;                      /* ACK range count */
-    *dst++ = 0;                      /* first ACK range: the largest packet only */
-    *dst++ = QUICLY_FRAME_TYPE_PING; /* makes reliable feedback ack-eliciting */
-    *encoded_size = required;
-    return QUICLY_FLEXICAST_OK;
-}
-
 int quicly_flexicast_send_announce(quicly_conn_t *conn, const quicly_flexicast_announce_frame_t *frame)
 {
+    quicly_flexicast_control_t *control;
+    int ret;
     if (conn == NULL || quicly_is_client(conn))
         return QUICLY_FLEXICAST_ERROR_PROTOCOL_VIOLATION;
-    return enqueue_flexicast_control(conn, QUICLY_FRAME_TYPE_FC_ANNOUNCE, quicly_flexicast_announce_frame_capacity(frame),
-                                     encode_announce_erased, frame);
+    if ((ret = alloc_flexicast_control(conn, QUICLY_FRAME_TYPE_FC_ANNOUNCE, quicly_flexicast_announce_frame_capacity(frame),
+                                       &control)) != 0)
+        return ret;
+    ret = quicly_flexicast_encode_announce_frame(control->encoded, control->encoded_size, frame, &control->encoded_size);
+    return enqueue_flexicast_control(conn, control, ret);
 }
 
 int quicly_flexicast_send_state(quicly_conn_t *conn, const quicly_flexicast_state_frame_t *frame)
 {
+    quicly_flexicast_control_t *control;
+    int ret;
     if (conn == NULL || frame == NULL || (!quicly_is_client(conn) && frame->action != QUICLY_FLEXICAST_STATE_LEAVE))
         return QUICLY_FLEXICAST_ERROR_PROTOCOL_VIOLATION;
-    return enqueue_flexicast_control(conn, QUICLY_FRAME_TYPE_FC_STATE, quicly_flexicast_state_frame_capacity(frame),
-                                     encode_state_erased, frame);
+    if ((ret = alloc_flexicast_control(conn, QUICLY_FRAME_TYPE_FC_STATE, quicly_flexicast_state_frame_capacity(frame), &control)) !=
+        0)
+        return ret;
+    ret = quicly_flexicast_encode_state_frame(control->encoded, control->encoded_size, frame, &control->encoded_size);
+    return enqueue_flexicast_control(conn, control, ret);
 }
 
 int quicly_flexicast_send_key(quicly_conn_t *conn, const quicly_flexicast_key_frame_t *frame)
 {
+    quicly_flexicast_control_t *control;
+    int ret;
     if (conn == NULL || quicly_is_client(conn))
         return QUICLY_FLEXICAST_ERROR_PROTOCOL_VIOLATION;
-    return enqueue_flexicast_control(conn, QUICLY_FRAME_TYPE_FC_KEY, quicly_flexicast_key_frame_capacity(frame), encode_key_erased,
-                                     frame);
+    if ((ret = alloc_flexicast_control(conn, QUICLY_FRAME_TYPE_FC_KEY, quicly_flexicast_key_frame_capacity(frame), &control)) != 0)
+        return ret;
+    ret = quicly_flexicast_encode_key_frame(control->encoded, control->encoded_size, frame, &control->encoded_size);
+    return enqueue_flexicast_control(conn, control, ret);
 }
 
 int quicly_flexicast_send_path_ack(quicly_conn_t *conn, uint64_t flow_id, uint64_t packet_number)
 {
-    quicly_flexicast_path_ack_t frame = {.flow_id = flow_id, .packet_number = packet_number};
+    quicly_flexicast_control_t *control;
+    quicly_ranges_t ranges;
+    uint64_t ecn_counts[3] = {0};
+    int ret;
     if (conn == NULL || !quicly_is_client(conn) || flow_id <= conn->super.remote.max_path_id)
         return QUICLY_FLEXICAST_ERROR_PROTOCOL_VIOLATION;
-    return enqueue_flexicast_control(conn, QUICLY_FRAME_TYPE_PATH_ACK, flexicast_path_ack_capacity(&frame), encode_path_ack_erased,
-                                     &frame);
-}
-
-typedef struct st_quicly_flexicast_encoded_control_t {
-    const uint8_t *bytes;
-    size_t size;
-} quicly_flexicast_encoded_control_t;
-
-static int encode_flexicast_control_copy(uint8_t *dst, size_t capacity, const void *_frame, size_t *encoded_size)
-{
-    const quicly_flexicast_encoded_control_t *frame = _frame;
-    if (dst == NULL || frame == NULL || encoded_size == NULL || capacity < frame->size)
+    if (flow_id > PTLS_QUICINT_MAX || packet_number > PTLS_QUICINT_MAX)
+        return QUICLY_FLEXICAST_ERROR_INVALID;
+    /* PATH_ACK, path_id, largest, delay=0, range-count=0, range=0, PING */
+    /* the shared encoder reserves eight bytes for each ACK block length */
+    size_t size = 12 + quicly_encodev_capacity(flow_id) + quicly_encodev_capacity(packet_number);
+    if ((ret = alloc_flexicast_control(conn, QUICLY_FRAME_TYPE_PATH_ACK, size, &control)) != 0)
+        return ret;
+    quicly_ranges_init_with_range(&ranges, packet_number, packet_number + 1);
+    uint8_t *end = quicly_encode_path_ack_frame(control->encoded, control->encoded + size - 1, flow_id, &ranges, ecn_counts, 0);
+    quicly_ranges_clear(&ranges);
+    if (end == NULL) {
+        free(control);
         return QUICLY_FLEXICAST_ERROR_BUFFER_TOO_SMALL;
-    memcpy(dst, frame->bytes, frame->size);
-    *encoded_size = frame->size;
-    return QUICLY_FLEXICAST_OK;
+    }
+    *end++ = QUICLY_FRAME_TYPE_PING;
+    control->encoded_size = end - control->encoded;
+    return enqueue_flexicast_control(conn, control, QUICLY_FLEXICAST_OK);
 }
 
 int quicly_flexicast_send_pending_ack(quicly_flexicast_flow_t *flow, quicly_conn_t *conn, int64_t now, int force)
 {
     uint8_t encoded[QUICLY_FLEXICAST_MAX_ACK_ENCODED_SIZE];
     size_t encoded_size;
+    quicly_flexicast_control_t *control;
     int ret;
 
     if (flow == NULL || conn == NULL || !quicly_is_client(conn) ||
         quicly_flexicast_get_flow_id(flow) <= conn->super.remote.max_path_id)
         return QUICLY_FLEXICAST_ERROR_PROTOCOL_VIOLATION;
-    if (quicly_flexicast_get_ack_deadline(flow) == INT64_MAX)
-        return QUICLY_FLEXICAST_OK;
-    if (!force && !quicly_flexicast_ack_is_due(flow, now))
+    if (quicly_flexicast_get_ack_deadline(flow) == INT64_MAX || (!force && !quicly_flexicast_ack_is_due(flow, now)))
         return QUICLY_FLEXICAST_OK;
     if ((ret = quicly_flexicast_encode_pending_ack(flow, encoded, sizeof(encoded), now, &encoded_size)) != QUICLY_FLEXICAST_OK)
         return ret;
-    quicly_flexicast_encoded_control_t frame = {.bytes = encoded, .size = encoded_size};
-    if ((ret = enqueue_flexicast_control(conn, QUICLY_FRAME_TYPE_PATH_ACK, encoded_size, encode_flexicast_control_copy, &frame)) !=
-        QUICLY_FLEXICAST_OK)
+    if ((ret = alloc_flexicast_control(conn, QUICLY_FRAME_TYPE_PATH_ACK, encoded_size, &control)) != 0)
         return ret;
+    memcpy(control->encoded, encoded, encoded_size);
+    enqueue_flexicast_control(conn, control, QUICLY_FLEXICAST_OK);
     quicly_flexicast_ack_sent(flow);
     return QUICLY_FLEXICAST_OK;
 }

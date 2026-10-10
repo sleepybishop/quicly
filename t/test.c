@@ -205,6 +205,44 @@ static void test_select_with_ratio255(void)
     }
 }
 
+static void test_flexicast_control_queue(void)
+{
+    quicly_context_t ctx = quic_ctx;
+    ctx.transport_params.enable_multipath = 1;
+    ctx.transport_params.flexicast_support.ipv4 = 1;
+    quicly_conn_t conn = {0};
+    conn.super.ctx = &ctx;
+    conn.super.remote.transport_params.enable_multipath = 1;
+    conn.super.remote.transport_params.flexicast_support.ipv4 = 1;
+
+    uint64_t packet_numbers[] = {0, 63, 64, 16383, 16384, PTLS_QUICINT_MAX};
+    for (size_t i = 0; i != PTLS_ELEMENTSOF(packet_numbers); ++i) {
+        ok(quicly_flexicast_send_path_ack(&conn, PTLS_QUICINT_MAX, packet_numbers[i]) == 0);
+        quicly_flexicast_control_t *control = conn.egress.flexicast_control.head;
+        const uint8_t *src = control->encoded, *end = src + control->encoded_size;
+        quicly_ack_frame_t ack;
+        ok(quicly_decodev(&src, end) == QUICLY_FRAME_TYPE_PATH_ACK);
+        ok(quicly_decodev(&src, end) == PTLS_QUICINT_MAX);
+        ok(quicly_decode_ack_frame(&src, end, &ack, 0) == 0);
+        ok(ack.largest_acknowledged == packet_numbers[i] && ack.smallest_acknowledged == packet_numbers[i]);
+        ok(src + 1 == end && *src == QUICLY_FRAME_TYPE_PING);
+        conn.egress.flexicast_control.head = NULL;
+        conn.egress.flexicast_control.tail_ref = NULL;
+        conn.egress.flexicast_control.count = 0;
+        free(control);
+    }
+    ok(quicly_flexicast_send_path_ack(&conn, PTLS_QUICINT_MAX + 1, 0) == QUICLY_FLEXICAST_ERROR_INVALID);
+
+    quicly_flexicast_state_frame_t state = {.flow_id = {.bytes = {1}, .len = 1}, .action = QUICLY_FLEXICAST_STATE_JOIN};
+    quicly_flexicast_state_frame_t decoded;
+    size_t consumed;
+    ok(quicly_flexicast_send_state(&conn, &state) == 0);
+    quicly_flexicast_control_t *control = conn.egress.flexicast_control.head;
+    ok(quicly_flexicast_decode_state_frame(control->encoded, control->encoded_size, &decoded, &consumed) == 0);
+    ok(consumed == control->encoded_size && decoded.action == state.action);
+    free(control);
+}
+
 static void test_egress_selection(void)
 {
     quicly_context_t ctx = quic_ctx;
@@ -4011,6 +4049,7 @@ int main(int argc, char **argv)
     subtest("time-threshold-loss-episode", test_time_threshold_loss_episode);
     subtest("time-threshold-loss-in-recovery", test_time_threshold_loss_in_recovery);
     subtest("flexicast", test_flexicast);
+    subtest("flexicast-control-queue", test_flexicast_control_queue);
 
     subtest("retransmit", test_retransmit);
     subtest("retransmit-max-stream-data-lower-window", test_retransmit_max_stream_data_lower_window);

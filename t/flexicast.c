@@ -856,6 +856,122 @@ static void test_scalable_members(void)
     quicly_flexicast_cc_free(cc);
 }
 
+static void test_member_churn(void)
+{
+    quicly_flexicast_cc_type_t *types[] = {&quicly_flexicast_cc_type_multicast, &quicly_flexicast_cc_type_adaptive};
+    quicly_flexicast_cc_config_t config = {
+        .maximum_members = 2, .startup_rate_bytes_per_second = 100000, .maximum_datagram_size = 1200};
+    for (size_t t = 0; t != PTLS_ELEMENTSOF(types); ++t) {
+        quicly_flexicast_cc_t *cc;
+        quicly_flexicast_cc_output_t output;
+        int all_ok = 1;
+        ok(quicly_flexicast_cc_create(&cc, types[t], &config, 100) == 0);
+        quicly_flexicast_cc_on_member_added(cc, UINT64_MAX, 100);
+        for (uint64_t id = 1; id <= 512; ++id) {
+            quicly_flexicast_feedback_t feedback = {.member_id = id, .epoch = 1, .ecn_ce_count = 1, .now = 100 + id};
+            quicly_flexicast_cc_on_member_added(cc, id, feedback.now);
+            quicly_flexicast_cc_on_feedback(cc, &feedback);
+            quicly_flexicast_cc_get_output(cc, &output);
+            all_ok &= output.limiting_member_id == id && output.reason == QUICLY_FLEXICAST_CC_REASON_ECN;
+            quicly_flexicast_cc_on_member_removed(cc, id, feedback.now);
+        }
+        ok(all_ok); /* joining must still work after every hash bucket has been used */
+        quicly_flexicast_cc_free(cc);
+    }
+
+    uint8_t secret[PTLS_MAX_DIGEST_SIZE] = {0}, packet[128];
+    quicly_flexicast_flow_t *flow = create_flow(1000, secret);
+    uint64_t ids[8], pn;
+    size_t size;
+    int all_ok = 1, complete;
+    for (size_t i = 0; i != PTLS_ELEMENTSOF(ids); ++i) {
+        ids[i] = i + 1;
+        all_ok &= quicly_flexicast_attach(flow, ids[i]) == 0;
+    }
+    for (size_t turn = 0; turn != 512; ++turn) {
+        size_t slot = turn % PTLS_ELEMENTSOF(ids);
+        all_ok &= quicly_flexicast_detach(flow, ids[slot]) == 0;
+        ids[slot] = turn + 100;
+        all_ok &= quicly_flexicast_attach(flow, ids[slot]) == 0;
+        all_ok &= quicly_flexicast_send_datagram(flow, ptls_iovec_init(NULL, 0), packet, sizeof(packet), &size, &pn) == 0;
+        for (size_t i = 0; i != PTLS_ELEMENTSOF(ids); ++i) {
+            all_ok &= quicly_flexicast_ack(flow, ids[i], pn, &complete) == 0;
+            all_ok &= complete == (i + 1 == PTLS_ELEMENTSOF(ids));
+        }
+    }
+    ok(all_ok); /* deleting a colliding entry must preserve the remaining members */
+    quicly_flexicast_flow_free(flow);
+}
+
+static void test_controller_boundaries(void)
+{
+    quicly_flexicast_cc_type_t *types[] = {&quicly_flexicast_cc_type_multicast, &quicly_flexicast_cc_type_adaptive};
+    for (size_t t = 0; t != PTLS_ELEMENTSOF(types); ++t) {
+        quicly_flexicast_cc_config_t config = {.maximum_datagram_size = 1200, .startup_rate_bytes_per_second = UINT64_MAX};
+        quicly_flexicast_cc_t *cc;
+        quicly_flexicast_cc_output_t output;
+        ok(quicly_flexicast_cc_create(&cc, types[t], &config, 100) == 0);
+        quicly_flexicast_cc_on_member_added(cc, 1, 100);
+        quicly_flexicast_cc_get_output(cc, &output);
+        ok(output.next_timeout > 100); /* a zero timeout selects a default, never a busy loop */
+        quicly_flexicast_feedback_t feedback = {.member_id = 1, .ecn_ce_count = 1, .now = 200};
+        quicly_flexicast_cc_on_feedback(cc, &feedback);
+        quicly_flexicast_cc_get_output(cc, &output);
+        uint64_t reduced = output.rate_bytes_per_second;
+        ok(reduced > UINT64_MAX / 2 && reduced < UINT64_MAX);
+        ok(output.ecn_reduction_events == 1);
+        quicly_flexicast_cc_on_epoch_reset(cc, 201);
+        feedback.now = 202;
+        quicly_flexicast_cc_on_feedback(cc, &feedback);
+        quicly_flexicast_cc_get_output(cc, &output);
+        ok(output.rate_bytes_per_second < reduced); /* an old epoch must not suppress fresh congestion feedback */
+        quicly_flexicast_cc_on_timeout(cc, output.next_timeout);
+        quicly_flexicast_cc_get_output(cc, &output);
+        ok(output.next_timeout > feedback.now);
+        quicly_flexicast_cc_free(cc);
+    }
+
+    quicly_flexicast_cc_config_t config = {.maximum_datagram_size = 1200, .startup_rate_bytes_per_second = 100000};
+    quicly_flexicast_cc_t *cc;
+    quicly_flexicast_cc_output_t output;
+    ok(quicly_flexicast_cc_create(&cc, &test_cc_type, &config, 100) == 0);
+    quicly_flexicast_feedback_t feedback = {.member_id = 1, .acked_packets = 1, .now = 200};
+    quicly_flexicast_cc_on_feedback(cc, &feedback);
+    quicly_flexicast_cc_on_timeout(cc, 201); /* this custom controller has no timeout callback */
+    quicly_flexicast_cc_get_output(cc, &output);
+    ok(output.reason == QUICLY_FLEXICAST_CC_REASON_NONE);
+    quicly_flexicast_cc_free(cc);
+    config.minimum_rate_bytes_per_second = 2000;
+    config.maximum_rate_bytes_per_second = 1000;
+    ok(quicly_flexicast_cc_create(&cc, &test_cc_type, &config, 100) != 0);
+
+    uint8_t secret[PTLS_MAX_DIGEST_SIZE] = {0};
+    quicly_flexicast_flow_t *flow;
+    quicly_flexicast_config_t flow_config = {.flow_id = 1000,
+                                             .cipher_suite = &ptls_openssl_aes128gcmsha256,
+                                             .crypto_engine = &quicly_default_crypto_engine,
+                                             .traffic_secret =
+                                                 ptls_iovec_init(secret, ptls_openssl_aes128gcmsha256.hash->digest_size),
+                                             .cc_type = &test_cc_type,
+                                             .cc_config = config};
+    ok(quicly_flexicast_flow_create(&flow, &flow_config) == QUICLY_FLEXICAST_ERROR_INVALID);
+}
+
+static void test_packet_number_limit(void)
+{
+    uint8_t secret[PTLS_MAX_DIGEST_SIZE] = {0}, packet[128];
+    quicly_flexicast_flow_t *flow = create_flow_at(1000, secret, PTLS_QUICINT_MAX);
+    uint64_t pn;
+    size_t size;
+    ok(quicly_flexicast_attach(flow, 1) == 0);
+    ok(quicly_flexicast_send_datagram(flow, ptls_iovec_init(NULL, 0), packet, sizeof(packet), &size, &pn) == 0);
+    ok(pn == PTLS_QUICINT_MAX);
+    ok(size == quicly_flexicast_datagram_size(flow, 0));
+    ok(quicly_flexicast_send_datagram(flow, ptls_iovec_init(NULL, 0), packet, sizeof(packet), &size, &pn) ==
+       QUICLY_FLEXICAST_ERROR_INVALID);
+    quicly_flexicast_flow_free(flow);
+}
+
 void test_flexicast(void)
 {
     static const uint64_t flow_id = UINT64_C(0x1020304050607080);
@@ -872,6 +988,9 @@ void test_flexicast(void)
     test_ack_aggregation();
     test_builtin_controllers();
     test_scalable_members();
+    test_member_churn();
+    test_controller_boundaries();
+    test_packet_number_limit();
 
     memset(secret, 0x5a, ptls_openssl_aes128gcmsha256.hash->digest_size);
     memset(wrong_secret, 0xa5, ptls_openssl_aes128gcmsha256.hash->digest_size);

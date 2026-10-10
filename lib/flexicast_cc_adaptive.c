@@ -2,8 +2,8 @@
  * Copyright (c) 2026 Joseph Calderon
  * SPDX-License-Identifier: MIT
  */
-#include "quicly/flexicast_cc.h"
-#include "flexicast_cc_member_map.h"
+#include "flexicast_cc_internal.h"
+#include "flexicast_member_map.h"
 
 #include <limits.h>
 #include <math.h>
@@ -24,7 +24,6 @@ typedef struct st_adaptive_member_t {
     uint32_t baseline_loss_ppm;
     uint32_t flat_loss_epochs;
     uint32_t minimum_rtt;
-    uint32_t smoothed_rtt;
     int64_t last_feedback;
     uint32_t elevated_rtt_epochs;
     uint32_t clear_rtt_epochs;
@@ -40,7 +39,7 @@ typedef struct st_adaptive_state_t {
     quicly_flexicast_cc_hints_t hints;
     adaptive_member_t *members;
     size_t num_members;
-    flexicast_cc_member_map_t member_map;
+    flexicast_member_map_t member_map;
     uint64_t rate;
     uint64_t last_growth_epoch;
     uint64_t last_growth_freeze_epoch;
@@ -50,7 +49,6 @@ typedef struct st_adaptive_state_t {
     uint64_t last_rtt_clear_epoch;
     uint32_t rtt_clear_epochs;
     uint64_t rtt_episode_member_id;
-    int rtt_episode_active;
     int64_t next_recovery_probe;
     int64_t last_timeout_reduction;
     uint32_t unanswered_recovery_probes;
@@ -61,19 +59,10 @@ typedef struct st_adaptive_state_t {
     int external_load_seen;
 } adaptive_state_t;
 
-static uint64_t clamp_rate(const adaptive_state_t *state, uint64_t rate)
-{
-    if (rate < state->config.minimum_rate_bytes_per_second)
-        rate = state->config.minimum_rate_bytes_per_second;
-    if (state->config.maximum_rate_bytes_per_second != 0 && rate > state->config.maximum_rate_bytes_per_second)
-        rate = state->config.maximum_rate_bytes_per_second;
-    return rate;
-}
-
 static adaptive_member_t *find_member(adaptive_state_t *state, uint64_t id)
 {
-    size_t slot;
-    return flexicast_cc_member_map_find(&state->member_map, id, &slot) == 0 ? state->members + slot : NULL;
+    int slot = flexicast_member_map_find(&state->member_map, id);
+    return slot >= 0 ? state->members + slot : NULL;
 }
 
 static adaptive_member_t *add_member(adaptive_state_t *state, uint64_t id, int64_t now)
@@ -81,9 +70,9 @@ static adaptive_member_t *add_member(adaptive_state_t *state, uint64_t id, int64
     adaptive_member_t *member = find_member(state, id);
     if (member != NULL)
         return member;
-    if (state->num_members == state->config.maximum_members ||
-        flexicast_cc_member_map_insert(&state->member_map, id, state->num_members) != 0)
+    if (state->num_members == state->config.maximum_members)
         return NULL;
+    flexicast_member_map_set(&state->member_map, id, state->num_members);
     member = state->members + state->num_members++;
     member->id = id;
     member->last_feedback = now;
@@ -113,14 +102,8 @@ static int64_t recovery_deadline(const adaptive_state_t *state, int64_t now)
 static void update_output(adaptive_state_t *state, int64_t now, uint64_t limiting_member, uint32_t reason,
                           quicly_flexicast_cc_output_t *output)
 {
-    state->rate = clamp_rate(state, state->rate);
-    uint64_t minimum_burst = (uint64_t)state->config.maximum_datagram_size * 4;
-    uint64_t maximum_burst = (uint64_t)state->config.maximum_datagram_size * 10;
-    uint64_t burst = state->rate / 20;
-    if (burst < minimum_burst)
-        burst = minimum_burst;
-    if (burst > maximum_burst)
-        burst = maximum_burst;
+    state->rate = clamp_rate(&state->config, state->rate);
+    uint64_t burst = burst_size(&state->config, state->rate);
     output->rate_bytes_per_second = state->rate;
     output->burst_bytes = burst;
     output->inflight_bytes = burst;
@@ -135,11 +118,8 @@ static int adaptive_init(void *_state, const quicly_flexicast_cc_config_t *confi
     adaptive_state_t *state = _state;
     state->config = *config;
     if ((state->members = calloc(config->maximum_members, sizeof(*state->members))) == NULL ||
-        flexicast_cc_member_map_init(&state->member_map, config->maximum_members) != 0) {
-        free(state->members);
-        state->members = NULL;
+        flexicast_member_map_init(&state->member_map, config->maximum_members) != 0)
         return -1;
-    }
     state->rate = config->startup_rate_bytes_per_second;
     state->next_recovery_probe = recovery_deadline(state, now);
     update_output(state, now, 0, QUICLY_FLEXICAST_CC_REASON_NONE, output);
@@ -149,10 +129,8 @@ static int adaptive_init(void *_state, const quicly_flexicast_cc_config_t *confi
 static void adaptive_dispose(void *_state)
 {
     adaptive_state_t *state = _state;
-    flexicast_cc_member_map_dispose(&state->member_map);
+    flexicast_member_map_dispose(&state->member_map);
     free(state->members);
-    state->members = NULL;
-    state->num_members = 0;
 }
 
 static void adaptive_on_member_added(void *_state, uint64_t member_id, int64_t now, quicly_flexicast_cc_output_t *output)
@@ -168,16 +146,15 @@ static void adaptive_on_member_removed(void *_state, uint64_t member_id, int64_t
     adaptive_member_t *member = find_member(state, member_id);
     if (member != NULL) {
         size_t slot = (size_t)(member - state->members), last = state->num_members - 1;
-        flexicast_cc_member_map_remove(&state->member_map, member_id);
+        flexicast_member_map_remove(&state->member_map, member_id);
         if (slot != last) {
             state->members[slot] = state->members[last];
-            flexicast_cc_member_map_update(&state->member_map, state->members[slot].id, slot);
+            flexicast_member_map_set(&state->member_map, state->members[slot].id, slot);
         }
         memset(state->members + last, 0, sizeof(state->members[last]));
         --state->num_members;
     }
-    if (state->rtt_episode_active && state->rtt_episode_member_id == member_id) {
-        state->rtt_episode_active = 0;
+    if (state->rtt_episode_member_id == member_id) {
         state->rtt_episode_member_id = 0;
         state->rtt_clear_epochs = 0;
     }
@@ -190,30 +167,29 @@ static void adaptive_on_epoch_reset(void *_state, int64_t now, quicly_flexicast_
     for (size_t i = 0; i != state->num_members; ++i) {
         state->members[i].last_feedback = now;
         state->members[i].last_feedback_epoch = 0;
+        state->members[i].elevated_rtt_epochs = 0;
+        state->members[i].clear_rtt_epochs = 0;
+        state->members[i].rtt_congested = 0;
+        state->members[i].flat_loss_epochs = 0;
+        state->members[i].degraded_delivery_epochs = 0;
     }
     state->unanswered_recovery_probes = 0;
     state->last_timeout_reduction = 0;
-    state->rtt_episode_active = 0;
+    state->last_growth_epoch = 0;
+    state->last_growth_freeze_epoch = 0;
+    state->last_rtt_reduction_at = 0;
+    state->last_rtt_clear_epoch = 0;
+    state->floor_recovery_epochs = 0;
+    state->last_floor_recovery_epoch = 0;
     state->rtt_episode_member_id = 0;
     state->rtt_clear_epochs = 0;
     state->next_recovery_probe = recovery_deadline(state, now);
     update_output(state, now, 0, QUICLY_FLEXICAST_CC_REASON_NONE, output);
 }
 
-static int queue_delay_grew(const adaptive_member_t *member, const quicly_flexicast_feedback_t *feedback)
-{
-    uint32_t floor = feedback->minimum_rtt_msec != 0 ? feedback->minimum_rtt_msec : member->minimum_rtt;
-    uint32_t margin = floor / 4;
-    if (margin < 5)
-        margin = 5;
-    return floor != 0 && feedback->latest_rtt_msec > floor + margin;
-}
-
 static int rtt_reduction_is_due(const adaptive_state_t *state, int64_t now)
 {
-    uint64_t horizon = state->config.feedback_timeout_msec != 0 ? state->config.feedback_timeout_msec : 1000;
-    if (horizon <= UINT64_MAX / 2)
-        horizon *= 2;
+    uint64_t horizon = (uint64_t)state->config.feedback_timeout_msec * 2;
     return state->last_rtt_reduction_at == 0 || now < state->last_rtt_reduction_at ||
            (uint64_t)(now - state->last_rtt_reduction_at) >= horizon;
 }
@@ -281,11 +257,6 @@ static void learn_clean_delivery_ratio(adaptive_member_t *member)
     }
 }
 
-static uint64_t scale_rate_ppm(uint64_t rate, uint32_t factor)
-{
-    return rate / LOSS_SCALE * factor + rate % LOSS_SCALE * factor / LOSS_SCALE;
-}
-
 static uint32_t loss_ppm(const quicly_flexicast_feedback_t *feedback)
 {
     uint64_t total = feedback->acked_packets + feedback->lost_packets;
@@ -311,9 +282,7 @@ static uint64_t external_load_recovery_ceiling(const adaptive_state_t *state)
 
 static int has_recent_feedback(const adaptive_state_t *state, int64_t now)
 {
-    uint64_t horizon = state->config.feedback_timeout_msec != 0 ? state->config.feedback_timeout_msec : 1000;
-    if (horizon <= UINT64_MAX / 2)
-        horizon *= 2;
+    uint64_t horizon = (uint64_t)state->config.feedback_timeout_msec * 2;
     for (size_t i = 0; i != state->num_members; ++i) {
         int64_t last = state->members[i].last_feedback;
         if (last > 0 && now >= last && (uint64_t)(now - last) <= horizon)
@@ -324,7 +293,7 @@ static int has_recent_feedback(const adaptive_state_t *state, int64_t now)
 
 static uint64_t sender_epoch(const adaptive_state_t *state, int64_t now)
 {
-    uint64_t interval = state->config.feedback_timeout_msec != 0 ? state->config.feedback_timeout_msec : 1000;
+    uint64_t interval = state->config.feedback_timeout_msec;
     return now < 0 ? 0 : (uint64_t)now / interval + 1;
 }
 
@@ -334,8 +303,7 @@ static uint64_t growth_epoch(const adaptive_state_t *state, int64_t now)
      * clocks. NORM's sender-local epoch follows its probe/feedback cadence,
      * while a substantially longer timeout detects a silent representative.
      * Keep the same separation without importing receiver sequence numbers. */
-    uint64_t interval = state->config.feedback_timeout_msec != 0 ? state->config.feedback_timeout_msec : 1000;
-    interval /= 4;
+    uint64_t interval = state->config.feedback_timeout_msec / 4;
     if (interval < 25)
         interval = 25;
     return now < 0 ? 0 : (uint64_t)now / interval + 1;
@@ -356,8 +324,8 @@ static int near_floor(const adaptive_state_t *state, uint64_t rate)
 static void apply_floor_recovery_growth(adaptive_state_t *state)
 {
     double divisor = sqrt((double)active_senders(state));
-    uint64_t increase = divisor > 0 ? (uint64_t)((double)state->rate / divisor) : state->rate;
-    uint64_t candidate = UINT64_MAX - state->rate < increase ? UINT64_MAX : state->rate + increase;
+    uint64_t increase = (uint64_t)((double)state->rate / divisor);
+    uint64_t candidate = increase_rate(state->rate, increase);
     uint64_t limit = floor_recovery_limit(state);
     if (candidate > limit)
         candidate = limit;
@@ -403,13 +371,13 @@ static int grow_once(adaptive_state_t *state, int64_t now)
      * must not combine with exponential startup growth to create avoidable
      * repair airtime. */
     double divisor = 8 * sqrt((double)active_senders(state));
-    uint64_t increase = divisor > 0 ? (uint64_t)((double)state->rate / divisor) : state->rate;
+    uint64_t increase = (uint64_t)((double)state->rate / divisor);
     if (increase < state->config.maximum_datagram_size)
         increase = state->config.maximum_datagram_size;
     if (state->hints.median_sender_rate_bytes_per_second != 0 && below_median(state) &&
         increase > state->hints.median_sender_rate_bytes_per_second - state->rate)
         increase = state->hints.median_sender_rate_bytes_per_second - state->rate;
-    state->rate = UINT64_MAX - state->rate < increase ? UINT64_MAX : state->rate + increase;
+    state->rate = increase_rate(state->rate, increase);
     /* Repair work is charged to this pacer and is not independent evidence of
      * congestion. Clean feedback may lift a timeout-reduced flow out of an
      * unusable floor tail, but only to a bounded recovery service rate. */
@@ -434,16 +402,14 @@ static void adaptive_on_feedback(void *_state, const quicly_flexicast_feedback_t
         member->last_feedback_epoch = feedback->epoch;
     if (feedback->minimum_rtt_msec != 0)
         member->minimum_rtt = feedback->minimum_rtt_msec;
-    if (feedback->smoothed_rtt_msec != 0)
-        member->smoothed_rtt = feedback->smoothed_rtt_msec;
     member->last_feedback = feedback->now;
     state->unanswered_recovery_probes = 0;
     state->next_recovery_probe = recovery_deadline(state, feedback->now);
     observed_loss = loss_ppm(feedback);
     has_delivery_sample = update_delivery_ratio(state, member, feedback);
-    delay_grew = queue_delay_grew(member, feedback);
+    delay_grew = queue_delay_grew(member->minimum_rtt, feedback->latest_rtt_msec);
     uint64_t feedback_growth_epoch = growth_epoch(state, feedback->now);
-    if (state->rtt_episode_active) {
+    if (state->rtt_episode_member_id != 0) {
         if (delay_grew || state->external_load_seen || feedback->ecn_ce_count != 0) {
             state->rtt_clear_epochs = 0;
             state->last_rtt_clear_epoch = feedback_growth_epoch;
@@ -451,7 +417,6 @@ static void adaptive_on_feedback(void *_state, const quicly_flexicast_feedback_t
                    feedback_growth_epoch > state->last_rtt_clear_epoch) {
             state->last_rtt_clear_epoch = feedback_growth_epoch;
             if (++state->rtt_clear_epochs >= RTT_CLEAR_EPOCHS) {
-                state->rtt_episode_active = 0;
                 state->rtt_episode_member_id = 0;
                 state->rtt_clear_epochs = 0;
                 for (size_t i = 0; i != state->num_members; ++i) {
@@ -467,8 +432,7 @@ static void adaptive_on_feedback(void *_state, const quicly_flexicast_feedback_t
      * load freezes growth; it does not invalidate corroborated path evidence.
      * The aggregate RTT episode below prevents correlated member feedback
      * from multiplying one queue event into a trip to the floor. */
-    congested = feedback->ecn_ce_count != 0 ||
-                (delay_grew && has_delivery_sample && delivery_ratio_degraded(member));
+    congested = feedback->ecn_ce_count != 0 || (delay_grew && has_delivery_sample && delivery_ratio_degraded(member));
 
     if (state->floor_recovery_epochs != 0) {
         if (feedback->ecn_ce_count != 0) {
@@ -489,30 +453,23 @@ static void adaptive_on_feedback(void *_state, const quicly_flexicast_feedback_t
         member->clear_rtt_epochs = 0;
         if (feedback->ecn_ce_count != 0) {
             member->elevated_rtt_epochs = 0;
-            if (!below_median(state)) {
-                state->rate = state->rate * 85 / 100;
-            }
+            if (!below_median(state))
+                state->rate = scale_rate(state->rate, 85, 100);
         } else if (++member->elevated_rtt_epochs >= RTT_CONGESTION_EPOCHS) {
             /* Receiver reports for one multicast queue episode are highly
              * correlated. Apply one aggregate reduction, then require the
              * limiting receiver to report sustained clean epochs before
              * rearming. This preserves an independently paced sender clock
              * without multiplying one shared queue event by the group size. */
-            if (has_delivery_sample && !state->rtt_episode_active && !below_median(state) &&
-                rtt_reduction_is_due(state, feedback->now)) {
-                uint32_t factor = 900000;
-                if (delivery_ratio_degraded(member)) {
-                    factor = member->baseline_delivery_ratio_ppm != 0 ? (uint32_t)((uint64_t)member->recent_delivery_ratio_ppm *
-                                                                                   LOSS_SCALE / member->baseline_delivery_ratio_ppm)
-                                                                      : factor;
-                    if (factor < 500000)
-                        factor = 500000;
-                    if (factor > 900000)
-                        factor = 900000;
-                }
-                state->rate = scale_rate_ppm(state->rate, factor);
+            if (state->rtt_episode_member_id == 0 && !below_median(state) && rtt_reduction_is_due(state, feedback->now)) {
+                uint32_t factor =
+                    (uint32_t)((uint64_t)member->recent_delivery_ratio_ppm * LOSS_SCALE / member->baseline_delivery_ratio_ppm);
+                if (factor < 500000)
+                    factor = 500000;
+                if (factor > 900000)
+                    factor = 900000;
+                state->rate = scale_rate(state->rate, factor, LOSS_SCALE);
                 state->last_rtt_reduction_at = feedback->now;
-                state->rtt_episode_active = 1;
                 state->rtt_episode_member_id = feedback->member_id;
                 state->rtt_clear_epochs = 0;
                 state->last_rtt_clear_epoch = feedback_growth_epoch;
@@ -547,20 +504,10 @@ static void adaptive_on_feedback(void *_state, const quicly_flexicast_feedback_t
         member->elevated_rtt_epochs = 0;
         member->flat_loss_epochs = 0;
         reason |= QUICLY_FLEXICAST_CC_REASON_ACK;
-        if (member->rtt_congested && ++member->clear_rtt_epochs < RTT_CLEAR_EPOCHS) {
-            /* A single low sample does not rearm delay reduction or immediately
-             * grow into the same queue. Sustained clean feedback ends the
-             * congestion episode and can then raise a flow off its floor. */
-        } else if (state->rtt_episode_active) {
-            /* Only sustained clean feedback from the limiting receiver can
-             * end the aggregate queue episode. An unrelated clean member
-             * proves its own liveness, but must not grow the shared sender
-             * back into the episode before that rearm completes. */
-        } else if ((!has_delivery_sample || !delivery_ratio_supports_growth(member)) && !startup_probe) {
-            /* Outside bounded startup, an ACK proves liveness but not that the
-             * advertised rate was delivered. Hold while a stable radio-loss
-             * baseline is still being learned. */
-        } else {
+        /* growth needs a cleared RTT episode and delivery evidence, except during bounded startup */
+        int rtt_clear = !member->rtt_congested || ++member->clear_rtt_epochs >= RTT_CLEAR_EPOCHS;
+        if (rtt_clear && state->rtt_episode_member_id == 0 &&
+            ((has_delivery_sample && delivery_ratio_supports_growth(member)) || startup_probe)) {
             int growth;
             member->rtt_congested = 0;
             member->clear_rtt_epochs = 0;
@@ -640,7 +587,7 @@ static void adaptive_set_hints(void *_state, const quicly_flexicast_cc_hints_t *
         state->rate < external_load_recovery_ceiling(state) && has_recent_feedback(state, now)) {
         uint64_t increase = state->rate;
         uint64_t ceiling = external_load_recovery_ceiling(state);
-        state->rate = UINT64_MAX - state->rate < increase ? UINT64_MAX : state->rate + increase;
+        state->rate = increase_rate(state->rate, increase);
         if (state->rate > ceiling)
             state->rate = ceiling;
         reason |= QUICLY_FLEXICAST_CC_REASON_EXTERNAL_LOAD;
