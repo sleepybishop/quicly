@@ -1620,6 +1620,81 @@ static void test_frames_opening_peer_stream(void)
     quicly_free(server);
 }
 
+static size_t stop_sending_callcnt;
+
+static void count_stop_sending(quicly_stream_t *stream, quicly_error_t err)
+{
+    ++stop_sending_callcnt;
+    on_egress_stop(stream, err);
+}
+
+static void test_stop_sending_after_shutdown(int ending)
+{
+    quicly_conn_t *client, *server;
+    test_setup_connected_peers(&client, &server);
+    quicly_stream_t *stream;
+    ok(quicly_open_stream(client, &stream, 0) == 0);
+    test_streambuf_t *streambuf = stream->data;
+    quicly_stream_callbacks_t callbacks = stream_callbacks;
+    callbacks.on_send_stop = count_stop_sending;
+    stream->callbacks = &callbacks;
+    stop_sending_callcnt = 0;
+    ok(quicly_streambuf_egress_write(stream, "hello", 5) == 0);
+    if (ending == 4) {
+        quicly_reset_stream(stream, QUICLY_ERROR_FROM_APPLICATION_ERROR_CODE(7));
+    } else if (ending != 0) {
+        quicly_streambuf_egress_shutdown(stream);
+        ok(!quicly_sendstate_is_open(&stream->sendstate));
+        if (ending >= 2) {
+            ok(transmit(client, server) > 0);
+            ok(stream->sendstate.size_inflight == 5);
+            ok(!quicly_sendstate_transfer_complete(&stream->sendstate));
+            if (ending == 3) {
+                quic_now += QUICLY_DELAYED_ACK_TIMEOUT;
+                ok(transmit(server, client) > 0);
+                ok(quicly_sendstate_transfer_complete(&stream->sendstate));
+            }
+        }
+    }
+
+    /* Exercise the decoded-frame handler without an ACK that could complete the FIN first. */
+    uint8_t frame[32];
+    uint8_t *end = quicly_encode_stop_sending_frame(frame, stream->stream_id, 11);
+    struct st_quicly_handle_payload_state_t state = {
+        .src = frame + 1, .end = end, .epoch = QUICLY_EPOCH_1RTT, .frame_type = QUICLY_FRAME_TYPE_STOP_SENDING};
+    lock_now(client, 0);
+    ok(handle_stop_sending_frame(client, &state) == 0);
+    if (ending < 3) {
+        ok(stream->_send_aux.reset_stream.sender_state == QUICLY_SENDER_STATE_SEND);
+        ok(stream->_send_aux.reset_stream.error_code == 11);
+        ok(streambuf->error_received.stop_sending == QUICLY_ERROR_FROM_APPLICATION_ERROR_CODE(11));
+        ok(stop_sending_callcnt == 1);
+    } else {
+        ok(stop_sending_callcnt == 0);
+        ok(streambuf->error_received.stop_sending == -1);
+        if (ending == 4)
+            ok(stream->_send_aux.reset_stream.error_code == 7);
+        else
+            ok(stream->_send_aux.reset_stream.sender_state == QUICLY_SENDER_STATE_NONE);
+    }
+
+    /* A repeated request must neither reset again nor notify the application again. */
+    state.src = frame + 1;
+    ok(handle_stop_sending_frame(client, &state) == 0);
+    ok(stop_sending_callcnt == (ending < 3 ? 1 : 0));
+    if (ending < 3) {
+        unlock_now(client);
+        ok(transmit(client, server) > 0);
+        lock_now(client, 0);
+        state.src = frame + 1;
+        ok(handle_stop_sending_frame(client, &state) == 0);
+        ok(stop_sending_callcnt == 1);
+    }
+    unlock_now(client);
+    quicly_free(client);
+    quicly_free(server);
+}
+
 static void test_fractional_close_timeout(void)
 {
     int64_t saved_now = quic_now;
@@ -2635,6 +2710,11 @@ int main(int argc, char **argv)
     subtest("fractional-close-timeout", test_fractional_close_timeout);
     subtest("time-threshold-loss-episode", test_time_threshold_loss_episode);
     subtest("time-threshold-loss-in-recovery", test_time_threshold_loss_in_recovery);
+    subtest("stop-sending-open", test_stop_sending_after_shutdown, 0);
+    subtest("stop-sending-before-fin", test_stop_sending_after_shutdown, 1);
+    subtest("stop-sending-after-fin", test_stop_sending_after_shutdown, 2);
+    subtest("stop-sending-after-fin-acked", test_stop_sending_after_shutdown, 3);
+    subtest("stop-sending-after-reset", test_stop_sending_after_shutdown, 4);
 
     subtest("retransmit", test_retransmit);
     subtest("retransmit-max-stream-data-lower-window", test_retransmit_max_stream_data_lower_window);

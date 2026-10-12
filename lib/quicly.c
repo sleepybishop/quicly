@@ -6865,19 +6865,21 @@ static quicly_error_t handle_stop_sending_frame(quicly_conn_t *conn, struct st_q
     if ((ret = quicly_get_or_open_stream(conn, frame.stream_id, &stream)) != 0 || stream == NULL)
         return ret;
 
-    if (quicly_sendstate_is_open(&stream->sendstate)) {
-        /* reset the stream, then notify the application */
-        quicly_error_t err = QUICLY_ERROR_FROM_APPLICATION_ERROR_CODE(frame.app_error_code);
-        quicly_reset_stream(stream, err);
-        QUICLY_PROBE(STREAM_ON_SEND_STOP, stream->conn, stream->conn->stash.now, stream, err);
-        QUICLY_LOG_CONN(stream_on_send_stop, stream->conn, {
-            PTLS_LOG_ELEMENT_NUMBER(stream_id, stream->stream_id);
-            PTLS_LOG_ELEMENT_NUMBER(err, err);
-        });
-        stream->callbacks->on_send_stop(stream, err);
-        if (stream->conn->super.state >= QUICLY_STATE_CLOSING)
-            return QUICLY_ERROR_IS_CLOSING;
-    }
+    if (stream->_send_aux.reset_stream.sender_state != QUICLY_SENDER_STATE_NONE ||
+        quicly_sendstate_transfer_complete(&stream->sendstate))
+        return 0;
+
+    /* reset the stream, then notify the application, including when FIN is pending */
+    quicly_error_t err = QUICLY_ERROR_FROM_APPLICATION_ERROR_CODE(frame.app_error_code);
+    quicly_reset_stream(stream, err);
+    QUICLY_PROBE(STREAM_ON_SEND_STOP, stream->conn, stream->conn->stash.now, stream, err);
+    QUICLY_LOG_CONN(stream_on_send_stop, stream->conn, {
+        PTLS_LOG_ELEMENT_NUMBER(stream_id, stream->stream_id);
+        PTLS_LOG_ELEMENT_NUMBER(err, err);
+    });
+    stream->callbacks->on_send_stop(stream, err);
+    if (stream->conn->super.state >= QUICLY_STATE_CLOSING)
+        return QUICLY_ERROR_IS_CLOSING;
 
     return 0;
 }
