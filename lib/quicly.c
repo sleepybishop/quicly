@@ -5379,7 +5379,7 @@ int64_t quicly_get_first_timeout(quicly_conn_t *conn)
     int64_t at = conn->idle_timeout.at;
     if (has_application_path_eligibility(conn) && (conn->initial != NULL || conn->handshake != NULL)) {
         int64_t handshake_at = ceil(conn->created_at + (double)conn->super.ctx->handshake_timeout_rtt_multiplier *
-                                                           conn->path_spaces[0]->loss.rtt.smoothed);
+                                                           fmax(1.0, conn->path_spaces[0]->loss.rtt.smoothed));
         if (handshake_at < at)
             at = handshake_at;
     }
@@ -8128,6 +8128,41 @@ void quicly_send_datagram_frames(quicly_conn_t *conn, ptls_iovec_t *datagrams, s
     quicly_send_datagram_frames_path(conn, 0, datagrams, num_datagrams);
 }
 
+size_t quicly_get_datagram_payload_limit(quicly_conn_t *conn, size_t path_index)
+{
+    if (path_index >= QUICLY_MAX_PATH_INDICES || conn->super.state != QUICLY_STATE_CONNECTED ||
+        conn->application == NULL || !conn->application->one_rtt_writable)
+        return 0;
+    struct st_quicly_conn_path_t *path = get_path(conn, path_index);
+    if (path == NULL || path->abandoned || path->dcid == UINT64_MAX ||
+        path->datagram_frame_payloads.count == PTLS_ELEMENTSOF(path->datagram_frame_payloads.payloads))
+        return 0;
+    const quicly_cid_t *dcid = get_dcid(conn, path_index);
+    size_t overhead = 1 + dcid->len + QUICLY_SEND_PN_SIZE + conn->application->cipher.egress.key.aead->algo->tag_size;
+    size_t capacity = path->path_space->max_udp_payload_size;
+    if (capacity <= overhead)
+        return 0;
+    capacity -= overhead;
+    if (capacity > conn->super.remote.transport_params.max_datagram_frame_size)
+        capacity = conn->super.remote.transport_params.max_datagram_frame_size;
+    if (capacity < 3)
+        return 0;
+    size_t payload = capacity - 2;
+    while (payload + 1 + quicly_encodev_capacity(payload) > capacity)
+        --payload;
+    return payload;
+}
+
+void quicly_discard_datagram_frames(quicly_conn_t *conn, size_t path_index)
+{
+    if (path_index >= QUICLY_MAX_PATH_INDICES || get_path(conn, path_index) == NULL)
+        return;
+    struct st_quicly_conn_path_t *path = get_path(conn, path_index);
+    for (size_t i = 0; i < path->datagram_frame_payloads.count; ++i)
+        free(path->datagram_frame_payloads.payloads[i].base);
+    path->datagram_frame_payloads.count = 0;
+}
+
 size_t quicly_get_num_datagram_frames_path(quicly_conn_t *conn, size_t path_index)
 {
     if (path_index >= QUICLY_MAX_PATH_INDICES || get_path(conn, path_index) == NULL)
@@ -8503,7 +8538,7 @@ quicly_error_t quicly_send(quicly_conn_t *conn, quicly_address_t *dest, quicly_a
     }
     if ((conn->initial != NULL || conn->handshake != NULL) &&
         conn->created_at +
-                (double)conn->super.ctx->handshake_timeout_rtt_multiplier * conn->path_spaces[0]->loss.rtt.smoothed <=
+                (double)conn->super.ctx->handshake_timeout_rtt_multiplier * fmax(1.0, conn->path_spaces[0]->loss.rtt.smoothed) <=
             conn->stash.now) {
         QUICLY_PROBE(HANDSHAKE_TIMEOUT, conn, conn->stash.now, conn->stash.now - conn->created_at,
                      (uint32_t)conn->path_spaces[0]->loss.rtt.smoothed);
@@ -9424,19 +9459,21 @@ static quicly_error_t handle_stop_sending_frame(quicly_conn_t *conn, struct st_q
     if ((ret = quicly_get_or_open_stream(conn, frame.stream_id, &stream)) != 0 || stream == NULL)
         return ret;
 
-    if (quicly_sendstate_is_open(&stream->sendstate)) {
-        /* reset the stream, then notify the application */
-        quicly_error_t err = QUICLY_ERROR_FROM_APPLICATION_ERROR_CODE(frame.app_error_code);
-        quicly_reset_stream(stream, err);
-        QUICLY_PROBE(STREAM_ON_SEND_STOP, stream->conn, stream->conn->stash.now, stream, err);
-        QUICLY_LOG_CONN(stream_on_send_stop, stream->conn, {
-            PTLS_LOG_ELEMENT_NUMBER(stream_id, stream->stream_id);
-            PTLS_LOG_ELEMENT_NUMBER(err, err);
-        });
-        stream->callbacks->on_send_stop(stream, err);
-        if (stream->conn->super.state >= QUICLY_STATE_CLOSING)
-            return QUICLY_ERROR_IS_CLOSING;
-    }
+    if (stream->_send_aux.reset_stream.sender_state != QUICLY_SENDER_STATE_NONE ||
+        quicly_sendstate_transfer_complete(&stream->sendstate))
+        return 0;
+
+    /* reset the stream, then notify the application, including when FIN is pending */
+    quicly_error_t err = QUICLY_ERROR_FROM_APPLICATION_ERROR_CODE(frame.app_error_code);
+    quicly_reset_stream(stream, err);
+    QUICLY_PROBE(STREAM_ON_SEND_STOP, stream->conn, stream->conn->stash.now, stream, err);
+    QUICLY_LOG_CONN(stream_on_send_stop, stream->conn, {
+        PTLS_LOG_ELEMENT_NUMBER(stream_id, stream->stream_id);
+        PTLS_LOG_ELEMENT_NUMBER(err, err);
+    });
+    stream->callbacks->on_send_stop(stream, err);
+    if (stream->conn->super.state >= QUICLY_STATE_CLOSING)
+        return QUICLY_ERROR_IS_CLOSING;
 
     return 0;
 }

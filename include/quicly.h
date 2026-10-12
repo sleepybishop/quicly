@@ -1814,6 +1814,14 @@ size_t quicly_get_num_datagram_frames_path(quicly_conn_t *conn, size_t path_inde
  */
 void quicly_send_datagram_frames_path(quicly_conn_t *conn, size_t path_index, ptls_iovec_t *datagrams, size_t num_datagrams);
 int quicly_has_datagram_frames(quicly_conn_t *conn);
+#define QUICLY_AMTQ_ADAPTER_API 1
+/** Current path/peer framing limit for one DATAGRAM application payload.
+ * Zero means 1-RTT/path/DATAGRAM support or queue capacity is unavailable.
+ * Congestion and pacing still govern when queued frames can leave. */
+size_t quicly_get_datagram_payload_limit(quicly_conn_t *conn, size_t path_index);
+/** Discard locally queued DATAGRAMs on this path; already emitted packets
+ * cannot be recalled. Call before send after application authorization changes. */
+void quicly_discard_datagram_frames(quicly_conn_t *conn, size_t path_index);
 /**
  * Sets CC to the specified type. Returns a boolean indicating if the operation was successful.
  */
