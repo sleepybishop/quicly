@@ -371,6 +371,8 @@ static void test_ack_aggregation(void)
 }
 
 #include "flexicast-adaptive-regressions.inc"
+#include "flexicast-adaptive-context.inc"
+#include "flexicast-cc-trace.inc"
 
 static void test_builtin_controllers(void)
 {
@@ -846,7 +848,7 @@ static void test_feedback_clock_and_submission(void)
         quicly_flexicast_member_stats_t stats;
         ok(quicly_flexicast_get_member_stats(flow, 1, &stats) == 0);
         rates[mode] = stats.delivery_rate_bytes_per_second;
-        ok(rates[mode] == size * 8 * 1000 / 10);
+        ok(rates[mode] == size * 8 * 1000 / 101); /* the send interval exceeds the compressed ACK interval */
         ok(test_last_feedback.delivery_rate_sample_epoch == 1);
         ok(test_last_feedback.delivery_rate_bytes_per_second == rates[mode]);
         if (mode == 0) {
@@ -913,16 +915,16 @@ static void test_submission_timestamp_bound(void)
     size_t size;
     uint64_t pn;
     quicly_flexicast_flow_t *flow = create_flow(1000, secret);
-    for (uint64_t member = 1; member <= 3; ++member)
+    for (uint64_t member = 1; member <= 4; ++member)
         ok(quicly_flexicast_attach_at(flow, member, 100) == 0);
-    /* 6144 late replicas exceed the 4096 timestamp budget without consuming
+    /* One common timestamp and 6144 replica exceptions exceed the 4096 budget without consuming
      * unbounded memory or stopping transmission. The excess samples are omitted. */
     for (size_t i = 0; i != QUICLY_FLEXICAST_SENT_WINDOW; ++i) {
         regression_send(flow, packet, sizeof(packet), &size, &pn, 100);
-        for (uint64_t member = 1; member <= 3; ++member)
+        for (uint64_t member = 1; member <= 4; ++member)
             ok(quicly_flexicast_mark_submitted(flow, member, pn, 110 + (int64_t)member) == 0);
     }
-    for (uint64_t member = 1; member <= 3; ++member) {
+    for (uint64_t member = 1; member <= 4; ++member) {
         regression_ack(flow, member, pn, pn, 0, 1000);
         quicly_flexicast_member_stats_t stats;
         ok(quicly_flexicast_get_member_stats(flow, member, &stats) == 0);
@@ -1029,6 +1031,8 @@ static void test_feedback_backpressure_and_ecn(void)
     quicly_flexicast_flow_free(rx);
 }
 
+#include "flexicast-provenance.inc"
+
 void test_flexicast(void)
 {
     static const uint64_t flow_id = UINT64_C(0x1020304050607080);
@@ -1044,6 +1048,8 @@ void test_flexicast(void)
     test_congestion_feedback();
     test_ack_aggregation();
     test_builtin_controllers();
+    test_adaptive_context();
+    test_cc_trace();
     test_scalable_members();
     test_member_churn();
     test_controller_boundaries();
@@ -1057,6 +1063,7 @@ void test_flexicast(void)
     test_feedback_clock_and_submission();
     test_submission_timestamp_bound();
     test_feedback_backpressure_and_ecn();
+    test_feedback_provenance();
 
     memset(secret, 0x5a, ptls_openssl_aes128gcmsha256.hash->digest_size);
     memset(wrong_secret, 0xa5, ptls_openssl_aes128gcmsha256.hash->digest_size);

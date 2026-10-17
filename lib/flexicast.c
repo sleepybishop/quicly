@@ -248,6 +248,8 @@ typedef struct st_quicly_flexicast_sent_t {
     size_t pending_count;
     size_t packet_size;
     int64_t sent_at;
+    quicly_flexicast_send_context_t context;
+    int has_submission;
     int rtt_untracked;
 } quicly_flexicast_sent_t;
 
@@ -259,15 +261,28 @@ typedef struct st_quicly_flexicast_sent_t {
 typedef struct st_flexicast_submission_t {
     uint64_t packet_number;
     int64_t submitted_at;
+    quicly_flexicast_send_context_t context;
     uint32_t member_slot_plus_one;
 } flexicast_submission_t;
 
+typedef struct st_flexicast_delivery_sample_t {
+    uint64_t bytes;
+    uint64_t rate;
+    int64_t sent_at_start, sent_at_end;
+    int64_t acked_at_start, acked_at_end;
+    quicly_flexicast_send_context_t context;
+    int timestamps_valid;
+    int end_timestamp_valid;
+} flexicast_delivery_sample_t;
+
 typedef struct st_quicly_flexicast_member_t {
     uint64_t loss_cursor;
-    int64_t rate_sample_start;
-    int64_t rate_sample_end;
-    uint64_t rate_sample_bytes;
+    flexicast_delivery_sample_t rate_sample;
+    flexicast_delivery_sample_t published_rate_sample;
     uint64_t rate_sample_epoch;
+    uint64_t rtt_sample_epoch;
+    int64_t rtt_sample_at;
+    uint32_t raw_rtt_msec, rtt_ack_delay_msec, applied_ack_delay_msec, rtt_sample_flags;
     quicly_flexicast_member_stats_t stats;
     int active;
 } quicly_flexicast_member_t;
@@ -297,6 +312,7 @@ struct st_quicly_flexicast_flow_t {
     uint64_t next_packet_number;
     uint64_t first_packet_number;
     size_t max_packet_size;
+    int64_t app_limited_at, host_limited_at;
     struct {
         uint64_t largest;
         uint64_t mask;
@@ -355,11 +371,13 @@ static void insert_submission(flexicast_submission_t *entries, size_t capacity, 
     entries[slot] = entry;
 }
 
-static int save_submission(quicly_flexicast_flow_t *flow, uint64_t packet_number, size_t member_slot, int64_t now)
+static int save_submission(quicly_flexicast_flow_t *flow, uint64_t packet_number, size_t member_slot, int64_t now,
+                           const quicly_flexicast_send_context_t *context)
 {
     flexicast_submission_t *existing = find_submission(flow, packet_number, member_slot);
     if (existing != NULL) {
         existing->submitted_at = now;
+        existing->context = *context;
         return 1;
     }
     if (flow->num_submissions == MAX_SUBMISSION_TIMESTAMPS)
@@ -377,7 +395,10 @@ static int save_submission(quicly_flexicast_flow_t *flow, uint64_t packet_number
         flow->submission_capacity = capacity;
     }
     insert_submission(flow->submissions, flow->submission_capacity,
-                      (flexicast_submission_t){packet_number, now, (uint32_t)member_slot + 1});
+                      (flexicast_submission_t){.packet_number = packet_number,
+                                               .submitted_at = now,
+                                               .context = *context,
+                                               .member_slot_plus_one = (uint32_t)member_slot + 1});
     ++flow->num_submissions;
     return 1;
 }
@@ -618,6 +639,7 @@ int quicly_flexicast_flow_rekey(quicly_flexicast_flow_t *flow, ptls_iovec_t traf
     flow->crypto.current_key = key;
     flow->first_packet_number = first_packet_number;
     flow->next_packet_number = first_packet_number;
+    flow->app_limited_at = flow->host_limited_at = 0;
     flow->received.largest = 0;
     flow->received.mask = 0;
     flow->received.initialized = 0;
@@ -644,10 +666,15 @@ int quicly_flexicast_flow_rekey(quicly_flexicast_flow_t *flow, ptls_iovec_t traf
         flow->members[i].loss_cursor = first_packet_number;
         flow->members[i].stats.largest_acknowledged = 0;
         flow->members[i].stats.last_feedback_at = 0;
-        flow->members[i].rate_sample_start = 0;
-        flow->members[i].rate_sample_end = 0;
-        flow->members[i].rate_sample_bytes = 0;
+        flow->members[i].rate_sample = (flexicast_delivery_sample_t){0};
+        flow->members[i].published_rate_sample = (flexicast_delivery_sample_t){0};
         flow->members[i].rate_sample_epoch = 0;
+        flow->members[i].rtt_sample_epoch = 0;
+        flow->members[i].rtt_sample_at = 0;
+        flow->members[i].rtt_sample_flags = 0;
+        flow->members[i].raw_rtt_msec = 0;
+        flow->members[i].rtt_ack_delay_msec = 0;
+        flow->members[i].applied_ack_delay_msec = 0;
         /* ECN counters are cumulative within this key epoch, unlike lifetime
          * delivered/lost totals and the retained path rate estimate. */
         flow->members[i].stats.ecn_ce_count = 0;
@@ -846,6 +873,8 @@ int quicly_flexicast_send_datagram_at(quicly_flexicast_flow_t *flow, ptls_iovec_
     sent->pending_count = flow->num_members;
     sent->packet_size = dst - packet;
     sent->sent_at = now;
+    sent->context = (quicly_flexicast_send_context_t){.flags = QUICLY_FLEXICAST_SAMPLE_PRESENT};
+    sent->has_submission = 0;
     sent->rtt_untracked = 0;
     ++flow->next_packet_number;
     *packet_size = dst - packet;
@@ -861,20 +890,47 @@ int quicly_flexicast_send_datagram(quicly_flexicast_flow_t *flow, ptls_iovec_t p
 
 int quicly_flexicast_mark_submitted(quicly_flexicast_flow_t *flow, uint64_t member_id, uint64_t packet_number, int64_t now)
 {
+    return quicly_flexicast_mark_submitted_with_context(flow, member_id, packet_number, now, NULL);
+}
+
+static int same_send_context(const quicly_flexicast_send_context_t *a, const quicly_flexicast_send_context_t *b)
+{
+    return a->pacing_rate_bytes_per_second == b->pacing_rate_bytes_per_second && a->physical_fanout == b->physical_fanout &&
+           a->flags == b->flags;
+}
+
+int quicly_flexicast_mark_submitted_with_context(quicly_flexicast_flow_t *flow, uint64_t member_id, uint64_t packet_number,
+                                                 int64_t now, const quicly_flexicast_send_context_t *context)
+{
     if (flow == NULL)
         return QUICLY_FLEXICAST_ERROR_INVALID;
     quicly_flexicast_sent_t *sent = flow->sent + packet_number % QUICLY_FLEXICAST_SENT_WINDOW;
     if (sent->pending_count == 0 || sent->packet_number != packet_number)
         return QUICLY_FLEXICAST_ERROR_NOT_FOUND;
-    if (member_id == 0) {
+    int member_index = member_id != 0 ? find_member(flow, member_id) : -1;
+    if (member_id != 0 && (member_index < 0 || !sent_has_member(flow, sent, (size_t)member_index)))
+        return QUICLY_FLEXICAST_ERROR_NOT_FOUND;
+    quicly_flexicast_send_context_t normalized = context != NULL ? *context : (quicly_flexicast_send_context_t){0};
+    normalized.flags |= QUICLY_FLEXICAST_SAMPLE_PRESENT;
+    /* Preserve limitation evidence even if the flagged packet is lost. One
+     * watermark per cause is bounded and conservative across all replicas. */
+    if ((normalized.flags & QUICLY_FLEXICAST_SAMPLE_APP_LIMITED) && now > flow->app_limited_at)
+        flow->app_limited_at = now;
+    if ((normalized.flags & QUICLY_FLEXICAST_SAMPLE_HOST_LIMITED) && now > flow->host_limited_at)
+        flow->host_limited_at = now;
+    if (normalized.pacing_rate_bytes_per_second == 0 || normalized.physical_fanout == 0 || now <= 0)
+        normalized.flags &= ~QUICLY_FLEXICAST_SAMPLE_VALID;
+    if (member_id == 0 || !sent->has_submission) {
+        /* The first actual send is the common case. Only differing replicas
+         * consume sparse storage, even with a very large receiver cohort. */
         sent->sent_at = now;
+        sent->context = normalized;
+        sent->has_submission = 1;
         sent->rtt_untracked = now <= 0;
     } else {
-        int member_index = find_member(flow, member_id);
-        if (member_index < 0 || !sent_has_member(flow, sent, (size_t)member_index))
-            return QUICLY_FLEXICAST_ERROR_NOT_FOUND;
-        if ((now != sent->sent_at || find_submission(flow, packet_number, (size_t)member_index) != NULL) &&
-            !save_submission(flow, packet_number, (size_t)member_index, now))
+        if ((now != sent->sent_at || !same_send_context(&normalized, &sent->context) ||
+             find_submission(flow, packet_number, (size_t)member_index) != NULL) &&
+            !save_submission(flow, packet_number, (size_t)member_index, now, &normalized))
             sent->rtt_untracked = 1;
     }
     return QUICLY_FLEXICAST_OK;
@@ -1149,16 +1205,27 @@ static uint32_t clamp_msec(uint64_t value)
     return value > UINT32_MAX ? UINT32_MAX : (uint32_t)value;
 }
 
-static void update_rtt(quicly_flexicast_member_stats_t *stats, int64_t submitted_at, int64_t now, uint32_t ack_delay_msec)
+static void update_rtt(quicly_flexicast_member_t *member, int64_t submitted_at, int64_t now, uint32_t ack_delay_msec)
 {
+    quicly_flexicast_member_stats_t *stats = &member->stats;
     uint32_t sample;
     if (now <= 0 || submitted_at <= 0 || now < submitted_at)
         return;
     sample = clamp_msec((uint64_t)(now - submitted_at));
+    ++member->rtt_sample_epoch;
+    member->rtt_sample_at = now;
+    member->raw_rtt_msec = sample;
+    member->rtt_ack_delay_msec = ack_delay_msec;
+    member->applied_ack_delay_msec = 0;
+    member->rtt_sample_flags = QUICLY_FLEXICAST_RTT_PRESENT | QUICLY_FLEXICAST_RTT_VALID;
     if (stats->minimum_rtt_msec == 0 || sample < stats->minimum_rtt_msec)
         stats->minimum_rtt_msec = sample;
-    if ((uint64_t)sample >= (uint64_t)stats->minimum_rtt_msec + ack_delay_msec)
+    if ((uint64_t)sample >= (uint64_t)stats->minimum_rtt_msec + ack_delay_msec) {
         sample -= ack_delay_msec;
+        member->applied_ack_delay_msec = ack_delay_msec;
+    } else if (ack_delay_msec != 0) {
+        member->rtt_sample_flags |= QUICLY_FLEXICAST_RTT_ACK_DELAY_INCONSISTENT;
+    }
     stats->latest_rtt_msec = sample;
     if (stats->smoothed_rtt_msec == 0)
         stats->smoothed_rtt_msec = sample;
@@ -1166,21 +1233,46 @@ static void update_rtt(quicly_flexicast_member_stats_t *stats, int64_t submitted
         stats->smoothed_rtt_msec = (uint32_t)(((uint64_t)stats->smoothed_rtt_msec * 7 + sample) / 8);
 }
 
+static void merge_send_context(quicly_flexicast_send_context_t *dst, const quicly_flexicast_send_context_t *src, int first)
+{
+    if (first) {
+        *dst = *src;
+        return;
+    }
+    uint32_t flags = dst->flags | src->flags;
+    if (!(dst->flags & QUICLY_FLEXICAST_SAMPLE_VALID) || !(src->flags & QUICLY_FLEXICAST_SAMPLE_VALID))
+        flags &= ~QUICLY_FLEXICAST_SAMPLE_VALID;
+    if (dst->pacing_rate_bytes_per_second != src->pacing_rate_bytes_per_second || dst->physical_fanout != src->physical_fanout)
+        flags = (flags | QUICLY_FLEXICAST_SAMPLE_MIXED) & ~QUICLY_FLEXICAST_SAMPLE_VALID;
+    dst->flags = flags;
+}
+
 static int acknowledge_packet(quicly_flexicast_flow_t *flow, int member_index, uint64_t packet_number, int64_t now,
-                              quicly_flexicast_feedback_t *feedback, size_t *num_completed)
+                              quicly_flexicast_feedback_t *feedback, flexicast_delivery_sample_t *observation,
+                              size_t *num_completed)
 {
     quicly_flexicast_sent_t *sent = flow->sent + packet_number % QUICLY_FLEXICAST_SENT_WINDOW;
     quicly_flexicast_member_stats_t *stats = &flow->members[member_index].stats;
 
     if (sent->pending_count == 0 || sent->packet_number != packet_number || !sent_has_member(flow, sent, (size_t)member_index))
         return 0;
-    /* ACK delay refers to the frame's largest packet. An older newly ACKed
-     * packet cannot provide an RTT sample when that largest was already ACKed. */
-    if (packet_number == feedback->largest_acknowledged) {
-        flexicast_submission_t *submission = find_submission(flow, packet_number, (size_t)member_index);
-        int64_t submitted_at = submission != NULL ? submission->submitted_at : sent->rtt_untracked ? 0 : sent->sent_at;
-        update_rtt(stats, submitted_at, now, feedback->ack_delay_msec);
-    }
+    flexicast_submission_t *submission = find_submission(flow, packet_number, (size_t)member_index);
+    int64_t submitted_at = submission != NULL ? submission->submitted_at : sent->rtt_untracked ? 0 : sent->sent_at;
+    quicly_flexicast_send_context_t context = submission != NULL ? submission->context : sent->context;
+    int timestamp_valid = submitted_at > 0 && now >= submitted_at;
+    if (!timestamp_valid)
+        context.flags &= ~QUICLY_FLEXICAST_SAMPLE_VALID;
+    merge_send_context(&observation->context, &context, observation->bytes == 0);
+    observation->timestamps_valid = observation->bytes == 0 ? timestamp_valid : observation->timestamps_valid && timestamp_valid;
+    if (observation->bytes == 0 || submitted_at < observation->sent_at_start)
+        observation->sent_at_start = submitted_at;
+    if (submitted_at > observation->sent_at_end)
+        observation->sent_at_end = submitted_at;
+    observation->bytes += sent->packet_size;
+    /* ACK delay describes the frame's largest PN, never a lower newly ACKed
+     * packet that happens to follow a duplicate largest PN. */
+    if (packet_number == feedback->largest_acknowledged)
+        update_rtt(flow->members + member_index, submitted_at, now, feedback->ack_delay_msec);
     (void)sent_clear_member(flow, sent, (size_t)member_index);
     ++feedback->acked_packets;
     feedback->acked_bytes += sent->packet_size;
@@ -1191,24 +1283,47 @@ static int acknowledge_packet(quicly_flexicast_flow_t *flow, int member_index, u
     return 1;
 }
 
-static void sample_delivery_rate(quicly_flexicast_member_t *member, uint64_t acked_bytes, int64_t now)
+static void sample_delivery_rate(quicly_flexicast_flow_t *flow, quicly_flexicast_member_t *member,
+                                 const flexicast_delivery_sample_t *observation, int64_t now)
 {
-    if (acked_bytes == 0 || now <= 0)
+    flexicast_delivery_sample_t *bucket = &member->rate_sample;
+    if (observation->bytes == 0 || now <= 0)
         return;
-    if (member->rate_sample_end == 0 || now < member->rate_sample_end) {
+    if (bucket->acked_at_end == 0 || now < bucket->acked_at_end) {
         /* The first ACK establishes the clock. Exclude its bytes because no
          * preceding delivery interval is known. */
-        member->rate_sample_start = member->rate_sample_end = now;
-        member->rate_sample_bytes = 0;
+        int64_t sent_at = observation->timestamps_valid ? observation->sent_at_end : 0;
+        *bucket = (flexicast_delivery_sample_t){.acked_at_start = now,
+                                                .acked_at_end = now,
+                                                .sent_at_start = sent_at,
+                                                .sent_at_end = sent_at,
+                                                .timestamps_valid = observation->timestamps_valid,
+                                                .end_timestamp_valid = observation->timestamps_valid};
         return;
     }
-    if (now > member->rate_sample_end) {
+    if (now > bucket->acked_at_end) {
         /* Publish only a completed receive-time bucket. All frames handled
          * in one millisecond contribute once, irrespective of batching. */
-        uint64_t elapsed = (uint64_t)(member->rate_sample_end - member->rate_sample_start);
-        if (elapsed != 0 && member->rate_sample_bytes != 0) {
-            uint64_t bytes = member->rate_sample_bytes;
+        uint64_t elapsed = (uint64_t)(bucket->acked_at_end - bucket->acked_at_start);
+        if (elapsed != 0 && bucket->bytes != 0) {
+            if (!bucket->timestamps_valid || bucket->sent_at_start <= 0 || bucket->sent_at_end < bucket->sent_at_start) {
+                bucket->context.flags &= ~QUICLY_FLEXICAST_SAMPLE_VALID;
+            } else if ((uint64_t)(bucket->sent_at_end - bucket->sent_at_start) > elapsed) {
+                /* ACK compression cannot make delivery faster than the
+                 * corresponding actual socket submission interval. */
+                elapsed = (uint64_t)(bucket->sent_at_end - bucket->sent_at_start);
+            }
+            uint64_t bytes = bucket->bytes;
             uint64_t sample = bytes > UINT64_MAX / 1000 ? UINT64_MAX : bytes * 1000 / elapsed;
+            bucket->rate = sample;
+            /* Older outstanding intervals remain limited until their send
+             * boundary passes the observation, including when its packet
+             * never appears in an ACK range. Newer clean intervals recover. */
+            if (flow->app_limited_at > 0 && bucket->sent_at_start <= flow->app_limited_at)
+                bucket->context.flags |= QUICLY_FLEXICAST_SAMPLE_APP_LIMITED;
+            if (flow->host_limited_at > 0 && bucket->sent_at_start <= flow->host_limited_at)
+                bucket->context.flags |= QUICLY_FLEXICAST_SAMPLE_HOST_LIMITED;
+            member->published_rate_sample = *bucket;
             quicly_flexicast_member_stats_t *stats = &member->stats;
             if (stats->delivery_rate_bytes_per_second == 0)
                 stats->delivery_rate_bytes_per_second = sample;
@@ -1217,21 +1332,36 @@ static void sample_delivery_rate(quicly_flexicast_member_t *member, uint64_t ack
                     stats->delivery_rate_bytes_per_second - stats->delivery_rate_bytes_per_second / 8 + sample / 8;
             ++member->rate_sample_epoch;
         }
-        member->rate_sample_start = member->rate_sample_end;
-        member->rate_sample_end = now;
-        member->rate_sample_bytes = 0;
+        /* An unknown interval start invalidates that measurement, not the
+         * next known boundary. Otherwise one untracked packet would poison
+         * all subsequent delivery samples permanently. */
+        int64_t sent_at = bucket->end_timestamp_valid ? bucket->sent_at_end : 0;
+        *bucket = (flexicast_delivery_sample_t){.acked_at_start = bucket->acked_at_end,
+                                                .acked_at_end = now,
+                                                .sent_at_start = sent_at,
+                                                .timestamps_valid = sent_at > 0,
+                                                .end_timestamp_valid = 1};
     }
-    member->rate_sample_bytes =
-        UINT64_MAX - member->rate_sample_bytes < acked_bytes ? UINT64_MAX : member->rate_sample_bytes + acked_bytes;
+    merge_send_context(&bucket->context, &observation->context, bucket->bytes == 0);
+    bucket->timestamps_valid = bucket->timestamps_valid && observation->timestamps_valid;
+    bucket->end_timestamp_valid = bucket->end_timestamp_valid && observation->timestamps_valid;
+    /* A reordered older packet remains part of this measurement. Include
+     * its send time so the bucket cannot masquerade as entirely post-cut. */
+    if (observation->sent_at_start > 0 && observation->sent_at_start < bucket->sent_at_start)
+        bucket->sent_at_start = observation->sent_at_start;
+    if (observation->sent_at_end > bucket->sent_at_end)
+        bucket->sent_at_end = observation->sent_at_end;
+    bucket->bytes = UINT64_MAX - bucket->bytes < observation->bytes ? UINT64_MAX : bucket->bytes + observation->bytes;
 }
 
-static void finish_feedback(quicly_flexicast_flow_t *flow, int member_index, quicly_flexicast_feedback_t *feedback)
+static void finish_feedback(quicly_flexicast_flow_t *flow, int member_index, quicly_flexicast_feedback_t *feedback,
+                            const flexicast_delivery_sample_t *observation)
 {
     quicly_flexicast_member_t *member = flow->members + member_index;
     quicly_flexicast_member_stats_t *stats = &member->stats;
     if (feedback->acked_packets == 0 && feedback->lost_packets == 0 && feedback->ecn_ce_count == 0)
         return;
-    sample_delivery_rate(member, feedback->acked_bytes, feedback->now);
+    sample_delivery_rate(flow, member, observation, feedback->now);
     if (feedback->now > 0)
         stats->last_feedback_at = feedback->now;
     feedback->epoch = ++stats->feedback_epoch;
@@ -1239,16 +1369,32 @@ static void finish_feedback(quicly_flexicast_flow_t *flow, int member_index, qui
     /* A retained estimate after rekey is not a fresh measurement. Publish its
      * identity only when a complete bucket is available in this key epoch. */
     feedback->delivery_rate_sample_epoch = member->rate_sample_epoch;
-    feedback->delivery_rate_bytes_per_second = member->rate_sample_epoch != 0 ? stats->delivery_rate_bytes_per_second : 0;
+    const flexicast_delivery_sample_t *sample = &member->published_rate_sample;
+    feedback->delivery_rate_bytes_per_second = sample->rate;
+    feedback->delivery_sample_flags = sample->context.flags | QUICLY_FLEXICAST_SAMPLE_PRESENT;
+    feedback->delivery_sample_fanout = sample->context.physical_fanout;
+    feedback->delivery_sample_pacing_rate_bytes_per_second = sample->context.pacing_rate_bytes_per_second;
+    feedback->delivery_sample_bytes = sample->bytes;
+    feedback->delivery_sample_sent_at_start = sample->sent_at_start;
+    feedback->delivery_sample_sent_at_end = sample->sent_at_end;
+    feedback->delivery_sample_acked_at_start = sample->acked_at_start;
+    feedback->delivery_sample_acked_at_end = sample->acked_at_end;
     feedback->latest_rtt_msec = stats->latest_rtt_msec;
     feedback->minimum_rtt_msec = stats->minimum_rtt_msec;
     feedback->smoothed_rtt_msec = stats->smoothed_rtt_msec;
+    feedback->rtt_sample_epoch = member->rtt_sample_epoch;
+    feedback->rtt_sample_at = member->rtt_sample_at;
+    feedback->raw_rtt_msec = member->raw_rtt_msec;
+    feedback->rtt_ack_delay_msec = member->rtt_ack_delay_msec;
+    feedback->applied_ack_delay_msec = member->applied_ack_delay_msec;
+    feedback->rtt_sample_flags = member->rtt_sample_flags | QUICLY_FLEXICAST_RTT_PRESENT;
     quicly_flexicast_cc_on_feedback(flow->cc, feedback);
 }
 
 int quicly_flexicast_ack_at(quicly_flexicast_flow_t *flow, uint64_t member_id, uint64_t packet_number, int *complete, int64_t now)
 {
     quicly_flexicast_feedback_t feedback = {.member_id = member_id, .largest_acknowledged = packet_number, .now = now};
+    flexicast_delivery_sample_t observation = {0};
     int member_index;
     size_t num_completed = 0;
     quicly_flexicast_sent_t *sent;
@@ -1260,11 +1406,11 @@ int quicly_flexicast_ack_at(quicly_flexicast_flow_t *flow, uint64_t member_id, u
         return QUICLY_FLEXICAST_ERROR_NOT_FOUND;
     if (!sent_has_member(flow, sent, (size_t)member_index))
         return QUICLY_FLEXICAST_ERROR_REPLAY;
-    (void)acknowledge_packet(flow, member_index, packet_number, now, &feedback, &num_completed);
+    (void)acknowledge_packet(flow, member_index, packet_number, now, &feedback, &observation, &num_completed);
     *complete = num_completed != 0;
     if (packet_number > flow->members[member_index].stats.largest_acknowledged)
         flow->members[member_index].stats.largest_acknowledged = packet_number;
-    finish_feedback(flow, member_index, &feedback);
+    finish_feedback(flow, member_index, &feedback, &observation);
     return QUICLY_FLEXICAST_OK;
 }
 
@@ -1302,7 +1448,8 @@ static uint64_t sent_window_start(const quicly_flexicast_flow_t *flow)
 }
 
 static void acknowledge_range(quicly_flexicast_flow_t *flow, int member_index, uint64_t smallest, uint64_t largest, int64_t now,
-                              quicly_flexicast_feedback_t *feedback, size_t *num_completed)
+                              quicly_flexicast_feedback_t *feedback, flexicast_delivery_sample_t *observation,
+                              size_t *num_completed)
 {
     uint64_t window_start;
     if (flow->next_packet_number == flow->first_packet_number)
@@ -1315,7 +1462,7 @@ static void acknowledge_range(quicly_flexicast_flow_t *flow, int member_index, u
     if (smallest > largest)
         return;
     for (uint64_t packet_number = largest;; --packet_number) {
-        (void)acknowledge_packet(flow, member_index, packet_number, now, feedback, num_completed);
+        (void)acknowledge_packet(flow, member_index, packet_number, now, feedback, observation, num_completed);
         if (packet_number == smallest)
             break;
     }
@@ -1358,6 +1505,7 @@ int quicly_flexicast_ack_frame_at(quicly_flexicast_flow_t *flow, uint64_t member
 {
     quicly_flexicast_feedback_t feedback = {
         .member_id = member_id, .largest_acknowledged = frame != NULL ? frame->largest_acknowledged : 0, .now = now};
+    flexicast_delivery_sample_t observation = {0};
     int member_index;
     uint64_t largest;
 
@@ -1378,7 +1526,7 @@ int quicly_flexicast_ack_frame_at(quicly_flexicast_flow_t *flow, uint64_t member
     largest = frame->largest_acknowledged;
     for (uint64_t i = 0; i <= frame->num_gaps; ++i) {
         uint64_t smallest = largest - (frame->ack_block_lengths[i] - 1);
-        acknowledge_range(flow, member_index, smallest, largest, now, &feedback, num_completed);
+        acknowledge_range(flow, member_index, smallest, largest, now, &feedback, &observation, num_completed);
         if (i != frame->num_gaps)
             largest = smallest - frame->gaps[i] - 1;
     }
@@ -1391,7 +1539,7 @@ int quicly_flexicast_ack_frame_at(quicly_flexicast_flow_t *flow, uint64_t member
     }
     *num_acked = (size_t)feedback.acked_packets;
     *num_lost = (size_t)feedback.lost_packets;
-    finish_feedback(flow, member_index, &feedback);
+    finish_feedback(flow, member_index, &feedback, &observation);
     return QUICLY_FLEXICAST_OK;
 }
 
@@ -1445,4 +1593,20 @@ void quicly_flexicast_cc_on_flow_timeout(quicly_flexicast_flow_t *flow, int64_t 
 void quicly_flexicast_cc_get_flow_output(const quicly_flexicast_flow_t *flow, quicly_flexicast_cc_output_t *output)
 {
     quicly_flexicast_cc_get_output(flow != NULL ? flow->cc : NULL, output);
+}
+
+int quicly_flexicast_cc_enable_flow_trace(quicly_flexicast_flow_t *flow, size_t capacity)
+{
+    return quicly_flexicast_cc_enable_trace(flow != NULL ? flow->cc : NULL, capacity);
+}
+
+void quicly_flexicast_cc_disable_flow_trace(quicly_flexicast_flow_t *flow)
+{
+    quicly_flexicast_cc_disable_trace(flow != NULL ? flow->cc : NULL);
+}
+
+size_t quicly_flexicast_cc_read_flow_trace(quicly_flexicast_flow_t *flow, quicly_flexicast_cc_trace_event_t *events,
+                                           size_t capacity, uint64_t *overwritten)
+{
+    return quicly_flexicast_cc_read_trace(flow != NULL ? flow->cc : NULL, events, capacity, overwritten);
 }

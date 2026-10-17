@@ -202,6 +202,24 @@ int quicly_flexicast_send_datagram_at(quicly_flexicast_flow_t *flow, ptls_iovec_
  * disables the affected RTT sample when the physical send time is unknown. */
 int quicly_flexicast_mark_submitted(quicly_flexicast_flow_t *flow, uint64_t member_id, uint64_t packet_number, int64_t now);
 
+typedef struct st_quicly_flexicast_send_context_t {
+    uint64_t pacing_rate_bytes_per_second;
+    uint32_t physical_fanout;
+    /** QUICLY_FLEXICAST_SAMPLE_VALID plus explicit APP_LIMITED/HOST_LIMITED
+     * interval observations. Normal pacing is neither limitation. Limitation
+     * watermarks also cover older outstanding sample intervals if this
+     * packet is lost; later send boundaries and rekey clear that influence. */
+    uint32_t flags;
+} quicly_flexicast_send_context_t;
+
+/** Like mark_submitted, with the physical pacing rate and actual copy count
+ * at this successful socket submission. NULL context preserves timing but
+ * makes delivery context unknown; the old function is this NULL wrapper.
+ * Common submission metadata and bounded sparse replica overrides avoid
+ * storage proportional to the packet-window/member-count product. */
+int quicly_flexicast_mark_submitted_with_context(quicly_flexicast_flow_t *flow, uint64_t member_id, uint64_t packet_number,
+                                                 int64_t now, const quicly_flexicast_send_context_t *context);
+
 /* Decrypts in place. The returned payload borrows storage from packet. A packet
  * containing multiple DATAGRAMs returns BUFFER_TOO_SMALL without consuming its
  * packet number; use receive_datagrams_at for general packet reception. PING-
@@ -262,6 +280,13 @@ int quicly_flexicast_abandon_datagram(quicly_flexicast_flow_t *flow, uint64_t me
 void quicly_flexicast_cc_set_flow_hints(quicly_flexicast_flow_t *flow, const quicly_flexicast_cc_hints_t *hints, int64_t now);
 void quicly_flexicast_cc_on_flow_timeout(quicly_flexicast_flow_t *flow, int64_t now);
 void quicly_flexicast_cc_get_flow_output(const quicly_flexicast_flow_t *flow, quicly_flexicast_cc_output_t *output);
+
+/** Optional bounded controller tracing; see the controller trace API for
+ * capacity, ownership, drain order, and cumulative overwrite semantics. */
+int quicly_flexicast_cc_enable_flow_trace(quicly_flexicast_flow_t *flow, size_t capacity);
+void quicly_flexicast_cc_disable_flow_trace(quicly_flexicast_flow_t *flow);
+size_t quicly_flexicast_cc_read_flow_trace(quicly_flexicast_flow_t *flow, quicly_flexicast_cc_trace_event_t *events,
+                                           size_t capacity, uint64_t *overwritten);
 
 #ifdef __cplusplus
 }
