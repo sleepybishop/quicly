@@ -13,25 +13,43 @@
 #define LOSS_SCALE 1000000U
 #define EXTERNAL_LOAD_CLEAR_PPM 100000U
 #define EXTERNAL_LOAD_CLEAR_EPOCHS 3U
-#define RTT_CONGESTION_EPOCHS 3U
-#define RTT_CLEAR_EPOCHS 3U
-#define FLOOR_RECOVERY_HOLD_EPOCHS 10U
-#define FLOOR_RECOVERY_RAMP_EPOCHS 2U
-#define STARTUP_GROWTH_EPOCHS 5U
+#define STARTUP_PROBES 5U
+#define DRAIN_OBSERVING 1U
+#define DRAIN_ACTIVE 2U
+
+typedef struct st_adaptive_drain_t {
+    uint32_t phase;
+    uint64_t member_id;
+    uint64_t ceiling;
+    uint64_t target;
+    int64_t started_at;
+    int64_t deadline;
+    int64_t ended_at;
+    int needs_growth;
+} adaptive_drain_t;
 
 typedef struct st_adaptive_member_t {
     uint64_t id;
+    uint64_t last_feedback_epoch;
+    uint32_t minimum_rtt;
+    uint32_t previous_rtt;
+    uint32_t rising_delay_epochs;
+    uint64_t last_rtt_sample_epoch;
+    int64_t previous_rtt_at;
     uint32_t baseline_loss_ppm;
     uint32_t flat_loss_epochs;
-    uint32_t minimum_rtt;
-    int64_t last_feedback;
-    uint32_t elevated_rtt_epochs;
-    uint32_t clear_rtt_epochs;
     uint32_t baseline_delivery_ratio_ppm;
+    uint64_t recent_delivery_rate;
+    uint64_t last_delivery_sample_epoch;
+    uint64_t delivery_reference_rate;
+    uint32_t delivery_reference_fanout;
     uint32_t recent_delivery_ratio_ppm;
     uint32_t degraded_delivery_epochs;
-    uint64_t last_feedback_epoch;
-    int rtt_congested;
+    int active;
+    uint64_t delivery_ceiling;
+    uint32_t delivery_ceiling_eligible;
+    uint32_t delivery_sample_post_cut;
+    uint32_t delivery_sample_ratio_ppm;
 } adaptive_member_t;
 
 typedef struct st_adaptive_state_t {
@@ -39,24 +57,21 @@ typedef struct st_adaptive_state_t {
     quicly_flexicast_cc_hints_t hints;
     adaptive_member_t *members;
     size_t num_members;
+    size_t num_active_members;
     flexicast_member_map_t member_map;
     uint64_t rate;
     uint64_t last_growth_epoch;
-    uint64_t last_growth_freeze_epoch;
-    uint32_t startup_growth_epochs;
-    int startup_complete;
-    int64_t last_rtt_reduction_at;
-    uint64_t last_rtt_clear_epoch;
-    uint32_t rtt_clear_epochs;
-    uint64_t rtt_episode_member_id;
-    int64_t next_recovery_probe;
-    int64_t last_timeout_reduction;
-    uint32_t unanswered_recovery_probes;
-    uint32_t floor_recovery_epochs;
-    uint64_t last_floor_recovery_epoch;
+    uint64_t last_reduction_epoch;
+    int64_t last_growth_at;
+    int64_t last_reduction_at;
+    int64_t growth_blocked_until;
+    int64_t next_timeout;
+    uint32_t startup_probes;
+    uint32_t unanswered_probes;
     uint64_t last_external_load_epoch;
     uint32_t external_load_clear_epochs;
     int external_load_seen;
+    adaptive_drain_t drain;
 } adaptive_state_t;
 
 static adaptive_member_t *find_member(adaptive_state_t *state, uint64_t id)
@@ -65,50 +80,78 @@ static adaptive_member_t *find_member(adaptive_state_t *state, uint64_t id)
     return slot >= 0 ? state->members + slot : NULL;
 }
 
-static adaptive_member_t *add_member(adaptive_state_t *state, uint64_t id, int64_t now)
+static adaptive_member_t *add_member(adaptive_state_t *state, uint64_t id)
 {
     adaptive_member_t *member = find_member(state, id);
-    if (member != NULL)
-        return member;
-    if (state->num_members == state->config.maximum_members)
-        return NULL;
-    flexicast_member_map_set(&state->member_map, id, state->num_members);
-    member = state->members + state->num_members++;
-    member->id = id;
-    member->last_feedback = now;
+    if (member == NULL) {
+        if (state->num_members == state->config.maximum_members)
+            return NULL;
+        flexicast_member_map_set(&state->member_map, id, state->num_members);
+        member = state->members + state->num_members++;
+        member->id = id;
+    }
+    if (!member->active) {
+        member->active = 1;
+        ++state->num_active_members;
+    }
     return member;
 }
 
-static uint32_t active_senders(const adaptive_state_t *state)
+static uint64_t control_interval(const adaptive_state_t *state)
 {
-    return state->hints.active_senders != 0 ? state->hints.active_senders : 1;
+    uint64_t interval = state->config.feedback_timeout_msec / 4;
+    return interval < 25 ? 25 : interval;
 }
 
-static int64_t recovery_deadline(const adaptive_state_t *state, int64_t now)
+static uint64_t control_epoch(const adaptive_state_t *state, int64_t now)
 {
-    uint64_t interval = state->config.feedback_timeout_msec;
-    uint64_t delay, remaining;
+    return now < 0 ? 0 : (uint64_t)now / control_interval(state) + 1;
+}
+
+static int64_t deadline(int64_t now, uint64_t delay)
+{
     if (now < 0)
         now = 0;
-    if (interval > 2000)
-        interval = 2000;
-    uint64_t seed = (uint64_t)now ^ state->rate ^ ((uint64_t)active_senders(state) << 32);
-    uint64_t jitter = interval != 0 ? (seed * UINT64_C(11400714819323198485) >> 56) * interval / 1280 : 0;
-    delay = interval + jitter;
-    remaining = (uint64_t)(INT64_MAX - now);
-    return delay > remaining ? INT64_MAX : now + (int64_t)delay;
+    return delay > (uint64_t)(INT64_MAX - now) ? INT64_MAX : now + (int64_t)delay;
 }
 
-static void update_output(adaptive_state_t *state, int64_t now, uint64_t limiting_member, uint32_t reason,
-                          quicly_flexicast_cc_output_t *output)
+/* Decisions are separated by elapsed time, not by wall-clock bucket edges. */
+static int control_due(const adaptive_state_t *state, int64_t now, int64_t previous, uint64_t previous_epoch)
 {
+    return previous_epoch == 0 || now >= deadline(previous, control_interval(state));
+}
+
+static uint32_t end_drain(adaptive_state_t *state, int64_t now, uint32_t reason)
+{
+    state->drain.phase = 0;
+    state->drain.ended_at = now;
+    state->drain.needs_growth = 1;
+    return reason;
+}
+
+static uint32_t expire_drain(adaptive_state_t *state, int64_t now)
+{
+    return state->drain.phase != 0 && now >= state->drain.deadline ? end_drain(state, now, QUICLY_FLEXICAST_CC_REASON_DRAIN_EXPIRE)
+                                                                   : 0;
+}
+
+static void update_output(adaptive_state_t *state, uint64_t member_id, uint32_t reason, quicly_flexicast_cc_output_t *output)
+{
+    /* The aggregate limit remains in effect across feedback and recovery
+     * events. Keep the controller's rate bounded as well as its output. */
     state->rate = clamp_rate(&state->config, state->rate);
-    uint64_t burst = burst_size(&state->config, state->rate);
+    if (state->hints.aggregate_rate_limit_bytes_per_second != 0 &&
+        state->rate > state->hints.aggregate_rate_limit_bytes_per_second) {
+        state->rate = state->hints.aggregate_rate_limit_bytes_per_second;
+        reason |= QUICLY_FLEXICAST_CC_REASON_RATE_LIMIT;
+    }
     output->rate_bytes_per_second = state->rate;
-    output->burst_bytes = burst;
-    output->inflight_bytes = burst;
-    output->limiting_member_id = limiting_member;
-    output->next_timeout = state->next_recovery_probe != 0 ? state->next_recovery_probe : recovery_deadline(state, now);
+    output->burst_bytes = burst_size(&state->config, state->rate);
+    output->inflight_bytes = output->burst_bytes;
+    output->limiting_member_id = member_id;
+    output->next_timeout = state->num_active_members == 0 ? INT64_MAX : state->next_timeout;
+    if (state->drain.phase != 0 && output->next_timeout > state->drain.deadline)
+        output->next_timeout = state->drain.deadline;
     output->reason = reason;
 }
 
@@ -121,8 +164,8 @@ static int adaptive_init(void *_state, const quicly_flexicast_cc_config_t *confi
         flexicast_member_map_init(&state->member_map, config->maximum_members) != 0)
         return -1;
     state->rate = config->startup_rate_bytes_per_second;
-    state->next_recovery_probe = recovery_deadline(state, now);
-    update_output(state, now, 0, QUICLY_FLEXICAST_CC_REASON_NONE, output);
+    state->next_timeout = deadline(now, config->feedback_timeout_msec);
+    update_output(state, 0, QUICLY_FLEXICAST_CC_REASON_NONE, output);
     return 0;
 }
 
@@ -136,16 +179,47 @@ static void adaptive_dispose(void *_state)
 static void adaptive_on_member_added(void *_state, uint64_t member_id, int64_t now, quicly_flexicast_cc_output_t *output)
 {
     adaptive_state_t *state = _state;
-    (void)add_member(state, member_id, now);
-    update_output(state, now, 0, QUICLY_FLEXICAST_CC_REASON_NONE, output);
+    uint32_t reason = expire_drain(state, now);
+    (void)add_member(state, member_id);
+    if (state->next_timeout <= now || state->next_timeout == INT64_MAX)
+        state->next_timeout = deadline(now, state->config.feedback_timeout_msec);
+    update_output(state, 0, reason, output);
+}
+
+static void suspend_member(adaptive_state_t *state, adaptive_member_t *member)
+{
+    if (!member->active)
+        return;
+    member->active = 0;
+    --state->num_active_members;
+    if (state->num_active_members == 0) {
+        state->next_timeout = INT64_MAX;
+        state->unanswered_probes = 0;
+    }
+}
+
+static void adaptive_on_member_suspended(void *_state, uint64_t member_id, int64_t now, quicly_flexicast_cc_output_t *output)
+{
+    adaptive_state_t *state = _state;
+    adaptive_member_t *member = find_member(state, member_id);
+    uint32_t reason = expire_drain(state, now);
+    if (state->drain.phase != 0 && state->drain.member_id == member_id)
+        reason |= end_drain(state, now, QUICLY_FLEXICAST_CC_REASON_DRAIN_CLEAR);
+    if (member != NULL)
+        suspend_member(state, member);
+    update_output(state, 0, reason, output);
 }
 
 static void adaptive_on_member_removed(void *_state, uint64_t member_id, int64_t now, quicly_flexicast_cc_output_t *output)
 {
     adaptive_state_t *state = _state;
     adaptive_member_t *member = find_member(state, member_id);
+    uint32_t reason = expire_drain(state, now);
+    if (state->drain.phase != 0 && state->drain.member_id == member_id)
+        reason |= end_drain(state, now, QUICLY_FLEXICAST_CC_REASON_DRAIN_CLEAR);
     if (member != NULL) {
         size_t slot = (size_t)(member - state->members), last = state->num_members - 1;
+        suspend_member(state, member);
         flexicast_member_map_remove(&state->member_map, member_id);
         if (slot != last) {
             state->members[slot] = state->members[last];
@@ -154,87 +228,175 @@ static void adaptive_on_member_removed(void *_state, uint64_t member_id, int64_t
         memset(state->members + last, 0, sizeof(state->members[last]));
         --state->num_members;
     }
-    if (state->rtt_episode_member_id == member_id) {
-        state->rtt_episode_member_id = 0;
-        state->rtt_clear_epochs = 0;
-    }
-    update_output(state, now, 0, QUICLY_FLEXICAST_CC_REASON_NONE, output);
+    update_output(state, 0, reason, output);
 }
 
 static void adaptive_on_epoch_reset(void *_state, int64_t now, quicly_flexicast_cc_output_t *output)
 {
     adaptive_state_t *state = _state;
+    uint32_t reason = state->drain.phase != 0 ? QUICLY_FLEXICAST_CC_REASON_DRAIN_CLEAR : 0;
+    memset(&state->drain, 0, sizeof(state->drain));
     for (size_t i = 0; i != state->num_members; ++i) {
-        state->members[i].last_feedback = now;
         state->members[i].last_feedback_epoch = 0;
-        state->members[i].elevated_rtt_epochs = 0;
-        state->members[i].clear_rtt_epochs = 0;
-        state->members[i].rtt_congested = 0;
         state->members[i].flat_loss_epochs = 0;
         state->members[i].degraded_delivery_epochs = 0;
+        state->members[i].last_delivery_sample_epoch = 0;
+        state->members[i].previous_rtt = 0;
+        state->members[i].last_rtt_sample_epoch = 0;
+        state->members[i].previous_rtt_at = 0;
+        state->members[i].recent_delivery_rate = 0;
+        state->members[i].delivery_reference_rate = 0;
+        state->members[i].delivery_reference_fanout = 0;
+        state->members[i].rising_delay_epochs = 0;
+        state->members[i].delivery_ceiling = 0;
+        state->members[i].delivery_ceiling_eligible = 0;
+        state->members[i].delivery_sample_post_cut = 0;
+        state->members[i].delivery_sample_ratio_ppm = 0;
     }
-    state->unanswered_recovery_probes = 0;
-    state->last_timeout_reduction = 0;
+    state->unanswered_probes = 0;
     state->last_growth_epoch = 0;
-    state->last_growth_freeze_epoch = 0;
-    state->last_rtt_reduction_at = 0;
-    state->last_rtt_clear_epoch = 0;
-    state->floor_recovery_epochs = 0;
-    state->last_floor_recovery_epoch = 0;
-    state->rtt_episode_member_id = 0;
-    state->rtt_clear_epochs = 0;
-    state->next_recovery_probe = recovery_deadline(state, now);
-    update_output(state, now, 0, QUICLY_FLEXICAST_CC_REASON_NONE, output);
+    state->last_reduction_epoch = 0;
+    state->last_growth_at = state->last_reduction_at = 0;
+    state->growth_blocked_until = now;
+    state->next_timeout = deadline(now, state->config.feedback_timeout_msec);
+    update_output(state, 0, reason, output);
 }
 
-static int rtt_reduction_is_due(const adaptive_state_t *state, int64_t now)
+/* The ceiling is in physical bytes/second. Cap before every potentially
+ * overflowing product: delivery * fanout / clean_fraction cannot exceed the
+ * historical pacing rate, even for extreme direct-controller inputs. */
+static uint64_t delivery_rate_ceiling(uint64_t delivery, uint32_t fanout, uint32_t clean_fraction, uint64_t reference)
 {
-    uint64_t horizon = (uint64_t)state->config.feedback_timeout_msec * 2;
-    return state->last_rtt_reduction_at == 0 || now < state->last_rtt_reduction_at ||
-           (uint64_t)(now - state->last_rtt_reduction_at) >= horizon;
+    if (delivery > reference / fanout)
+        return reference;
+    uint64_t physical = delivery * fanout;
+    uint64_t quotient = physical / clean_fraction;
+    if (quotient > reference / LOSS_SCALE)
+        return reference;
+    uint64_t whole = quotient * LOSS_SCALE;
+    uint64_t remainder = physical % clean_fraction * LOSS_SCALE / clean_fraction;
+    return remainder > reference - whole ? reference : whole + remainder;
 }
 
-static int update_delivery_ratio(adaptive_state_t *state, adaptive_member_t *member, const quicly_flexicast_feedback_t *feedback)
+static int update_delivery_ratio(adaptive_state_t *state, adaptive_member_t *member, const quicly_flexicast_feedback_t *feedback,
+                                 int *fresh)
 {
-    if (state->rate == 0 || feedback->delivery_rate_bytes_per_second == 0)
+    int explicit_context = (feedback->delivery_sample_flags & QUICLY_FLEXICAST_SAMPLE_PRESENT) != 0;
+    uint64_t sample_epoch = feedback->delivery_rate_sample_epoch;
+    if (!explicit_context && sample_epoch == 0)
+        sample_epoch = feedback->now > 0 ? (uint64_t)feedback->now : feedback->epoch;
+    if (sample_epoch == 0 || sample_epoch <= member->last_delivery_sample_epoch)
         return 0;
-    uint32_t sample = feedback->delivery_rate_bytes_per_second >= state->rate
-                          ? LOSS_SCALE
-                          : (uint32_t)((double)feedback->delivery_rate_bytes_per_second / (double)state->rate * LOSS_SCALE);
-    if (member->baseline_delivery_ratio_ppm == 0) {
-        /* The advertised rate is the initial reference. A receiver that joins
-         * an already-impaired path must not make its first low sample the
-         * permanent normal and thereby mask startup congestion. Stable loss
-         * without delay is learned below after four fresh observations. */
-        member->baseline_delivery_ratio_ppm = LOSS_SCALE;
-        member->recent_delivery_ratio_ppm = sample;
-        member->degraded_delivery_epochs = 0;
-        return 1;
+    member->last_delivery_sample_epoch = sample_epoch;
+
+    uint32_t divisor = state->hints.delivery_rate_divisor != 0 ? state->hints.delivery_rate_divisor : 1;
+    uint64_t reference_rate = state->rate;
+    if (explicit_context) {
+        uint32_t invalid =
+            QUICLY_FLEXICAST_SAMPLE_APP_LIMITED | QUICLY_FLEXICAST_SAMPLE_HOST_LIMITED | QUICLY_FLEXICAST_SAMPLE_MIXED;
+        if (!(feedback->delivery_sample_flags & QUICLY_FLEXICAST_SAMPLE_VALID) ||
+            (feedback->delivery_sample_flags & invalid) != 0 || feedback->delivery_sample_fanout == 0 ||
+            feedback->delivery_sample_bytes == 0 || feedback->delivery_sample_sent_at_start < 0 ||
+            feedback->delivery_sample_sent_at_end < feedback->delivery_sample_sent_at_start ||
+            feedback->delivery_sample_acked_at_end <= feedback->delivery_sample_acked_at_start ||
+            feedback->delivery_sample_sent_at_end > feedback->delivery_sample_acked_at_end ||
+            feedback->delivery_sample_acked_at_end > feedback->now ||
+            feedback->now > deadline(feedback->delivery_sample_acked_at_end, state->config.feedback_timeout_msec)) {
+            /* Unknown or limited sending cannot distinguish available capacity
+             * from offered load. */
+            member->recent_delivery_rate = 0;
+            member->delivery_reference_rate = 0;
+            member->degraded_delivery_epochs = 0;
+            return 0;
+        }
+        divisor = feedback->delivery_sample_fanout;
+        reference_rate = feedback->delivery_sample_pacing_rate_bytes_per_second;
+        if (reference_rate != member->delivery_reference_rate || divisor != member->delivery_reference_fanout) {
+            member->recent_delivery_rate = 0;
+            member->degraded_delivery_epochs = 0;
+        }
+        member->delivery_reference_rate = reference_rate;
+        member->delivery_reference_fanout = divisor;
     }
-    member->recent_delivery_ratio_ppm = (uint32_t)(((uint64_t)member->recent_delivery_ratio_ppm * 3 + sample) / 4);
+    uint64_t expected = reference_rate / divisor;
+    if (expected == 0 || feedback->delivery_rate_bytes_per_second == 0)
+        return 0;
+    uint64_t sample_rate = feedback->delivery_rate_bytes_per_second;
+    if (explicit_context) {
+        uint32_t clean_fraction = member->baseline_delivery_ratio_ppm != 0 ? member->baseline_delivery_ratio_ppm : LOSS_SCALE;
+        member->delivery_ceiling = delivery_rate_ceiling(sample_rate, divisor, clean_fraction, reference_rate);
+        member->delivery_ceiling_eligible = 1;
+        member->delivery_sample_ratio_ppm =
+            sample_rate >= expected ? LOSS_SCALE : (uint32_t)((double)sample_rate / (double)expected * LOSS_SCALE);
+        member->delivery_sample_post_cut =
+            state->last_reduction_epoch == 0 || feedback->delivery_sample_sent_at_start >= state->last_reduction_at;
+        if (!member->delivery_sample_post_cut) {
+            /* Old sending can still bound capacity, but cannot justify growth or
+             * teach a clean baseline for the new rate. Keep that history separate. */
+            member->recent_delivery_rate = 0;
+            member->degraded_delivery_epochs = 0;
+            return 0;
+        }
+    }
+    *fresh = 1;
+    if (member->recent_delivery_rate == 0)
+        member->recent_delivery_rate = sample_rate;
+    else
+        member->recent_delivery_rate =
+            member->recent_delivery_rate / 4 * 3 + sample_rate / 4 + (member->recent_delivery_rate % 4 * 3 + sample_rate % 4) / 4;
+    /* Native samples use the rate and fanout at submission. Legacy direct
+     * callers retain their current-rate convention. Never blend native rates
+     * from different sending contexts or count repeated publications twice. */
+    uint32_t sample = member->recent_delivery_rate >= expected
+                          ? LOSS_SCALE
+                          : (uint32_t)((double)member->recent_delivery_rate / (double)expected * LOSS_SCALE);
+    if (member->baseline_delivery_ratio_ppm == 0)
+        member->baseline_delivery_ratio_ppm = LOSS_SCALE;
+    member->recent_delivery_ratio_ppm = sample;
     uint32_t margin = member->baseline_delivery_ratio_ppm / 10;
     if (margin < 50000)
         margin = 50000;
-    if ((uint64_t)member->recent_delivery_ratio_ppm + margin < member->baseline_delivery_ratio_ppm)
-        ++member->degraded_delivery_epochs;
-    else
+    if ((uint64_t)sample + margin < member->baseline_delivery_ratio_ppm) {
+        if (member->degraded_delivery_epochs < 4)
+            ++member->degraded_delivery_epochs;
+    } else {
         member->degraded_delivery_epochs = 0;
+    }
     return 1;
 }
 
-static int delivery_ratio_degraded(const adaptive_member_t *member)
+static int update_rtt(adaptive_state_t *state, adaptive_member_t *member, const quicly_flexicast_feedback_t *feedback)
 {
-    return member->baseline_delivery_ratio_ppm != 0 && member->degraded_delivery_epochs != 0;
-}
-
-static int delivery_ratio_supports_growth(const adaptive_member_t *member)
-{
-    if (member->baseline_delivery_ratio_ppm == 0 || member->recent_delivery_ratio_ppm == 0)
+    int explicit_context = (feedback->rtt_sample_flags & QUICLY_FLEXICAST_RTT_PRESENT) != 0;
+    uint64_t sample_epoch = feedback->rtt_sample_epoch;
+    if (!explicit_context)
+        sample_epoch = feedback->now > 0 ? (uint64_t)feedback->now : feedback->epoch;
+    if (sample_epoch == 0 || sample_epoch <= member->last_rtt_sample_epoch)
         return 0;
-    uint32_t margin = member->baseline_delivery_ratio_ppm / 10;
-    if (margin < 50000)
-        margin = 50000;
-    return (uint64_t)member->recent_delivery_ratio_ppm + margin >= member->baseline_delivery_ratio_ppm;
+    member->last_rtt_sample_epoch = sample_epoch;
+    if (feedback->latest_rtt_msec == 0 ||
+        (explicit_context && (!(feedback->rtt_sample_flags & QUICLY_FLEXICAST_RTT_VALID) ||
+                              (feedback->rtt_sample_flags & QUICLY_FLEXICAST_RTT_ACK_DELAY_INCONSISTENT) ||
+                              feedback->rtt_sample_at <= 0 || feedback->rtt_sample_at > feedback->now ||
+                              feedback->now > deadline(feedback->rtt_sample_at, state->config.feedback_timeout_msec))))
+        return 0;
+    if (feedback->minimum_rtt_msec != 0)
+        member->minimum_rtt = feedback->minimum_rtt_msec;
+    int64_t sampled_at = explicit_context ? feedback->rtt_sample_at : feedback->now;
+    if (member->previous_rtt == 0 || sampled_at >= deadline(member->previous_rtt_at, control_interval(state))) {
+        uint32_t margin = member->minimum_rtt / 20;
+        if (margin < 1)
+            margin = 1;
+        if (member->previous_rtt != 0 && (uint64_t)feedback->latest_rtt_msec > (uint64_t)member->previous_rtt + margin) {
+            if (member->rising_delay_epochs < 2)
+                ++member->rising_delay_epochs;
+        } else {
+            member->rising_delay_epochs = 0;
+        }
+        member->previous_rtt = feedback->latest_rtt_msec;
+        member->previous_rtt_at = sampled_at;
+    }
+    return 1;
 }
 
 static void learn_clean_delivery_ratio(adaptive_member_t *member)
@@ -242,257 +404,173 @@ static void learn_clean_delivery_ratio(adaptive_member_t *member)
     if (member->baseline_delivery_ratio_ppm == 0 || member->recent_delivery_ratio_ppm == 0)
         return;
     if (member->degraded_delivery_epochs >= 4) {
-        /* A lasting delivery change without queue growth is more likely a new
-         * radio-loss regime than congestion. Adopt it instead of repeatedly
-         * penalizing a stable lossy path. */
+        /* Stable delivery loss without queue growth is the radio baseline.
+         * Neither repairs nor a congestion sample may teach this baseline. */
         member->baseline_delivery_ratio_ppm = member->recent_delivery_ratio_ppm;
         member->degraded_delivery_epochs = 0;
     } else if (member->degraded_delivery_epochs == 0) {
-        if (member->recent_delivery_ratio_ppm > member->baseline_delivery_ratio_ppm)
-            member->baseline_delivery_ratio_ppm =
-                (uint32_t)(((uint64_t)member->baseline_delivery_ratio_ppm * 7 + member->recent_delivery_ratio_ppm) / 8);
-        else
-            member->baseline_delivery_ratio_ppm =
-                (uint32_t)(((uint64_t)member->baseline_delivery_ratio_ppm * 49 + member->recent_delivery_ratio_ppm) / 50);
+        uint32_t weight = member->recent_delivery_ratio_ppm > member->baseline_delivery_ratio_ppm ? 7 : 49;
+        member->baseline_delivery_ratio_ppm =
+            (uint32_t)(((uint64_t)member->baseline_delivery_ratio_ppm * weight + member->recent_delivery_ratio_ppm) / (weight + 1));
     }
 }
 
 static uint32_t loss_ppm(const quicly_flexicast_feedback_t *feedback)
 {
-    uint64_t total = feedback->acked_packets + feedback->lost_packets;
-    if (total == 0)
+    double total = (double)feedback->acked_packets + (double)feedback->lost_packets;
+    return total == 0 ? 0 : (uint32_t)((double)feedback->lost_packets / total * LOSS_SCALE);
+}
+
+static int external_load(const adaptive_state_t *state)
+{
+    return state->external_load_seen || state->hints.external_load_queued_bytes != 0 ||
+           state->hints.external_load_oldest_age_msec != 0;
+}
+
+/* Observe for one sender interval before using a single current capacity
+ * sample. The short impulse is an experiment, not a persistent rate cap:
+ * neither later samples nor correlated receivers can move its target/deadline. */
+static uint32_t update_drain(adaptive_state_t *state, const adaptive_member_t *member, const quicly_flexicast_feedback_t *feedback,
+                             int fresh_native_rtt, int delay_grew, int delivery_congested)
+{
+    adaptive_drain_t *drain = &state->drain;
+    if (drain->phase != 0 && drain->member_id == feedback->member_id && fresh_native_rtt &&
+        feedback->rtt_sample_at >= drain->started_at && !delay_grew && feedback->ecn_ce_count == 0 &&
+        (drain->phase == DRAIN_OBSERVING || feedback->now >= state->growth_blocked_until))
+        return end_drain(state, feedback->now, QUICLY_FLEXICAST_CC_REASON_DRAIN_CLEAR);
+
+    int eligible = member->delivery_ceiling_eligible && fresh_native_rtt && delay_grew && feedback->ecn_ce_count == 0 &&
+                   !external_load(state) &&
+                   (drain->ended_at == 0 || (feedback->delivery_sample_sent_at_start >= state->last_growth_at &&
+                                             feedback->rtt_sample_at >= state->last_growth_at));
+    if (!eligible)
         return 0;
-    return feedback->lost_packets > UINT64_MAX / LOSS_SCALE ? LOSS_SCALE : (uint32_t)(feedback->lost_packets * LOSS_SCALE / total);
-}
-
-static int below_median(const adaptive_state_t *state)
-{
-    return state->hints.median_sender_rate_bytes_per_second != 0 &&
-           state->rate < state->hints.median_sender_rate_bytes_per_second - state->hints.median_sender_rate_bytes_per_second / 10;
-}
-
-static uint64_t external_load_recovery_ceiling(const adaptive_state_t *state)
-{
-    uint64_t ceiling =
-        state->config.minimum_rate_bytes_per_second > UINT64_MAX / 8 ? UINT64_MAX : state->config.minimum_rate_bytes_per_second * 8;
-    if (state->config.startup_rate_bytes_per_second != 0 && ceiling > state->config.startup_rate_bytes_per_second)
-        ceiling = state->config.startup_rate_bytes_per_second;
-    return ceiling < state->config.minimum_rate_bytes_per_second ? state->config.minimum_rate_bytes_per_second : ceiling;
-}
-
-static int has_recent_feedback(const adaptive_state_t *state, int64_t now)
-{
-    uint64_t horizon = (uint64_t)state->config.feedback_timeout_msec * 2;
-    for (size_t i = 0; i != state->num_members; ++i) {
-        int64_t last = state->members[i].last_feedback;
-        if (last > 0 && now >= last && (uint64_t)(now - last) <= horizon)
-            return 1;
+    if (drain->phase == 0 && !drain->needs_growth && delivery_congested) {
+        drain->phase = DRAIN_OBSERVING;
+        drain->member_id = feedback->member_id;
+        drain->ceiling = drain->target = 0;
+        drain->started_at = feedback->now;
+        drain->deadline = deadline(feedback->now, control_interval(state) * 2);
+    } else if (drain->phase == DRAIN_OBSERVING && feedback->now >= deadline(drain->started_at, control_interval(state)) &&
+               control_due(state, feedback->now, state->last_reduction_at, state->last_reduction_epoch)) {
+        uint64_t target = clamp_rate(&state->config, scale_rate(member->delivery_ceiling, 800000, LOSS_SCALE));
+        if (target < state->rate) {
+            drain->phase = DRAIN_ACTIVE;
+            drain->member_id = feedback->member_id;
+            drain->ceiling = member->delivery_ceiling;
+            drain->target = target;
+            drain->started_at = feedback->now;
+            drain->deadline = deadline(feedback->now, control_interval(state) * 4);
+            return QUICLY_FLEXICAST_CC_REASON_DRAIN_ENTER;
+        }
     }
     return 0;
 }
 
-static uint64_t sender_epoch(const adaptive_state_t *state, int64_t now)
+static void grow_once(adaptive_state_t *state, int64_t now, uint32_t growth_divisor)
 {
-    uint64_t interval = state->config.feedback_timeout_msec;
-    return now < 0 ? 0 : (uint64_t)now / interval + 1;
-}
-
-static uint64_t growth_epoch(const adaptive_state_t *state, int64_t now)
-{
-    /* Missing-feedback recovery and positive-feedback growth are different
-     * clocks. NORM's sender-local epoch follows its probe/feedback cadence,
-     * while a substantially longer timeout detects a silent representative.
-     * Keep the same separation without importing receiver sequence numbers. */
-    uint64_t interval = state->config.feedback_timeout_msec / 4;
-    if (interval < 25)
-        interval = 25;
-    return now < 0 ? 0 : (uint64_t)now / interval + 1;
-}
-
-static uint64_t floor_recovery_limit(const adaptive_state_t *state)
-{
-    uint64_t limit = state->config.minimum_rate_bytes_per_second;
-    return limit > UINT64_MAX / 8 ? UINT64_MAX : limit * 8;
-}
-
-static int near_floor(const adaptive_state_t *state, uint64_t rate)
-{
-    uint64_t minimum = state->config.minimum_rate_bytes_per_second;
-    return minimum != 0 && (minimum > UINT64_MAX / 3 || rate <= minimum * 3);
-}
-
-static void apply_floor_recovery_growth(adaptive_state_t *state)
-{
-    double divisor = sqrt((double)active_senders(state));
-    uint64_t increase = (uint64_t)((double)state->rate / divisor);
-    uint64_t candidate = increase_rate(state->rate, increase);
-    uint64_t limit = floor_recovery_limit(state);
-    if (candidate > limit)
-        candidate = limit;
-    if (candidate > state->rate)
-        state->rate = candidate;
-}
-
-static void start_floor_recovery(adaptive_state_t *state, uint64_t epoch)
-{
-    state->floor_recovery_epochs = FLOOR_RECOVERY_RAMP_EPOCHS + FLOOR_RECOVERY_HOLD_EPOCHS;
-    state->last_floor_recovery_epoch = epoch;
-    apply_floor_recovery_growth(state);
-}
-
-static void advance_floor_recovery(adaptive_state_t *state, uint64_t epoch)
-{
-    if (state->floor_recovery_epochs == 0 || epoch <= state->last_floor_recovery_epoch)
-        return;
-    state->last_floor_recovery_epoch = epoch;
-    if (state->floor_recovery_epochs > FLOOR_RECOVERY_HOLD_EPOCHS)
-        apply_floor_recovery_growth(state);
-    --state->floor_recovery_epochs;
-}
-
-static int grow_once(adaptive_state_t *state, int64_t now)
-{
-    uint64_t epoch = growth_epoch(state, now);
-    int external_load = state->hints.external_load_queued_bytes != 0 || state->hints.external_load_oldest_age_msec != 0 ||
-                        state->external_load_seen;
-    uint64_t recovery_ceiling = external_load_recovery_ceiling(state);
-    if (epoch <= state->last_growth_epoch)
-        return 0;
-    if (external_load && state->rate >= recovery_ceiling) {
-        if (epoch <= state->last_growth_freeze_epoch)
-            return 0;
-        state->last_growth_freeze_epoch = epoch;
-        return -1;
-    }
-    state->last_growth_epoch = epoch;
-    /* Grow conservatively because one clean feedback epoch can precede the
-     * receiver repair signal that reveals an overdriven multicast link. Flat
-     * radio loss is still learned rather than treated as congestion, but it
-     * must not combine with exponential startup growth to create avoidable
-     * repair airtime. */
-    double divisor = 8 * sqrt((double)active_senders(state));
-    uint64_t increase = (uint64_t)((double)state->rate / divisor);
+    uint32_t senders = state->hints.active_senders != 0 ? state->hints.active_senders : 1;
+    uint64_t increase = (uint64_t)((double)state->rate / (growth_divisor * sqrt((double)senders)));
     if (increase < state->config.maximum_datagram_size)
         increase = state->config.maximum_datagram_size;
-    if (state->hints.median_sender_rate_bytes_per_second != 0 && below_median(state) &&
-        increase > state->hints.median_sender_rate_bytes_per_second - state->rate)
-        increase = state->hints.median_sender_rate_bytes_per_second - state->rate;
+    uint64_t median = state->hints.median_sender_rate_bytes_per_second;
+    if (median > state->rate && increase > median - state->rate)
+        increase = median - state->rate;
     state->rate = increase_rate(state->rate, increase);
-    /* Repair work is charged to this pacer and is not independent evidence of
-     * congestion. Clean feedback may lift a timeout-reduced flow out of an
-     * unusable floor tail, but only to a bounded recovery service rate. */
-    if (external_load && state->rate > recovery_ceiling)
-        state->rate = recovery_ceiling;
-    return 1;
+    state->last_growth_epoch = control_epoch(state, now);
+    state->last_growth_at = now;
 }
 
 static void adaptive_on_feedback(void *_state, const quicly_flexicast_feedback_t *feedback, quicly_flexicast_cc_output_t *output)
 {
     adaptive_state_t *state = _state;
-    adaptive_member_t *member = add_member(state, feedback->member_id, feedback->now);
-    uint32_t observed_loss, reason = QUICLY_FLEXICAST_CC_REASON_NONE;
-    int congested, delay_grew, has_delivery_sample;
-    if (member == NULL)
+    adaptive_member_t *member = add_member(state, feedback->member_id);
+    uint32_t reason = expire_drain(state, feedback->now);
+    if (member == NULL) {
+        if (reason != 0)
+            update_output(state, feedback->member_id, reason, output);
         return;
+    }
+    member->delivery_ceiling = 0;
+    member->delivery_ceiling_eligible = 0;
+    member->delivery_sample_post_cut = 0;
+    member->delivery_sample_ratio_ppm = 0;
     if (feedback->epoch != 0 && member->last_feedback_epoch != 0 && feedback->epoch <= member->last_feedback_epoch) {
-        update_output(state, feedback->now, feedback->member_id, QUICLY_FLEXICAST_CC_REASON_NONE, output);
+        update_output(state, feedback->member_id, reason, output);
         return;
     }
     if (feedback->epoch != 0)
         member->last_feedback_epoch = feedback->epoch;
-    if (feedback->minimum_rtt_msec != 0)
-        member->minimum_rtt = feedback->minimum_rtt_msec;
-    member->last_feedback = feedback->now;
-    state->unanswered_recovery_probes = 0;
-    state->next_recovery_probe = recovery_deadline(state, feedback->now);
-    observed_loss = loss_ppm(feedback);
-    has_delivery_sample = update_delivery_ratio(state, member, feedback);
-    delay_grew = queue_delay_grew(member->minimum_rtt, feedback->latest_rtt_msec);
-    uint64_t feedback_growth_epoch = growth_epoch(state, feedback->now);
-    if (state->rtt_episode_member_id != 0) {
-        if (delay_grew || state->external_load_seen || feedback->ecn_ce_count != 0) {
-            state->rtt_clear_epochs = 0;
-            state->last_rtt_clear_epoch = feedback_growth_epoch;
-        } else if (feedback->member_id == state->rtt_episode_member_id && feedback->acked_packets != 0 &&
-                   feedback_growth_epoch > state->last_rtt_clear_epoch) {
-            state->last_rtt_clear_epoch = feedback_growth_epoch;
-            if (++state->rtt_clear_epochs >= RTT_CLEAR_EPOCHS) {
-                state->rtt_episode_member_id = 0;
-                state->rtt_clear_epochs = 0;
-                for (size_t i = 0; i != state->num_members; ++i) {
-                    state->members[i].elevated_rtt_epochs = 0;
-                    state->members[i].clear_rtt_epochs = 0;
-                    state->members[i].rtt_congested = 0;
-                }
-            }
-        }
-    }
-    /* External work shares this pacer, but each Flexicast ACK still measures
-     * the physical packet acknowledged, including a repair packet. External
-     * load freezes growth; it does not invalidate corroborated path evidence.
-     * The aggregate RTT episode below prevents correlated member feedback
-     * from multiplying one queue event into a trip to the floor. */
-    congested = feedback->ecn_ce_count != 0 || (delay_grew && has_delivery_sample && delivery_ratio_degraded(member));
+    state->unanswered_probes = 0;
+    state->next_timeout = deadline(feedback->now, state->config.feedback_timeout_msec);
+    uint64_t epoch = control_epoch(state, feedback->now);
+    int fresh_delivery = 0;
+    int has_delivery = update_delivery_ratio(state, member, feedback, &fresh_delivery);
+    int fresh_rtt = update_rtt(state, member, feedback);
+    int delay_grew = fresh_rtt && queue_delay_grew(member->minimum_rtt, feedback->latest_rtt_msec);
+    uint32_t observed_loss = loss_ppm(feedback);
+    uint32_t clean_fraction = member->baseline_delivery_ratio_ppm != 0 ? member->baseline_delivery_ratio_ppm : LOSS_SCALE;
+    uint32_t margin = clean_fraction / 10;
+    if (margin < 50000)
+        margin = 50000;
+    int native_sample = (feedback->delivery_sample_flags & QUICLY_FLEXICAST_SAMPLE_PRESENT) != 0;
+    int delivery_congested = native_sample ? member->delivery_ceiling_eligible && member->delivery_ceiling < state->rate &&
+                                                 (uint64_t)member->delivery_sample_ratio_ppm + margin < clean_fraction
+                                           : has_delivery && member->degraded_delivery_epochs != 0;
+    int fresh_native_rtt = fresh_rtt && (feedback->rtt_sample_flags & QUICLY_FLEXICAST_RTT_PRESENT) != 0;
+    reason |= update_drain(state, member, feedback, fresh_native_rtt, delay_grew, delivery_congested);
+    /* New external-load hints cannot renew an active impulse or veto fresh
+     * congestion evidence. Explicitly limited delivery remains ineligible. */
+    int drain_step = state->drain.phase == DRAIN_ACTIVE && state->rate > state->drain.target && member->delivery_ceiling_eligible &&
+                     fresh_native_rtt && delay_grew;
+    int congested =
+        feedback->ecn_ce_count != 0 || (delay_grew && (delivery_congested || drain_step || member->rising_delay_epochs >= 2 ||
+                                                       observed_loss > member->baseline_loss_ppm + 20000));
 
-    if (state->floor_recovery_epochs != 0) {
-        if (feedback->ecn_ce_count != 0) {
-            /* An explicit congestion mark vetoes the liveness sampling epoch;
-             * ordinary loss or delay is deliberately held until the bounded
-             * sample has had time to produce useful feedback. */
-            state->floor_recovery_epochs = 0;
-            state->last_floor_recovery_epoch = 0;
-        } else {
-            advance_floor_recovery(state, sender_epoch(state, feedback->now));
-            update_output(state, feedback->now, feedback->member_id, QUICLY_FLEXICAST_CC_REASON_ACK, output);
-            return;
-        }
-    }
-
-    if (congested) {
-        state->startup_complete = 1;
-        member->clear_rtt_epochs = 0;
-        if (feedback->ecn_ce_count != 0) {
-            member->elevated_rtt_epochs = 0;
-            if (!below_median(state))
-                state->rate = scale_rate(state->rate, 85, 100);
-        } else if (++member->elevated_rtt_epochs >= RTT_CONGESTION_EPOCHS) {
-            /* Receiver reports for one multicast queue episode are highly
-             * correlated. Apply one aggregate reduction, then require the
-             * limiting receiver to report sustained clean epochs before
-             * rearming. This preserves an independently paced sender clock
-             * without multiplying one shared queue event by the group size. */
-            if (state->rtt_episode_member_id == 0 && !below_median(state) && rtt_reduction_is_due(state, feedback->now)) {
-                uint32_t factor =
-                    (uint32_t)((uint64_t)member->recent_delivery_ratio_ppm * LOSS_SCALE / member->baseline_delivery_ratio_ppm);
-                if (factor < 500000)
-                    factor = 500000;
-                if (factor > 900000)
-                    factor = 900000;
-                state->rate = scale_rate(state->rate, factor, LOSS_SCALE);
-                state->last_rtt_reduction_at = feedback->now;
-                state->rtt_episode_member_id = feedback->member_id;
-                state->rtt_clear_epochs = 0;
-                state->last_rtt_clear_epoch = feedback_growth_epoch;
-            }
-            member->elevated_rtt_epochs = 0;
-            member->rtt_congested = 1;
-        }
+    if (congested || delay_grew) {
+        /* Any member can veto growth. One sender clock bounds correlated
+         * receiver reports, but persistent congestion can reduce again on the
+         * next clock tick without first requiring an impossible clean queue. */
+        state->growth_blocked_until = deadline(feedback->now, control_interval(state) * 2);
+        state->startup_probes = STARTUP_PROBES;
+        member->flat_loss_epochs = 0;
         reason |= feedback->ecn_ce_count != 0 ? QUICLY_FLEXICAST_CC_REASON_ECN : QUICLY_FLEXICAST_CC_REASON_RTT;
-        member->flat_loss_epochs = 0;
-    } else if (delay_grew) {
-        /* A standing TDMA or local pacing queue can raise RTT while delivered
-         * throughput remains stable. Hold growth, but require the learned
-         * delivery ratio to degrade before treating delay as congestion. */
-        member->clear_rtt_epochs = 0;
-        ++member->elevated_rtt_epochs;
-        member->flat_loss_epochs = 0;
-        reason |= QUICLY_FLEXICAST_CC_REASON_RTT;
+        /* New sending can justify an earlier ceiling cut. Historical samples
+         * retain the ordinary clock. RTT time guards post-cut ACK receipt,
+         * not packet submission; the complete delivery interval is post-cut. */
+        int early_delivery_cut = state->last_reduction_epoch != 0 && native_sample && fresh_delivery &&
+                                 member->delivery_sample_post_cut && delivery_congested && feedback->ecn_ce_count == 0 &&
+                                 (feedback->rtt_sample_flags & QUICLY_FLEXICAST_RTT_PRESENT) != 0 && fresh_rtt && delay_grew &&
+                                 feedback->rtt_sample_at >= state->last_reduction_at &&
+                                 feedback->now >= deadline(state->last_reduction_at, 125);
+        if (congested &&
+            (control_due(state, feedback->now, state->last_reduction_at, state->last_reduction_epoch) || early_delivery_cut)) {
+            if (feedback->ecn_ce_count != 0) {
+                state->rate = scale_rate(state->rate, 850000, LOSS_SCALE);
+            } else if (delivery_congested || drain_step) {
+                /* Native history sets an absolute ceiling. Legacy callers
+                 * without submission context retain their EWMA ratio policy. */
+                uint64_t next = state->rate;
+                if (delivery_congested)
+                    next = native_sample ? member->delivery_ceiling
+                                         : scale_rate(state->rate,
+                                                      (uint32_t)((uint64_t)member->recent_delivery_ratio_ppm * LOSS_SCALE /
+                                                                 member->baseline_delivery_ratio_ppm),
+                                                      LOSS_SCALE);
+                if (drain_step && state->drain.target < next) {
+                    next = state->drain.target;
+                    reason |= QUICLY_FLEXICAST_CC_REASON_DRAIN_CUT;
+                }
+                uint64_t minimum = scale_rate(state->rate, 500000, LOSS_SCALE);
+                uint64_t maximum = scale_rate(state->rate, 900000, LOSS_SCALE);
+                state->rate = next < minimum ? minimum : next > maximum ? maximum : next;
+            } else {
+                state->rate = scale_rate(state->rate, 900000, LOSS_SCALE);
+            }
+            state->last_reduction_epoch = epoch;
+            state->last_reduction_at = feedback->now;
+        }
     } else if (observed_loss > member->baseline_loss_ppm + 20000) {
-        member->elevated_rtt_epochs = 0;
-        member->clear_rtt_epochs = 0;
-        member->rtt_congested = 0;
-        /* Ambiguous flat loss is held first, then incorporated gradually as a
-         * radio-loss baseline rather than immediately reducing the flow. */
         if (++member->flat_loss_epochs >= 3) {
             member->baseline_loss_ppm =
                 member->baseline_loss_ppm == 0 ? observed_loss : (member->baseline_loss_ppm * 7 + observed_loss) / 8;
@@ -500,99 +578,154 @@ static void adaptive_on_feedback(void *_state, const quicly_flexicast_feedback_t
         }
         reason |= QUICLY_FLEXICAST_CC_REASON_LOSS;
     } else if (feedback->acked_packets != 0) {
-        int startup_probe = !state->startup_complete && state->startup_growth_epochs < STARTUP_GROWTH_EPOCHS;
-        member->elevated_rtt_epochs = 0;
         member->flat_loss_epochs = 0;
         reason |= QUICLY_FLEXICAST_CC_REASON_ACK;
-        /* growth needs a cleared RTT episode and delivery evidence, except during bounded startup */
-        int rtt_clear = !member->rtt_congested || ++member->clear_rtt_epochs >= RTT_CLEAR_EPOCHS;
-        if (rtt_clear && state->rtt_episode_member_id == 0 &&
-            ((has_delivery_sample && delivery_ratio_supports_growth(member)) || startup_probe)) {
-            int growth;
-            member->rtt_congested = 0;
-            member->clear_rtt_epochs = 0;
-            growth = grow_once(state, feedback->now);
-            if (growth > 0 && startup_probe && ++state->startup_growth_epochs >= STARTUP_GROWTH_EPOCHS)
-                state->startup_complete = 1;
-            if (growth < 0)
+        int delivery_supports_growth = has_delivery && member->degraded_delivery_epochs == 0;
+        int startup_probe = !has_delivery && state->startup_probes < STARTUP_PROBES &&
+                            (!native_sample || (feedback->delivery_rate_sample_epoch == 0 && fresh_rtt));
+        if (state->drain.phase == DRAIN_ACTIVE) {
+            reason |= QUICLY_FLEXICAST_CC_REASON_GROWTH_FROZEN;
+        } else if (control_due(state, feedback->now, state->last_growth_at, state->last_growth_epoch) &&
+                   control_due(state, feedback->now, state->last_reduction_at, state->last_reduction_epoch) &&
+                   feedback->now >= state->growth_blocked_until && (delivery_supports_growth || startup_probe)) {
+            if (external_load(state)) {
                 reason |= QUICLY_FLEXICAST_CC_REASON_EXTERNAL_LOAD | QUICLY_FLEXICAST_CC_REASON_GROWTH_FROZEN;
+            } else {
+                uint64_t previous = state->rate;
+                grow_once(state, feedback->now, native_sample && delivery_supports_growth ? 16 : 8);
+                uint64_t effective = clamp_rate(&state->config, state->rate);
+                if (state->hints.aggregate_rate_limit_bytes_per_second != 0 &&
+                    effective > state->hints.aggregate_rate_limit_bytes_per_second)
+                    effective = state->hints.aggregate_rate_limit_bytes_per_second;
+                if (effective > previous) {
+                    if (state->drain.phase == DRAIN_OBSERVING)
+                        reason |= end_drain(state, feedback->now, QUICLY_FLEXICAST_CC_REASON_DRAIN_CLEAR);
+                    state->drain.needs_growth = 0;
+                }
+                if (startup_probe)
+                    ++state->startup_probes;
+            }
         }
     }
-    if (has_delivery_sample && !state->external_load_seen && feedback->ecn_ce_count == 0 && !delay_grew)
+    int native_context = (feedback->rtt_sample_flags & QUICLY_FLEXICAST_RTT_PRESENT) != 0 ||
+                         (feedback->delivery_sample_flags & QUICLY_FLEXICAST_SAMPLE_PRESENT) != 0;
+    int clean_delivery = !external_load(state) && !congested && !delay_grew &&
+                         (!native_context || (fresh_rtt && feedback->now >= state->growth_blocked_until));
+    if (fresh_delivery && clean_delivery)
         learn_clean_delivery_ratio(member);
-    update_output(state, feedback->now, feedback->member_id, reason, output);
+    else if (fresh_delivery && native_context)
+        member->degraded_delivery_epochs = 0; /* only clean samples can accumulate radio-baseline evidence */
+    update_output(state, feedback->member_id, reason, output);
 }
 
 static void adaptive_on_timeout(void *_state, int64_t now, quicly_flexicast_cc_output_t *output)
 {
     adaptive_state_t *state = _state;
-    uint32_t reason = QUICLY_FLEXICAST_CC_REASON_NONE;
-    if (state->next_recovery_probe != 0 && now >= state->next_recovery_probe) {
-        ++state->unanswered_recovery_probes;
-        if (state->floor_recovery_epochs != 0) {
-            advance_floor_recovery(state, sender_epoch(state, now));
-        } else if (state->unanswered_recovery_probes >= 3 &&
-                   (state->last_timeout_reduction == 0 ||
-                    now - state->last_timeout_reduction >= state->config.feedback_timeout_msec)) {
-            uint64_t previous_rate = state->rate;
-            state->startup_complete = 1;
+    uint32_t reason = expire_drain(state, now);
+    if (state->num_active_members != 0 && now >= state->next_timeout) {
+        if (++state->unanswered_probes >= 3) {
             state->rate /= 2;
-            state->last_timeout_reduction = now;
-            state->unanswered_recovery_probes = 0;
-            if (near_floor(state, previous_rate)) {
-                state->rate = previous_rate;
-                start_floor_recovery(state, sender_epoch(state, now));
-            }
+            state->unanswered_probes = 0;
+            state->startup_probes = STARTUP_PROBES;
+            state->last_reduction_epoch = control_epoch(state, now);
+            state->last_reduction_at = now;
+            state->growth_blocked_until = deadline(now, control_interval(state) * 2);
         }
-        state->next_recovery_probe = recovery_deadline(state, now);
-        reason = QUICLY_FLEXICAST_CC_REASON_TIMEOUT;
+        /* At the floor, ordinary pacing still permits bounded probe traffic.
+         * Silence never authorizes a rate increase or disables congestion. */
+        state->next_timeout = deadline(now, state->config.feedback_timeout_msec);
+        reason |= QUICLY_FLEXICAST_CC_REASON_TIMEOUT;
     }
-    update_output(state, now, 0, reason, output);
+    update_output(state, 0, reason, output);
 }
 
 static void adaptive_set_hints(void *_state, const quicly_flexicast_cc_hints_t *hints, int64_t now,
                                quicly_flexicast_cc_output_t *output)
 {
     adaptive_state_t *state = _state;
-    uint32_t reason = QUICLY_FLEXICAST_CC_REASON_HINT;
+    uint32_t reason = QUICLY_FLEXICAST_CC_REASON_HINT | expire_drain(state, now);
+    int fresh_load_epoch = hints->external_load_epoch != 0 && hints->external_load_epoch > state->last_external_load_epoch;
+    quicly_flexicast_cc_hints_t previous_hints = state->hints;
     state->hints = *hints;
+    if (hints->external_load_epoch != 0 && !fresh_load_epoch) {
+        /* A repeated or reordered measurement cannot change the load episode
+         * or supply another recovery observation. Other hints remain live. */
+        state->hints.external_load_epoch = previous_hints.external_load_epoch;
+        state->hints.external_load_queued_bytes = previous_hints.external_load_queued_bytes;
+        state->hints.external_load_oldest_age_msec = previous_hints.external_load_oldest_age_msec;
+        state->hints.external_load_fraction_ppm = previous_hints.external_load_fraction_ppm;
+    }
     if (hints->aggregate_rate_limit_bytes_per_second != 0 && state->rate > hints->aggregate_rate_limit_bytes_per_second) {
         state->rate = hints->aggregate_rate_limit_bytes_per_second;
         reason |= QUICLY_FLEXICAST_CC_REASON_RATE_LIMIT;
     }
-    if (hints->external_load_epoch != 0 && hints->external_load_epoch != state->last_external_load_epoch) {
+    int queued = hints->external_load_queued_bytes != 0 || hints->external_load_oldest_age_msec != 0;
+    if (fresh_load_epoch) {
         state->last_external_load_epoch = hints->external_load_epoch;
-        if (hints->external_load_queued_bytes != 0 || hints->external_load_oldest_age_msec != 0 ||
-            hints->external_load_fraction_ppm > EXTERNAL_LOAD_CLEAR_PPM) {
-            /* External work is already charged to this flow's physical pacer.
-             * Treat it as a reason to stop increasing the path rate, not as
-             * independent evidence that the path is congested. Reducing the
-             * total rate here also reduces repair service and can create a
-             * self-sustaining trip to the minimum rate. */
+        if (queued || hints->external_load_fraction_ppm > EXTERNAL_LOAD_CLEAR_PPM) {
             state->external_load_seen = 1;
-            state->startup_complete = 1;
             state->external_load_clear_epochs = 0;
-            reason |= QUICLY_FLEXICAST_CC_REASON_EXTERNAL_LOAD;
         } else if (state->external_load_seen && ++state->external_load_clear_epochs >= EXTERNAL_LOAD_CLEAR_EPOCHS) {
             state->external_load_seen = 0;
             state->external_load_clear_epochs = 0;
         }
-    } else if (hints->external_load_queued_bytes != 0 || hints->external_load_oldest_age_msec != 0) {
+    } else if (hints->external_load_epoch == 0 && queued) {
         state->external_load_seen = 1;
         state->external_load_clear_epochs = 0;
-        reason |= QUICLY_FLEXICAST_CC_REASON_EXTERNAL_LOAD;
     }
-    if (state->floor_recovery_epochs == 0 &&
-        (hints->external_load_queued_bytes != 0 || hints->external_load_oldest_age_msec != 0) &&
-        state->rate < external_load_recovery_ceiling(state) && has_recent_feedback(state, now)) {
-        uint64_t increase = state->rate;
-        uint64_t ceiling = external_load_recovery_ceiling(state);
-        state->rate = increase_rate(state->rate, increase);
-        if (state->rate > ceiling)
-            state->rate = ceiling;
+    if (external_load(state))
         reason |= QUICLY_FLEXICAST_CC_REASON_EXTERNAL_LOAD;
+    update_output(state, 0, reason, output);
+}
+
+static void adaptive_get_trace_state(const void *_state, uint64_t member_id, int64_t now, quicly_flexicast_cc_trace_state_t *trace)
+{
+    const adaptive_state_t *state = _state;
+    trace->available = 1;
+    trace->control_epoch = control_epoch(state, now);
+    trace->control_interval_msec = control_interval(state);
+    trace->last_growth_epoch = state->last_growth_epoch;
+    trace->last_reduction_epoch = state->last_reduction_epoch;
+    trace->last_growth_at = state->last_growth_at;
+    trace->last_reduction_at = state->last_reduction_at;
+    trace->growth_blocked_until = state->growth_blocked_until;
+    trace->next_timeout = state->next_timeout;
+    trace->startup_probes = state->startup_probes;
+    trace->unanswered_probes = state->unanswered_probes;
+    trace->external_load = external_load(state);
+    trace->drain_phase = state->drain.phase;
+    trace->drain_member_id = state->drain.member_id;
+    trace->drain_ceiling_bytes_per_second = state->drain.ceiling;
+    trace->drain_target_bytes_per_second = state->drain.target;
+    trace->drain_started_at = state->drain.started_at;
+    trace->drain_deadline = state->drain.deadline;
+    trace->drain_ended_at = state->drain.ended_at;
+    uint32_t divisor = state->hints.delivery_rate_divisor != 0 ? state->hints.delivery_rate_divisor : 1;
+    trace->expected_delivery_rate = state->rate / divisor;
+    int slot = flexicast_member_map_find(&state->member_map, member_id);
+    if (slot >= 0) {
+        const adaptive_member_t *member = state->members + slot;
+        trace->member_present = 1;
+        trace->last_feedback_epoch = member->last_feedback_epoch;
+        trace->last_delivery_sample_epoch = member->last_delivery_sample_epoch;
+        trace->last_rtt_sample_epoch = member->last_rtt_sample_epoch;
+        trace->previous_rtt_at = member->previous_rtt_at;
+        if (member->delivery_reference_rate != 0 && member->delivery_reference_fanout != 0)
+            trace->expected_delivery_rate = member->delivery_reference_rate / member->delivery_reference_fanout;
+        trace->recent_delivery_rate = member->recent_delivery_rate;
+        trace->baseline_delivery_ratio_ppm = member->baseline_delivery_ratio_ppm;
+        trace->recent_delivery_ratio_ppm = member->recent_delivery_ratio_ppm;
+        trace->degraded_delivery_epochs = member->degraded_delivery_epochs;
+        trace->delivery_ceiling_bytes_per_second = member->delivery_ceiling;
+        trace->delivery_ceiling_eligible = member->delivery_ceiling_eligible;
+        trace->delivery_sample_post_cut = member->delivery_sample_post_cut;
+        trace->delivery_sample_ratio_ppm = member->delivery_sample_ratio_ppm;
+        trace->baseline_loss_ppm = member->baseline_loss_ppm;
+        trace->flat_loss_epochs = member->flat_loss_epochs;
+        trace->minimum_rtt = member->minimum_rtt;
+        trace->previous_rtt = member->previous_rtt;
+        trace->rising_delay_epochs = member->rising_delay_epochs;
     }
-    update_output(state, now, 0, reason, output);
 }
 
 quicly_flexicast_cc_type_t quicly_flexicast_cc_type_adaptive = {
@@ -602,8 +735,10 @@ quicly_flexicast_cc_type_t quicly_flexicast_cc_type_adaptive = {
     .dispose = adaptive_dispose,
     .on_member_added = adaptive_on_member_added,
     .on_member_removed = adaptive_on_member_removed,
+    .on_member_suspended = adaptive_on_member_suspended,
     .on_epoch_reset = adaptive_on_epoch_reset,
     .on_feedback = adaptive_on_feedback,
     .on_timeout = adaptive_on_timeout,
     .set_hints = adaptive_set_hints,
+    .get_trace_state = adaptive_get_trace_state,
 };

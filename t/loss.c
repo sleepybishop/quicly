@@ -157,7 +157,7 @@ static void test_slow_cert_verify(void)
     last_retransmittable_sent_at[QUICLY_EPOCH_HANDSHAKE] = now;
     last_retransmittable_sent_at[QUICLY_EPOCH_1RTT] = now;
     quicly_loss_update_alarm(&loss, now, last_retransmittable_sent_at, (1u << QUICLY_EPOCH_HANDSHAKE) | (1u << QUICLY_EPOCH_1RTT),
-                             0, 0, 0, 1);
+                             0, 0, 0, 1, 1);
 
     now += 10;
 
@@ -168,11 +168,11 @@ static void test_slow_cert_verify(void)
     ok(num_packets_lost == 0);
 
     /* Application Data alone must not arm PTO before confirmation. */
-    quicly_loss_update_alarm(&loss, now, last_retransmittable_sent_at, 1u << QUICLY_EPOCH_1RTT, 0, 0, 0, 0);
+    quicly_loss_update_alarm(&loss, now, last_retransmittable_sent_at, 1u << QUICLY_EPOCH_1RTT, 0, 0, 0, 0, 1);
     ok(loss.alarm_at == INT64_MAX);
 
     /* Once confirmed, the same outstanding packet arms an Application Data PTO including max_ack_delay. */
-    quicly_loss_update_alarm(&loss, now, last_retransmittable_sent_at, 1u << QUICLY_EPOCH_1RTT, 0, 1, 0, 0);
+    quicly_loss_update_alarm(&loss, now, last_retransmittable_sent_at, 1u << QUICLY_EPOCH_1RTT, 0, 1, 0, 0, 1);
     ok(loss.alarm_at != INT64_MAX);
     ok(loss.alarm_at > now);
 
@@ -225,25 +225,25 @@ static void test_overdue_alarm(void)
     quicly_loss_init(&loss, &quicly_spec_context.egress[0].loss, 40, &quicly_spec_context.transport_params.max_ack_delay,
                      &quicly_spec_context.transport_params.ack_delay_exponent);
     double last_sent[QUICLY_NUM_EPOCHS] = {100, INFINITY, INFINITY, INFINITY};
-    quicly_loss_update_alarm(&loss, 100, last_sent, 1, 1, 0, 1, 1);
+    quicly_loss_update_alarm(&loss, 100, last_sent, 1, 1, 0, 1, 1, 1);
     int64_t deadline = loss.alarm_at;
     ok(deadline > 100);
 
     /* ACK processing and sends on other paths must not indefinitely defer PTO. */
     for (int i = 0; i != 4; ++i) {
         int64_t at = deadline + i * 25;
-        quicly_loss_update_alarm(&loss, at, last_sent, 1, 1, 0, 1, 0);
+        quicly_loss_update_alarm(&loss, at, last_sent, 1, 1, 0, 1, 0, 1);
         ok(loss.alarm_at <= at);
     }
-    quicly_loss_update_alarm(&loss, deadline + 100, last_sent, 1, 1, 0, 1, 1);
+    quicly_loss_update_alarm(&loss, deadline + 100, last_sent, 1, 1, 0, 1, 1, 1);
     ok(loss.alarm_at > deadline + 100);
 
     /* The same rule applies to time-threshold loss detection. */
     loss.loss_time = deadline;
-    quicly_loss_update_alarm(&loss, deadline + 101, last_sent, 1, 1, 0, 1, 0);
+    quicly_loss_update_alarm(&loss, deadline + 101, last_sent, 1, 1, 0, 1, 0, 1);
     ok(loss.alarm_at <= deadline + 101);
     loss.loss_time = INT64_MAX; /* model discarding the outstanding packet-number space */
-    quicly_loss_update_alarm(&loss, deadline + 101, last_sent, 0, 0, 0, 1, 0);
+    quicly_loss_update_alarm(&loss, deadline + 101, last_sent, 0, 0, 0, 1, 0, 1);
     ok(loss.alarm_at == INT64_MAX);
     ok(loss.loss_time == INT64_MAX);
     quicly_loss_dispose(&loss);
@@ -399,7 +399,7 @@ static void update_alarm_for_epoch(quicly_loss_t *loss, int64_t now, double sent
     size_t epoch = handshake_in_progress ? QUICLY_EPOCH_HANDSHAKE : QUICLY_EPOCH_1RTT;
     last_sent[epoch] = sent_at;
     quicly_loss_update_alarm(loss, now, last_sent, has_outstanding ? 1u << epoch : 0, can_send_stream_data, !handshake_in_progress,
-                             total_bytes_sent, is_after_send);
+                             total_bytes_sent, is_after_send, 1);
 }
 
 static void test_submillisecond_timers(void)

@@ -62,14 +62,18 @@ static uint32_t update_w_est(quicly_cc_t *cc, uint32_t bytes, uint32_t max_udp_p
     cubic_float_t alpha =
         cc->state.cubic.w_est >= cc->state.cubic.cwnd_prior ? 1 : 3 * (1 - QUICLY_CUBIC_BETA) / (1 + QUICLY_CUBIC_BETA);
     cc->state.cubic.w_est += alpha * bytes / cc->cwnd * max_udp_payload_size;
-    return cc->state.cubic.w_est < UINT32_MAX ? cc->state.cubic.w_est : UINT32_MAX;
+    return cc->state.cubic.w_est < INT32_MAX ? cc->state.cubic.w_est : INT32_MAX;
 }
 
 /* TODO: Avoid increase if sender was application limited. */
 static void cubic_on_acked(quicly_cc_t *cc, const quicly_loss_t *loss, uint32_t bytes, uint64_t largest_acked, uint32_t inflight,
-                           int cc_limited, uint64_t next_pn, int64_t now, uint32_t max_udp_payload_size)
+                           int cc_limited, uint64_t next_pn, int64_t now, uint32_t max_udp_payload_size,
+                           const quicly_cc_ecn_counts_t *l4s)
 {
     assert(inflight >= bytes);
+    /* ECN counters can advance without packets being newly acknowledged; L4S is not supported. */
+    if (bytes == 0)
+        return;
     /* Do not increase congestion window while in recovery (but jumpstart may do something different). */
     if (largest_acked < cc->recovery_end) {
         quicly_cc_jumpstart_on_acked(cc, 1, bytes, largest_acked, inflight, next_pn);
@@ -82,7 +86,7 @@ static void cubic_on_acked(quicly_cc_t *cc, const quicly_loss_t *loss, uint32_t 
 
     /* Slow start. */
     if (cc->cwnd < cc->ssthresh) {
-        cc->cwnd = quicly_u32_add_saturating(cc->cwnd, bytes);
+        quicly_cc_add_cwnd(&cc->cwnd, bytes);
         if (cc->cwnd_maximum < cc->cwnd)
             cc->cwnd_maximum = cc->cwnd;
         return;
@@ -107,7 +111,7 @@ static void cubic_on_acked(quicly_cc_t *cc, const quicly_loss_t *loss, uint32_t 
         if (w_cubic_target > 1.5 * cc->cwnd)
             w_cubic_target = 1.5 * cc->cwnd;
         /* (W_cubic(t+RTT) - cwnd)/cwnd * MSS = (W_cubic(t+RTT)/cwnd - 1) * MSS */
-        cc->cwnd = quicly_u32_add_saturating(cc->cwnd, ((w_cubic_target / cc->cwnd) - 1) * max_udp_payload_size);
+        quicly_cc_add_cwnd(&cc->cwnd, ((w_cubic_target / cc->cwnd) - 1) * max_udp_payload_size);
     }
 
     if (cc->cwnd_maximum < cc->cwnd)

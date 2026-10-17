@@ -5,6 +5,48 @@ Quicly is an IETF [QUIC](https://quicwg.github.io/) protocol implementation, wri
 
 The software is licensed under the MIT License.
 
+Flexicast
+---
+
+This branch provides an experimental DATAGRAM-only Flexicast primitive and unicast control-frame callbacks based on
+[draft-navarre-quic-flexicast-03](https://www.ietf.org/archive/id/draft-navarre-quic-flexicast-03.html).
+Draft 03 names FC_STATE action `0x03` `LISTEN`; `QUICLY_FLEXICAST_STATE_LISTEN` is the current API name, and
+`QUICLY_FLEXICAST_STATE_READY` remains an alias for existing draft 02 callers. The action's wire encoding is unchanged.
+
+Enable Multipath and the appropriate `transport_params.flexicast_support` address families on both peers. The application
+handles flow registration, control-frame sequence ordering, address-family selection, JOIN/LISTEN/LEAVE transitions, multicast socket membership,
+and independently generated traffic secrets. Control frames are restricted to their permitted endpoint roles and 1-RTT
+packets. Rekeying retains cumulative member measurements but requires packet numbers to keep increasing so delayed ACKs
+cannot acknowledge packets from a new key epoch. PATH_ACK uses the negotiated QUIC ACK-delay encoding on the wire;
+`receive_flexicast_ack` supplies the delay in milliseconds to the flow feedback API.
+
+Use `quicly_flexicast_receive_datagrams_at` to receive all DATAGRAM frames in a packet without copying their payloads.
+The singular receive API remains available for packets containing at most one DATAGRAM; it returns
+`QUICLY_FLEXICAST_ERROR_BUFFER_TOO_SMALL` for multiple DATAGRAMs without consuming the packet number. Both APIs decrypt
+in place, so retrying requires a fresh encrypted copy. PADDING and PING are accepted; a packet containing no DATAGRAM
+returns zero payloads (or a null payload pointer from the singular API). Pass authenticated protocol/frame errors and
+`QUICLY_FLEXICAST_ERROR_AEAD_LIMIT_REACHED` to `quicly_flexicast_handle_receive_error` with the associated unicast connection.
+Unauthenticated packet errors do not close that connection.
+
+Outgoing protected packets default to a maximum of 1200 bytes. Set `max_packet_size` only to a size supported by the path
+and all receivers, up to 65507 bytes. Applications must also negotiate DATAGRAM support and enforce every receiver's
+`max_datagram_frame_size`, and use the congestion controller's rate and burst outputs to pace physical transmission.
+These requirements also apply when one protected packet is replicated to several unicast destinations.
+
+Cryptographic limits are enforced for each installed traffic secret, including after reinstalling a previous secret.
+AES-GCM permits at most 2^23 encrypted packets per secret; reaching the limit returns
+`QUICLY_FLEXICAST_ERROR_KEY_UPDATE_REQUIRED` before consuming another packet number. Install a fresh secret through the
+application's FC_KEY lifecycle to resume. Failed authentications accumulate across rekeys; exhausting that budget is
+terminal for the flow. Configuration may lower these limits but cannot raise them. Rekeying suspends delivery membership
+and congestion-control participation until each receiver is attached again; built-in controllers retain learned path
+history without letting inactive receivers limit the rate.
+
+The draft still leaves frame and error code assignments and some wire details unspecified. This implementation retains
+provisional FC frame types `0x173e00`–`0x173e02`, transport parameter `0xedf3` with one octet per address-family boolean,
+and the standard QUIC protocol-violation error for FC protocol violations. Its shared-packet format remains private:
+eight-byte numeric flow IDs occupy a namespace above the unicast path-ID limit. These choices do not establish
+interoperability with other Flexicast implementations or provide multicast STREAM reliability.
+
 How to build
 ---
 

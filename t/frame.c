@@ -59,6 +59,19 @@ static void test_ack_decode_underflow(void)
         const uint8_t pat[] = {2, 0, 1, 0, 3, 0}, *src = pat;
         ok(quicly_decode_ack_frame(&src, pat + sizeof(pat), &decoded, 0) != 0);
     }
+    { /* Ranges beyond the retained limit must still be checked for underflow. */
+        uint8_t pat[2 * QUICLY_ACK_MAX_GAPS + 32], *end = pat;
+        const uint8_t *src = pat;
+        end = quicly_encodev(end, 2 * QUICLY_ACK_MAX_GAPS);
+        end = quicly_encodev(end, 0);
+        end = quicly_encodev(end, QUICLY_ACK_MAX_GAPS + 1);
+        end = quicly_encodev(end, 0);
+        for (size_t i = 0; i != QUICLY_ACK_MAX_GAPS + 1; ++i) {
+            end = quicly_encodev(end, 0);
+            end = quicly_encodev(end, 0);
+        }
+        ok(quicly_decode_ack_frame(&src, end, &decoded, 0) == QUICLY_TRANSPORT_ERROR_FRAME_ENCODING);
+    }
 }
 
 static void test_ack_decode(void)
@@ -178,6 +191,37 @@ static void test_ack_encode(void)
     quicly_ranges_clear(&ranges);
 }
 
+static void test_ack_encode_capacity(void)
+{
+    quicly_ranges_t ranges;
+    uint64_t ecn_counts[3] = {PTLS_QUICINT_MAX, 64, 16384};
+    uint8_t buf[128], reference[128];
+    quicly_ranges_init(&ranges);
+    ok(quicly_ranges_add(&ranges, PTLS_QUICINT_MAX - 2, PTLS_QUICINT_MAX + 1) == 0);
+
+    for (int path = 0; path != 2; ++path) {
+        uint8_t *end =
+            path ? quicly_encode_path_ack_frame(reference, reference + sizeof(reference), PTLS_QUICINT_MAX, &ranges, ecn_counts,
+                                                PTLS_QUICINT_MAX)
+                 : quicly_encode_ack_frame(reference, reference + sizeof(reference), &ranges, ecn_counts, PTLS_QUICINT_MAX);
+        ok(end != NULL);
+        size_t required = end - reference;
+        for (size_t capacity = 0; capacity <= required; ++capacity) {
+            memset(buf, 0xaa, sizeof(buf));
+            end = path ? quicly_encode_path_ack_frame(buf, buf + capacity, PTLS_QUICINT_MAX, &ranges, ecn_counts, PTLS_QUICINT_MAX)
+                       : quicly_encode_ack_frame(buf, buf + capacity, &ranges, ecn_counts, PTLS_QUICINT_MAX);
+            ok(capacity < required ? end == NULL : end == buf + required);
+            int intact = 1;
+            for (size_t i = capacity; i != sizeof(buf); ++i)
+                intact &= buf[i] == 0xaa;
+            ok(intact);
+            if (capacity == required)
+                ok(memcmp(buf, reference, required) == 0);
+        }
+    }
+    quicly_ranges_clear(&ranges);
+}
+
 static void test_mozquic(void)
 {
     quicly_stream_frame_t frame;
@@ -190,5 +234,6 @@ void test_frame(void)
 {
     subtest("ack-decode", test_ack_decode);
     subtest("ack-encode", test_ack_encode);
+    subtest("ack-encode-capacity", test_ack_encode_capacity);
     subtest("mozquic", test_mozquic);
 }

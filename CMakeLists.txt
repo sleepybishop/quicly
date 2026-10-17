@@ -71,6 +71,9 @@ SET(UNITTEST_SOURCE_FILES
     deps/picotest/picotest.c
     t/cc.c
     t/flexicast.c
+    t/flexicast-cc-regression.c
+    t/flexicast-crypto.c
+    t/flexicast-packet.c
     t/frame.c
     t/jumpstart.c
     t/local_cid.c
@@ -122,7 +125,8 @@ TARGET_LINK_LIBRARIES(cli ${OPENSSL_CRYPTO_LIBRARIES} ${CMAKE_DL_LIBS} m)
 ADD_EXECUTABLE(test.t ${PICOTLS_OPENSSL_FILES} ${UNITTEST_SOURCE_FILES})
 TARGET_LINK_LIBRARIES(test.t quicly ${OPENSSL_CRYPTO_LIBRARIES} ${CMAKE_DL_LIBS})
 
-ADD_EXECUTABLE(flexicast-test.t ${PICOTLS_OPENSSL_FILES} deps/picotest/picotest.c t/flexicast.c t/flexicast-main.c)
+ADD_EXECUTABLE(flexicast-test.t ${PICOTLS_OPENSSL_FILES} deps/picotest/picotest.c t/flexicast.c t/flexicast-cc-regression.c
+    t/flexicast-crypto.c t/flexicast-packet.c t/flexicast-main.c)
 TARGET_LINK_LIBRARIES(flexicast-test.t quicly ${OPENSSL_CRYPTO_LIBRARIES} ${CMAKE_DL_LIBS})
 
 ADD_EXECUTABLE(simulator ${PICOTLS_OPENSSL_FILES} ${QUICLY_LIBRARY_FILES} t/simulator.c)

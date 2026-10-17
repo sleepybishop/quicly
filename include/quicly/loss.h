@@ -208,7 +208,7 @@ static void quicly_loss_init(quicly_loss_t *r, const quicly_loss_conf_t *conf, f
 static void quicly_loss_dispose(quicly_loss_t *r);
 static void quicly_loss_update_alarm(quicly_loss_t *r, int64_t now, const double last_retransmittable_sent_at[QUICLY_NUM_EPOCHS],
                                      unsigned outstanding_epochs, int can_send_stream_data, int handshake_confirmed,
-                                     uint64_t total_bytes_sent, int is_after_send);
+                                     uint64_t total_bytes_sent, int is_after_send, int use_loss_time);
 /**
  * called when an ACK is received
  */
@@ -354,7 +354,7 @@ inline void quicly_loss_dispose(quicly_loss_t *r)
 
 inline void quicly_loss_update_alarm(quicly_loss_t *r, int64_t now, const double last_retransmittable_sent_at[QUICLY_NUM_EPOCHS],
                                      unsigned outstanding_epochs, int can_send_stream_data, int handshake_confirmed,
-                                     uint64_t total_bytes_sent, int is_after_send)
+                                     uint64_t total_bytes_sent, int is_after_send, int use_loss_time)
 {
 #define SET_ALARM(t)                                                                                                               \
     do {                                                                                                                           \
@@ -371,7 +371,7 @@ inline void quicly_loss_update_alarm(quicly_loss_t *r, int64_t now, const double
      * avoid immediately repeating a send attempt that made no progress. */
 
     /* time-threshold loss detection */
-    if (r->loss_time != INT64_MAX) {
+    if (r->loss_time != INT64_MAX && use_loss_time) {
         SET_ALARM(r->loss_time);
         return;
     }
@@ -487,7 +487,7 @@ inline quicly_error_t quicly_loss_on_alarm(quicly_loss_t *r, int64_t now, uint32
 {
     r->alarm_at = INT64_MAX;
     *min_packets_to_send = 1;
-    if (r->loss_time != INT64_MAX) {
+    if (r->loss_time <= now) {
         /* Time threshold loss detection. Send at least 1 packet, but no restrictions on sending otherwise. */
         *restrict_sending = 0;
         return quicly_loss_detect_loss_after_ack(r, now, max_ack_delay, is_1rtt_only, on_loss_detected, on_persistent_congestion);

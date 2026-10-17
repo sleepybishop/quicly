@@ -206,9 +206,13 @@ QUICLY_CALLBACK_TYPE(quicly_error_t, stream_open, quicly_stream_t *stream);
  *
  */
 QUICLY_CALLBACK_TYPE(void, receive_datagram_frame, quicly_conn_t *conn, ptls_iovec_t payload);
-/** Called synchronously for FC control frames. Borrowed fields are valid only during the callback. */
+/** Called synchronously for FC control frames. Borrowed fields are valid only during the callback.
+ * The application owns flow registration, per-flow sequence ordering, address-family selection, and membership transitions.
+ * Discard stale announcements before considering their addresses or applying flow updates. */
 QUICLY_CALLBACK_TYPE(quicly_error_t, receive_flexicast_frame, quicly_conn_t *conn, const quicly_flexicast_frame_t *frame);
-/** Receives a PATH_ACK whose path_id identifies a negotiated Flexicast flow. */
+/** Receives a PATH_ACK for the experimental Flexicast flow-ID namespace (above the local unicast path limit).
+ * ack_delay is converted to milliseconds using the peer's ACK-delay exponent before this callback.
+ * The application must validate the flow ID and associate the authenticated connection with a member. */
 QUICLY_CALLBACK_TYPE(quicly_error_t, receive_flexicast_ack, quicly_conn_t *conn, uint64_t flow_id, const quicly_ack_frame_t *frame);
 /**
  * Called when the connection is closed (i.e., when entering the closing or draining state). Otherwise the callback is not called;
@@ -364,7 +368,7 @@ typedef struct st_quicly_transport_parameters_t {
     uint8_t grease_quic_bit : 1;
     /* version information (RFC 9368) */
     quicly_version_information_t version_information;
-    /** address families supported by draft-navarre-quic-flexicast-02 */
+    /** address families supported by draft-navarre-quic-flexicast-03 */
     struct {
         uint8_t ipv4 : 1;
         uint8_t ipv6 : 1;
@@ -382,7 +386,14 @@ typedef struct st_quicly_salt_t {
 /**
  * number of alternative egress contexts (i.e., `quicly_context_t::egress[1..QUICLY_NUM_ALT_EGRESS]`)
  */
-#define QUICLY_NUM_ALT_EGRESS 3
+#define QUICLY_NUM_ALT_EGRESS 4
+
+/**
+ * values of `quicly_context_t::egress[].ecn`
+ */
+#define QUICLY_ECN_MODE_OFF 0
+#define QUICLY_ECN_MODE_CLASSIC 1
+#define QUICLY_ECN_MODE_L4S 2
 
 struct st_quicly_context_t {
     /**
@@ -537,13 +548,23 @@ struct st_quicly_context_t {
          */
         uint32_t max_jumpstart_packets;
         /**
+         * Pacing multiplier used in congestion avoidance, unless L4S is used. The value is scaled by 1024; i.e., 2048 means 2x.
+         */
+        uint16_t pacing_multiplier;
+        /**
+         * Pacing multiplier used in congestion avoidance, when L4S is used.
+         */
+        uint16_t pacing_multiplier_l4s;
+        /**
          * prepares jumpstart but disengages before any action; provided for A/B testing between connections eligible for jumpstart
          */
         uint8_t disengage_jumpstart : 1;
         /**
-         * whether to use ECN on the send side; ECN is always on on the receive side
+         * ECN mode on the send side; ECN is always on on the receive side. `QUICLY_ECN_MODE_L4S` sends ECT(1) and reports CE
+         * marks to the congestion controller as L4S signals; it requires `pacing` to be set and a congestion controller that
+         * supports L4S (i.e., CUBACK).
          */
-        uint8_t ecn : 1;
+        uint8_t ecn : 2;
         /**
          * if RFC 8899 DPLPMTUD should be enabled
          */
@@ -1020,6 +1041,7 @@ typedef struct st_quicly_path_health_t {
     apply(cc.num_accel_eligible_episodes, "cc.num-accel-eligible-episodes")                                                        \
     apply(cc.cwnd_increase_ca, "cc.cwnd-increase-ca")                                                                              \
     apply(cc.cwnd_increase_accel, "cc.cwnd-increase-accel")                                                                        \
+    apply(cc.num_prague_reductions, "cc.num-prague-reductions")                                                                    \
     apply(delivery_rate.latest, "delivery-rate.latest")                                                                            \
     apply(delivery_rate.smoothed, "delivery-rate.smoothed")                                                                        \
     apply(delivery_rate.stdev, "delivery-rate.stdev")                                                                              \
@@ -1739,7 +1761,6 @@ void quicly_reset_stream(quicly_stream_t *stream, quicly_error_t err);
  * @return          0 if successful
  */
 int quicly_set_stream_path_affinity(quicly_stream_t *stream, uint32_t path_id);
-
 /**
  * Gets the current path ID being transmitted on from a send context.
  */

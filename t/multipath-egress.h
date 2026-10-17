@@ -9,7 +9,7 @@ static void test_multipath_egress_context(void)
         memset(quic_ctx.alt_egress_ratio, 0, sizeof(quic_ctx.alt_egress_ratio));
         quic_ctx.egress[alt] = original.egress[0];
         struct st_quicly_context_egress_t *policy = &quic_ctx.egress[alt];
-        policy->cc.init_cc = controllers[alt];
+        policy->cc.init_cc = controllers[alt % PTLS_ELEMENTSOF(controllers)];
         policy->cc.initcwnd_packets = 12 + alt;
         policy->cc.normalize_mtu = alt % 2;
         policy->cc.rapid_start = 1;
@@ -37,14 +37,14 @@ static void test_multipath_egress_context(void)
         ok(new_path(client, 1, 1, &fake_address.sa, &fake_address.sa) == 0);
         quicly_path_space_t *ps = client->path_spaces[1];
         ok(ps->cc.conf == &policy->cc && ps->loss.conf == &policy->loss);
-        ok(ps->cc.type->cc_init == controllers[alt]);
+        ok(ps->cc.type->cc_init == controllers[alt % PTLS_ELEMENTSOF(controllers)]);
         ok(ps->cc.conn == client);
         ok(ps->cc.cwnd == quicly_cc_calc_initial_cwnd(policy->cc.initcwnd_packets, ps->max_udp_payload_size));
         ok(ps->cc.rapid_start.state == QUICLY_CC_RAPID_START_STATE_PROBING);
         ok((ps->pacer != NULL) == policy->pacing);
         ok(ps->pacer == NULL || ps->pacer != client->path_spaces[0]->pacer);
         ok(ps->loss.rtt.smoothed == 0.25f);
-        ok(calc_pacer_send_rate(ps) == quicly_pacer_calc_send_rate(2, ps->cc.cwnd, 0.25f));
+        ok(calc_pacer_send_rate(ps) == quicly_pacer_calc_send_rate(2048, ps->cc.cwnd, 0.25f));
 
         /* promotion resets only affected path, retaining policy and fractional RTT */
         uint32_t primary_cwnd = client->path_spaces[0]->cc.cwnd;
@@ -52,7 +52,7 @@ static void test_multipath_egress_context(void)
         ok(new_path(client, candidate, 1, &fake_address.sa, &fake_address.sa) == 0);
         ok(promote_path(client, candidate) == 0);
         ok(ps->cc.conf == &policy->cc && ps->loss.conf == &policy->loss);
-        ok(ps->cc.conn == client && ps->cc.type->cc_init == controllers[alt]);
+        ok(ps->cc.conn == client && ps->cc.type->cc_init == controllers[alt % PTLS_ELEMENTSOF(controllers)]);
         ok(ps->loss.rtt.smoothed == 0.25f && ps->loss.rtt.latest == 0);
         ok(client->path_spaces[0]->cc.cwnd == primary_cwnd);
         ok(quicly_get_alt_egress(client) == alt);
