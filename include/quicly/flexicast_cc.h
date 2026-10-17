@@ -161,6 +161,9 @@ typedef struct st_quicly_flexicast_cc_output_t {
     uint64_t external_load_growth_freeze_events;
 } quicly_flexicast_cc_output_t;
 
+/** Trace-state feature available to source-compatible external harnesses. */
+#define QUICLY_FLEXICAST_CC_TRACE_DELIVERY_CEILING 1
+
 /** Optional observational state. Zero available means that this controller
  * does not expose these diagnostics. Reading state must never mutate it. */
 typedef struct st_quicly_flexicast_cc_trace_state_t {
@@ -191,6 +194,13 @@ typedef struct st_quicly_flexicast_cc_trace_state_t {
     uint32_t minimum_rtt;
     uint32_t previous_rtt;
     uint32_t rising_delay_epochs;
+    /** Current feedback's raw historical delivery ceiling, before reduction
+     * bounds. Eligibility is independent of the RTT congestion decision;
+     * post_cut separately permits growth and clean-baseline learning. */
+    uint64_t delivery_ceiling_bytes_per_second;
+    uint32_t delivery_ceiling_eligible;
+    uint32_t delivery_sample_post_cut;
+    uint32_t delivery_sample_ratio_ppm;
 } quicly_flexicast_cc_trace_state_t;
 
 typedef enum en_quicly_flexicast_cc_trace_type_t {

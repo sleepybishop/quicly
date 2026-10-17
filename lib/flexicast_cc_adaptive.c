@@ -33,6 +33,10 @@ typedef struct st_adaptive_member_t {
     uint32_t recent_delivery_ratio_ppm;
     uint32_t degraded_delivery_epochs;
     int active;
+    uint64_t delivery_ceiling;
+    uint32_t delivery_ceiling_eligible;
+    uint32_t delivery_sample_post_cut;
+    uint32_t delivery_sample_ratio_ppm;
 } adaptive_member_t;
 
 typedef struct st_adaptive_state_t {
@@ -207,6 +211,10 @@ static void adaptive_on_epoch_reset(void *_state, int64_t now, quicly_flexicast_
         state->members[i].delivery_reference_rate = 0;
         state->members[i].delivery_reference_fanout = 0;
         state->members[i].rising_delay_epochs = 0;
+        state->members[i].delivery_ceiling = 0;
+        state->members[i].delivery_ceiling_eligible = 0;
+        state->members[i].delivery_sample_post_cut = 0;
+        state->members[i].delivery_sample_ratio_ppm = 0;
     }
     state->unanswered_probes = 0;
     state->last_growth_epoch = 0;
@@ -215,6 +223,22 @@ static void adaptive_on_epoch_reset(void *_state, int64_t now, quicly_flexicast_
     state->growth_blocked_until = now;
     state->next_timeout = deadline(now, state->config.feedback_timeout_msec);
     update_output(state, 0, QUICLY_FLEXICAST_CC_REASON_NONE, output);
+}
+
+/* The ceiling is in physical bytes/second. Cap before every potentially
+ * overflowing product: delivery * fanout / clean_fraction cannot exceed the
+ * historical pacing rate, even for extreme direct-controller inputs. */
+static uint64_t delivery_rate_ceiling(uint64_t delivery, uint32_t fanout, uint32_t clean_fraction, uint64_t reference)
+{
+    if (delivery > reference / fanout)
+        return reference;
+    uint64_t physical = delivery * fanout;
+    uint64_t quotient = physical / clean_fraction;
+    if (quotient > reference / LOSS_SCALE)
+        return reference;
+    uint64_t whole = quotient * LOSS_SCALE;
+    uint64_t remainder = physical % clean_fraction * LOSS_SCALE / clean_fraction;
+    return remainder > reference - whole ? reference : whole + remainder;
 }
 
 static int update_delivery_ratio(adaptive_state_t *state, adaptive_member_t *member, const quicly_flexicast_feedback_t *feedback,
@@ -240,10 +264,9 @@ static int update_delivery_ratio(adaptive_state_t *state, adaptive_member_t *mem
             feedback->delivery_sample_acked_at_end <= feedback->delivery_sample_acked_at_start ||
             feedback->delivery_sample_sent_at_end > feedback->delivery_sample_acked_at_end ||
             feedback->delivery_sample_acked_at_end > feedback->now ||
-            feedback->now > deadline(feedback->delivery_sample_acked_at_end, state->config.feedback_timeout_msec) ||
-            (state->last_reduction_epoch != 0 && feedback->delivery_sample_sent_at_start < state->last_reduction_at)) {
+            feedback->now > deadline(feedback->delivery_sample_acked_at_end, state->config.feedback_timeout_msec)) {
             /* Unknown or limited sending cannot distinguish available capacity
-             * from offered load. Nor may pre-cut packets cut the new rate again. */
+             * from offered load. */
             member->recent_delivery_rate = 0;
             member->delivery_reference_rate = 0;
             member->degraded_delivery_epochs = 0;
@@ -261,8 +284,24 @@ static int update_delivery_ratio(adaptive_state_t *state, adaptive_member_t *mem
     uint64_t expected = reference_rate / divisor;
     if (expected == 0 || feedback->delivery_rate_bytes_per_second == 0)
         return 0;
-    *fresh = 1;
     uint64_t sample_rate = feedback->delivery_rate_bytes_per_second;
+    if (explicit_context) {
+        uint32_t clean_fraction = member->baseline_delivery_ratio_ppm != 0 ? member->baseline_delivery_ratio_ppm : LOSS_SCALE;
+        member->delivery_ceiling = delivery_rate_ceiling(sample_rate, divisor, clean_fraction, reference_rate);
+        member->delivery_ceiling_eligible = 1;
+        member->delivery_sample_ratio_ppm =
+            sample_rate >= expected ? LOSS_SCALE : (uint32_t)((double)sample_rate / (double)expected * LOSS_SCALE);
+        member->delivery_sample_post_cut =
+            state->last_reduction_epoch == 0 || feedback->delivery_sample_sent_at_start >= state->last_reduction_at;
+        if (!member->delivery_sample_post_cut) {
+            /* Old sending can still bound capacity, but cannot justify growth or
+             * teach a clean baseline for the new rate. Keep that history separate. */
+            member->recent_delivery_rate = 0;
+            member->degraded_delivery_epochs = 0;
+            return 0;
+        }
+    }
+    *fresh = 1;
     if (member->recent_delivery_rate == 0)
         member->recent_delivery_rate = sample_rate;
     else
@@ -372,6 +411,10 @@ static void adaptive_on_feedback(void *_state, const quicly_flexicast_feedback_t
     uint32_t reason = QUICLY_FLEXICAST_CC_REASON_NONE;
     if (member == NULL)
         return;
+    member->delivery_ceiling = 0;
+    member->delivery_ceiling_eligible = 0;
+    member->delivery_sample_post_cut = 0;
+    member->delivery_sample_ratio_ppm = 0;
     if (feedback->epoch != 0 && member->last_feedback_epoch != 0 && feedback->epoch <= member->last_feedback_epoch) {
         update_output(state, feedback->member_id, reason, output);
         return;
@@ -386,9 +429,16 @@ static void adaptive_on_feedback(void *_state, const quicly_flexicast_feedback_t
     int fresh_rtt = update_rtt(state, member, feedback);
     int delay_grew = fresh_rtt && queue_delay_grew(member->minimum_rtt, feedback->latest_rtt_msec);
     uint32_t observed_loss = loss_ppm(feedback);
-    int congested = feedback->ecn_ce_count != 0 ||
-                    (delay_grew && ((has_delivery && member->degraded_delivery_epochs != 0) || member->rising_delay_epochs >= 2 ||
-                                    observed_loss > member->baseline_loss_ppm + 20000));
+    uint32_t clean_fraction = member->baseline_delivery_ratio_ppm != 0 ? member->baseline_delivery_ratio_ppm : LOSS_SCALE;
+    uint32_t margin = clean_fraction / 10;
+    if (margin < 50000)
+        margin = 50000;
+    int native_sample = (feedback->delivery_sample_flags & QUICLY_FLEXICAST_SAMPLE_PRESENT) != 0;
+    int delivery_congested = native_sample ? member->delivery_ceiling_eligible && member->delivery_ceiling < state->rate &&
+                                                 (uint64_t)member->delivery_sample_ratio_ppm + margin < clean_fraction
+                                           : has_delivery && member->degraded_delivery_epochs != 0;
+    int congested = feedback->ecn_ce_count != 0 || (delay_grew && (delivery_congested || member->rising_delay_epochs >= 2 ||
+                                                                   observed_loss > member->baseline_loss_ppm + 20000));
 
     if (congested || delay_grew) {
         /* Any member can veto growth. One sender clock bounds correlated
@@ -399,18 +449,22 @@ static void adaptive_on_feedback(void *_state, const quicly_flexicast_feedback_t
         member->flat_loss_epochs = 0;
         reason = feedback->ecn_ce_count != 0 ? QUICLY_FLEXICAST_CC_REASON_ECN : QUICLY_FLEXICAST_CC_REASON_RTT;
         if (congested && control_due(state, feedback->now, state->last_reduction_at, state->last_reduction_epoch)) {
-            uint32_t factor = 850000;
-            if (feedback->ecn_ce_count == 0) {
-                factor =
-                    has_delivery && member->degraded_delivery_epochs != 0
-                        ? (uint32_t)((uint64_t)member->recent_delivery_ratio_ppm * LOSS_SCALE / member->baseline_delivery_ratio_ppm)
-                        : 900000;
-                if (factor < 500000)
-                    factor = 500000;
-                if (factor > 900000)
-                    factor = 900000;
+            if (feedback->ecn_ce_count != 0) {
+                state->rate = scale_rate(state->rate, 850000, LOSS_SCALE);
+            } else if (delivery_congested) {
+                /* Native history sets an absolute ceiling. Legacy callers
+                 * without submission context retain their EWMA ratio policy. */
+                uint64_t next = native_sample ? member->delivery_ceiling
+                                              : scale_rate(state->rate,
+                                                           (uint32_t)((uint64_t)member->recent_delivery_ratio_ppm * LOSS_SCALE /
+                                                                      member->baseline_delivery_ratio_ppm),
+                                                           LOSS_SCALE);
+                uint64_t minimum = scale_rate(state->rate, 500000, LOSS_SCALE);
+                uint64_t maximum = scale_rate(state->rate, 900000, LOSS_SCALE);
+                state->rate = next < minimum ? minimum : next > maximum ? maximum : next;
+            } else {
+                state->rate = scale_rate(state->rate, 900000, LOSS_SCALE);
             }
-            state->rate = scale_rate(state->rate, factor, LOSS_SCALE);
             state->last_reduction_epoch = epoch;
             state->last_reduction_at = feedback->now;
         }
@@ -425,7 +479,6 @@ static void adaptive_on_feedback(void *_state, const quicly_flexicast_feedback_t
         member->flat_loss_epochs = 0;
         reason = QUICLY_FLEXICAST_CC_REASON_ACK;
         int delivery_supports_growth = has_delivery && member->degraded_delivery_epochs == 0;
-        int native_sample = (feedback->delivery_sample_flags & QUICLY_FLEXICAST_SAMPLE_PRESENT) != 0;
         int startup_probe = !has_delivery && state->startup_probes < STARTUP_PROBES &&
                             (!native_sample || (feedback->delivery_rate_sample_epoch == 0 && fresh_rtt));
         if (control_due(state, feedback->now, state->last_growth_at, state->last_growth_epoch) &&
@@ -543,6 +596,10 @@ static void adaptive_get_trace_state(const void *_state, uint64_t member_id, int
         trace->baseline_delivery_ratio_ppm = member->baseline_delivery_ratio_ppm;
         trace->recent_delivery_ratio_ppm = member->recent_delivery_ratio_ppm;
         trace->degraded_delivery_epochs = member->degraded_delivery_epochs;
+        trace->delivery_ceiling_bytes_per_second = member->delivery_ceiling;
+        trace->delivery_ceiling_eligible = member->delivery_ceiling_eligible;
+        trace->delivery_sample_post_cut = member->delivery_sample_post_cut;
+        trace->delivery_sample_ratio_ppm = member->delivery_sample_ratio_ppm;
         trace->baseline_loss_ppm = member->baseline_loss_ppm;
         trace->flat_loss_epochs = member->flat_loss_epochs;
         trace->minimum_rtt = member->minimum_rtt;
