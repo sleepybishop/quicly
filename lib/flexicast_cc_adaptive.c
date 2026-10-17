@@ -390,10 +390,10 @@ static int external_load(const adaptive_state_t *state)
            state->hints.external_load_oldest_age_msec != 0;
 }
 
-static void grow_once(adaptive_state_t *state, int64_t now)
+static void grow_once(adaptive_state_t *state, int64_t now, uint32_t growth_divisor)
 {
     uint32_t senders = state->hints.active_senders != 0 ? state->hints.active_senders : 1;
-    uint64_t increase = (uint64_t)((double)state->rate / (8 * sqrt((double)senders)));
+    uint64_t increase = (uint64_t)((double)state->rate / (growth_divisor * sqrt((double)senders)));
     if (increase < state->config.maximum_datagram_size)
         increase = state->config.maximum_datagram_size;
     uint64_t median = state->hints.median_sender_rate_bytes_per_second;
@@ -487,7 +487,7 @@ static void adaptive_on_feedback(void *_state, const quicly_flexicast_feedback_t
             if (external_load(state)) {
                 reason |= QUICLY_FLEXICAST_CC_REASON_EXTERNAL_LOAD | QUICLY_FLEXICAST_CC_REASON_GROWTH_FROZEN;
             } else {
-                grow_once(state, feedback->now);
+                grow_once(state, feedback->now, native_sample && delivery_supports_growth ? 16 : 8);
                 if (startup_probe)
                     ++state->startup_probes;
             }

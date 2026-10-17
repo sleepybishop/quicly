@@ -17,11 +17,73 @@ static quicly_flexicast_feedback_t adaptive_context_sample(uint64_t epoch, int64
         .rtt_sample_flags = QUICLY_FLEXICAST_RTT_PRESENT | QUICLY_FLEXICAST_RTT_VALID, .now = now};
 }
 
+/* The established native probe is smaller; bootstrap and legacy growth keep
+ * their previous gains. Exercise the selector and existing scheduling bounds. */
+static void test_adaptive_growth_probe(void)
+{
+    for (size_t mode = 0; mode != 3; ++mode) { /* native delivery, native startup, legacy delivery */
+        for (uint32_t senders = 1; senders <= 4; senders *= 4) {
+            quicly_flexicast_cc_t *cc = adaptive_test_new(100000, 2000, 1);
+            quicly_flexicast_cc_hints_t hints = {.active_senders = senders};
+            quicly_flexicast_cc_set_hints(cc, &hints, 100);
+            uint64_t expected = 100000;
+            const int64_t times[] = {249, 250, 498, 499};
+            for (size_t step = 0; step != 4; ++step) {
+                quicly_flexicast_feedback_t feedback = adaptive_context_sample(step + 1, times[step], expected, 1, expected, 20);
+                if (mode == 1) {
+                    feedback.delivery_rate_bytes_per_second = 0;
+                    feedback.delivery_rate_sample_epoch = 0;
+                    feedback.delivery_sample_flags = QUICLY_FLEXICAST_SAMPLE_PRESENT;
+                } else if (mode == 2) {
+                    feedback.delivery_sample_flags = 0;
+                    feedback.rtt_sample_flags = 0;
+                }
+                quicly_flexicast_cc_on_feedback(cc, &feedback);
+                if (step == 0 || step == 3) {
+                    uint32_t divisor = (mode == 0 ? 16 : 8) * (senders == 1 ? 1 : 2);
+                    expected += expected / divisor;
+                }
+                ok(adaptive_test_output(cc).rate_bytes_per_second == expected);
+            }
+            ok(adaptive_test_output(cc).rate_increase_events == 2);
+            quicly_flexicast_cc_free(cc);
+        }
+    }
+
+    /* The datagram floor, median catch-up limit and aggregate hard ceiling
+     * still constrain native established probes after gain selection. */
+    quicly_flexicast_cc_t *cc = adaptive_test_new(8000, 2000, 1);
+    quicly_flexicast_feedback_t feedback = adaptive_context_sample(1, 200, 8000, 1, 8000, 20);
+    quicly_flexicast_cc_on_feedback(cc, &feedback);
+    ok(adaptive_test_output(cc).rate_bytes_per_second == 9200);
+    quicly_flexicast_cc_free(cc);
+
+    cc = adaptive_test_new(100000, 2000, 1);
+    quicly_flexicast_cc_hints_t hints = {.median_sender_rate_bytes_per_second = 103000};
+    quicly_flexicast_cc_set_hints(cc, &hints, 100);
+    feedback = adaptive_context_sample(1, 200, 100000, 1, 100000, 20);
+    quicly_flexicast_cc_on_feedback(cc, &feedback);
+    ok(adaptive_test_output(cc).rate_bytes_per_second == 103000);
+    quicly_flexicast_cc_free(cc);
+
+    cc = adaptive_test_new(100000, 2000, 1);
+    hints = (quicly_flexicast_cc_hints_t){.aggregate_rate_limit_bytes_per_second = 106000};
+    quicly_flexicast_cc_set_hints(cc, &hints, 100);
+    feedback = adaptive_context_sample(1, 200, 100000, 1, 100000, 20);
+    quicly_flexicast_cc_on_feedback(cc, &feedback);
+    ok(adaptive_test_output(cc).rate_bytes_per_second == 106000);
+    feedback = adaptive_context_sample(2, 450, 106000, 1, 106000, 20);
+    quicly_flexicast_cc_on_feedback(cc, &feedback);
+    ok(adaptive_test_output(cc).rate_bytes_per_second == 106000);
+    quicly_flexicast_cc_free(cc);
+}
+
 static void test_adaptive_absolute_ceiling(void);
 
 static void test_adaptive_context(void)
 {
     test_adaptive_absolute_ceiling();
+    test_adaptive_growth_probe();
     /* Low application/host sending, missing context and mixed fanout cannot
      * become congestion or teach a radio loss baseline. CE is independent. */
     const uint32_t unusable[] = {QUICLY_FLEXICAST_SAMPLE_PRESENT,
@@ -105,7 +167,7 @@ static void test_adaptive_context(void)
     feedback.rtt_sample_epoch = 1;
     feedback.rtt_sample_at = 200;
     quicly_flexicast_cc_on_feedback(cc, &feedback);
-    ok(adaptive_test_output(cc).rate_bytes_per_second == 112500);
+    ok(adaptive_test_output(cc).rate_bytes_per_second == 106250);
     quicly_flexicast_cc_free(cc);
 
     /* New identities do not make impossible or stale RTT timestamps fresh.
@@ -173,12 +235,12 @@ static void test_adaptive_context(void)
     feedback.rtt_ack_delay_msec = 25;
     feedback.rtt_sample_flags |= QUICLY_FLEXICAST_RTT_ACK_DELAY_INCONSISTENT;
     quicly_flexicast_cc_on_feedback(cc, &feedback);
-    ok(adaptive_test_output(cc).rate_bytes_per_second == 112500);
+    ok(adaptive_test_output(cc).rate_bytes_per_second == 106250);
     feedback.epoch = 2;
     feedback.now = 500;
     feedback.ecn_ce_count = 1;
     quicly_flexicast_cc_on_feedback(cc, &feedback);
-    ok(adaptive_test_output(cc).rate_bytes_per_second == 95625);
+    ok(adaptive_test_output(cc).rate_bytes_per_second == 90312);
     quicly_flexicast_cc_free(cc);
 
     /* Before the first published delivery sample, fresh clean RTT permits
