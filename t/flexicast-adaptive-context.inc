@@ -79,10 +79,12 @@ static void test_adaptive_growth_probe(void)
 }
 
 static void test_adaptive_absolute_ceiling(void);
+static void test_adaptive_drain(void);
 
 static void test_adaptive_context(void)
 {
     test_adaptive_absolute_ceiling();
+    test_adaptive_drain();
     test_adaptive_growth_probe();
     /* Low application/host sending, missing context and mixed fanout cannot
      * become congestion or teach a radio loss baseline. CE is independent. */
@@ -289,12 +291,12 @@ static quicly_flexicast_cc_t *adaptive_ceiling_after_first_cut(void)
 
 static void test_adaptive_absolute_ceiling(void)
 {
-    /* A 20 KB/s capacity observation permits bounded steps toward 20 KB/s;
-     * it must never be reapplied as 20% of today's already reduced rate. */
+    /* A 20 KB/s capacity observation permits bounded steps toward a fixed
+     * 16 KB/s drain target, never 20% of today's already reduced rate. */
     quicly_flexicast_cc_t *cc = adaptive_test_new(100000, 2000, 1);
     ok(quicly_flexicast_cc_enable_trace(cc, 1) == 0);
     const int64_t times[] = {200, 449, 450, 699, 700, 950, 1200};
-    const uint64_t expected[] = {50000, 50000, 25000, 25000, 20000, 20000, 20000};
+    const uint64_t expected[] = {50000, 50000, 25000, 25000, 16000, 16000, 16000};
     for (size_t i = 0; i != sizeof(times) / sizeof(times[0]); ++i) {
         quicly_flexicast_feedback_t feedback = adaptive_ceiling_old_sample(i + 1, times[i], 100000, 1, 20000, 80);
         quicly_flexicast_cc_on_feedback(cc, &feedback);
@@ -320,7 +322,7 @@ static void test_adaptive_absolute_ceiling(void)
             quicly_flexicast_feedback_t feedback = adaptive_ceiling_old_sample(epoch, 200 + (epoch - 1) * 250,
                                                                               100000, fanouts[i], 40000 / fanouts[i], 80);
             quicly_flexicast_cc_on_feedback(cc, &feedback);
-            ok(adaptive_test_output(cc).rate_bytes_per_second == (epoch == 1 ? 50000 : 40000));
+            ok(adaptive_test_output(cc).rate_bytes_per_second == (epoch == 1 ? 50000 : 32000));
         }
         quicly_flexicast_cc_free(cc);
     }
@@ -428,7 +430,7 @@ static void test_adaptive_absolute_ceiling(void)
     for (uint64_t epoch = 5; epoch <= 8; ++epoch) {
         feedback = adaptive_ceiling_old_sample(epoch, epoch * 250, 100000, 1, 10000, 80);
         quicly_flexicast_cc_on_feedback(cc, &feedback);
-        const uint64_t learned_expected[] = {50000, 25000, 20000, 20000};
+        const uint64_t learned_expected[] = {50000, 25000, 16000, 16000};
         ok(adaptive_test_output(cc).rate_bytes_per_second == learned_expected[epoch - 5]);
     }
     quicly_flexicast_cc_free(cc);
@@ -473,7 +475,9 @@ static void test_adaptive_absolute_ceiling(void)
     for (uint64_t epoch = 1; epoch <= 3; ++epoch) {
         feedback = adaptive_ceiling_old_sample(epoch, 200 + (epoch - 1) * 250, large, 4, large / 16, 80);
         quicly_flexicast_cc_on_feedback(cc, &feedback);
-        ok(adaptive_test_output(cc).rate_bytes_per_second == (epoch == 1 ? large / 2 : large / 4));
+        uint64_t expected =
+            epoch == 1 ? large / 2 : epoch == 2 ? large / 4 : (large / 4) / 5 * 4 + (large / 4) % 5 * 4 / 5;
+        ok(adaptive_test_output(cc).rate_bytes_per_second == expected);
     }
     quicly_flexicast_cc_free(cc);
 
@@ -513,3 +517,5 @@ static void test_adaptive_absolute_ceiling(void)
     ok(adaptive_test_output(cc).rate_bytes_per_second > 2000);
     quicly_flexicast_cc_free(cc);
 }
+
+#include "flexicast-adaptive-drain.inc"

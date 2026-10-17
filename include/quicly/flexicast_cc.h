@@ -135,6 +135,10 @@ typedef struct st_quicly_flexicast_feedback_t {
 #define QUICLY_FLEXICAST_CC_REASON_RTT 0x40U
 #define QUICLY_FLEXICAST_CC_REASON_RATE_LIMIT 0x80U
 #define QUICLY_FLEXICAST_CC_REASON_GROWTH_FROZEN 0x100U
+#define QUICLY_FLEXICAST_CC_REASON_DRAIN_ENTER 0x200U
+#define QUICLY_FLEXICAST_CC_REASON_DRAIN_CUT 0x400U
+#define QUICLY_FLEXICAST_CC_REASON_DRAIN_CLEAR 0x800U
+#define QUICLY_FLEXICAST_CC_REASON_DRAIN_EXPIRE 0x1000U
 
 typedef struct st_quicly_flexicast_cc_output_t {
     uint64_t rate_bytes_per_second;
@@ -163,6 +167,7 @@ typedef struct st_quicly_flexicast_cc_output_t {
 
 /** Trace-state feature available to source-compatible external harnesses. */
 #define QUICLY_FLEXICAST_CC_TRACE_DELIVERY_CEILING 1
+#define QUICLY_FLEXICAST_CC_TRACE_DRAIN 1
 
 /** Optional observational state. Zero available means that this controller
  * does not expose these diagnostics. Reading state must never mutate it. */
@@ -201,6 +206,16 @@ typedef struct st_quicly_flexicast_cc_trace_state_t {
     uint32_t delivery_ceiling_eligible;
     uint32_t delivery_sample_post_cut;
     uint32_t delivery_sample_ratio_ppm;
+    /** Drain diagnostics: phase 0 is idle, 1 is observing, 2 is active.
+     * Clocks describe the current or most recently ended phase. Controllers
+     * without drain behavior leave these observational fields zero. */
+    uint32_t drain_phase;
+    uint64_t drain_member_id;
+    uint64_t drain_ceiling_bytes_per_second;
+    uint64_t drain_target_bytes_per_second;
+    int64_t drain_started_at;
+    int64_t drain_deadline;
+    int64_t drain_ended_at;
 } quicly_flexicast_cc_trace_state_t;
 
 typedef enum en_quicly_flexicast_cc_trace_type_t {

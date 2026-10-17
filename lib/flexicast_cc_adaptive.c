@@ -14,6 +14,19 @@
 #define EXTERNAL_LOAD_CLEAR_PPM 100000U
 #define EXTERNAL_LOAD_CLEAR_EPOCHS 3U
 #define STARTUP_PROBES 5U
+#define DRAIN_OBSERVING 1U
+#define DRAIN_ACTIVE 2U
+
+typedef struct st_adaptive_drain_t {
+    uint32_t phase;
+    uint64_t member_id;
+    uint64_t ceiling;
+    uint64_t target;
+    int64_t started_at;
+    int64_t deadline;
+    int64_t ended_at;
+    int needs_growth;
+} adaptive_drain_t;
 
 typedef struct st_adaptive_member_t {
     uint64_t id;
@@ -58,6 +71,7 @@ typedef struct st_adaptive_state_t {
     uint64_t last_external_load_epoch;
     uint32_t external_load_clear_epochs;
     int external_load_seen;
+    adaptive_drain_t drain;
 } adaptive_state_t;
 
 static adaptive_member_t *find_member(adaptive_state_t *state, uint64_t id)
@@ -107,6 +121,20 @@ static int control_due(const adaptive_state_t *state, int64_t now, int64_t previ
     return previous_epoch == 0 || now >= deadline(previous, control_interval(state));
 }
 
+static uint32_t end_drain(adaptive_state_t *state, int64_t now, uint32_t reason)
+{
+    state->drain.phase = 0;
+    state->drain.ended_at = now;
+    state->drain.needs_growth = 1;
+    return reason;
+}
+
+static uint32_t expire_drain(adaptive_state_t *state, int64_t now)
+{
+    return state->drain.phase != 0 && now >= state->drain.deadline ? end_drain(state, now, QUICLY_FLEXICAST_CC_REASON_DRAIN_EXPIRE)
+                                                                   : 0;
+}
+
 static void update_output(adaptive_state_t *state, uint64_t member_id, uint32_t reason, quicly_flexicast_cc_output_t *output)
 {
     /* The aggregate limit remains in effect across feedback and recovery
@@ -122,6 +150,8 @@ static void update_output(adaptive_state_t *state, uint64_t member_id, uint32_t 
     output->inflight_bytes = output->burst_bytes;
     output->limiting_member_id = member_id;
     output->next_timeout = state->num_active_members == 0 ? INT64_MAX : state->next_timeout;
+    if (state->drain.phase != 0 && output->next_timeout > state->drain.deadline)
+        output->next_timeout = state->drain.deadline;
     output->reason = reason;
 }
 
@@ -149,10 +179,11 @@ static void adaptive_dispose(void *_state)
 static void adaptive_on_member_added(void *_state, uint64_t member_id, int64_t now, quicly_flexicast_cc_output_t *output)
 {
     adaptive_state_t *state = _state;
+    uint32_t reason = expire_drain(state, now);
     (void)add_member(state, member_id);
     if (state->next_timeout <= now || state->next_timeout == INT64_MAX)
         state->next_timeout = deadline(now, state->config.feedback_timeout_msec);
-    update_output(state, 0, QUICLY_FLEXICAST_CC_REASON_NONE, output);
+    update_output(state, 0, reason, output);
 }
 
 static void suspend_member(adaptive_state_t *state, adaptive_member_t *member)
@@ -171,17 +202,21 @@ static void adaptive_on_member_suspended(void *_state, uint64_t member_id, int64
 {
     adaptive_state_t *state = _state;
     adaptive_member_t *member = find_member(state, member_id);
-    (void)now;
+    uint32_t reason = expire_drain(state, now);
+    if (state->drain.phase != 0 && state->drain.member_id == member_id)
+        reason |= end_drain(state, now, QUICLY_FLEXICAST_CC_REASON_DRAIN_CLEAR);
     if (member != NULL)
         suspend_member(state, member);
-    update_output(state, 0, QUICLY_FLEXICAST_CC_REASON_NONE, output);
+    update_output(state, 0, reason, output);
 }
 
 static void adaptive_on_member_removed(void *_state, uint64_t member_id, int64_t now, quicly_flexicast_cc_output_t *output)
 {
     adaptive_state_t *state = _state;
     adaptive_member_t *member = find_member(state, member_id);
-    (void)now;
+    uint32_t reason = expire_drain(state, now);
+    if (state->drain.phase != 0 && state->drain.member_id == member_id)
+        reason |= end_drain(state, now, QUICLY_FLEXICAST_CC_REASON_DRAIN_CLEAR);
     if (member != NULL) {
         size_t slot = (size_t)(member - state->members), last = state->num_members - 1;
         suspend_member(state, member);
@@ -193,12 +228,14 @@ static void adaptive_on_member_removed(void *_state, uint64_t member_id, int64_t
         memset(state->members + last, 0, sizeof(state->members[last]));
         --state->num_members;
     }
-    update_output(state, 0, QUICLY_FLEXICAST_CC_REASON_NONE, output);
+    update_output(state, 0, reason, output);
 }
 
 static void adaptive_on_epoch_reset(void *_state, int64_t now, quicly_flexicast_cc_output_t *output)
 {
     adaptive_state_t *state = _state;
+    uint32_t reason = state->drain.phase != 0 ? QUICLY_FLEXICAST_CC_REASON_DRAIN_CLEAR : 0;
+    memset(&state->drain, 0, sizeof(state->drain));
     for (size_t i = 0; i != state->num_members; ++i) {
         state->members[i].last_feedback_epoch = 0;
         state->members[i].flat_loss_epochs = 0;
@@ -222,7 +259,7 @@ static void adaptive_on_epoch_reset(void *_state, int64_t now, quicly_flexicast_
     state->last_growth_at = state->last_reduction_at = 0;
     state->growth_blocked_until = now;
     state->next_timeout = deadline(now, state->config.feedback_timeout_msec);
-    update_output(state, 0, QUICLY_FLEXICAST_CC_REASON_NONE, output);
+    update_output(state, 0, reason, output);
 }
 
 /* The ceiling is in physical bytes/second. Cap before every potentially
@@ -390,6 +427,46 @@ static int external_load(const adaptive_state_t *state)
            state->hints.external_load_oldest_age_msec != 0;
 }
 
+/* Observe for one sender interval before using a single current capacity
+ * sample. The short impulse is an experiment, not a persistent rate cap:
+ * neither later samples nor correlated receivers can move its target/deadline. */
+static uint32_t update_drain(adaptive_state_t *state, const adaptive_member_t *member, const quicly_flexicast_feedback_t *feedback,
+                             int fresh_native_rtt, int delay_grew, int delivery_congested)
+{
+    adaptive_drain_t *drain = &state->drain;
+    if (drain->phase != 0 && drain->member_id == feedback->member_id && fresh_native_rtt &&
+        feedback->rtt_sample_at >= drain->started_at && !delay_grew && feedback->ecn_ce_count == 0 &&
+        (drain->phase == DRAIN_OBSERVING || feedback->now >= state->growth_blocked_until))
+        return end_drain(state, feedback->now, QUICLY_FLEXICAST_CC_REASON_DRAIN_CLEAR);
+
+    int eligible = member->delivery_ceiling_eligible && fresh_native_rtt && delay_grew && feedback->ecn_ce_count == 0 &&
+                   !external_load(state) &&
+                   (drain->ended_at == 0 || (feedback->delivery_sample_sent_at_start >= state->last_growth_at &&
+                                             feedback->rtt_sample_at >= state->last_growth_at));
+    if (!eligible)
+        return 0;
+    if (drain->phase == 0 && !drain->needs_growth && delivery_congested) {
+        drain->phase = DRAIN_OBSERVING;
+        drain->member_id = feedback->member_id;
+        drain->ceiling = drain->target = 0;
+        drain->started_at = feedback->now;
+        drain->deadline = deadline(feedback->now, control_interval(state) * 2);
+    } else if (drain->phase == DRAIN_OBSERVING && feedback->now >= deadline(drain->started_at, control_interval(state)) &&
+               control_due(state, feedback->now, state->last_reduction_at, state->last_reduction_epoch)) {
+        uint64_t target = clamp_rate(&state->config, scale_rate(member->delivery_ceiling, 800000, LOSS_SCALE));
+        if (target < state->rate) {
+            drain->phase = DRAIN_ACTIVE;
+            drain->member_id = feedback->member_id;
+            drain->ceiling = member->delivery_ceiling;
+            drain->target = target;
+            drain->started_at = feedback->now;
+            drain->deadline = deadline(feedback->now, control_interval(state) * 4);
+            return QUICLY_FLEXICAST_CC_REASON_DRAIN_ENTER;
+        }
+    }
+    return 0;
+}
+
 static void grow_once(adaptive_state_t *state, int64_t now, uint32_t growth_divisor)
 {
     uint32_t senders = state->hints.active_senders != 0 ? state->hints.active_senders : 1;
@@ -408,9 +485,12 @@ static void adaptive_on_feedback(void *_state, const quicly_flexicast_feedback_t
 {
     adaptive_state_t *state = _state;
     adaptive_member_t *member = add_member(state, feedback->member_id);
-    uint32_t reason = QUICLY_FLEXICAST_CC_REASON_NONE;
-    if (member == NULL)
+    uint32_t reason = expire_drain(state, feedback->now);
+    if (member == NULL) {
+        if (reason != 0)
+            update_output(state, feedback->member_id, reason, output);
         return;
+    }
     member->delivery_ceiling = 0;
     member->delivery_ceiling_eligible = 0;
     member->delivery_sample_post_cut = 0;
@@ -437,8 +517,15 @@ static void adaptive_on_feedback(void *_state, const quicly_flexicast_feedback_t
     int delivery_congested = native_sample ? member->delivery_ceiling_eligible && member->delivery_ceiling < state->rate &&
                                                  (uint64_t)member->delivery_sample_ratio_ppm + margin < clean_fraction
                                            : has_delivery && member->degraded_delivery_epochs != 0;
-    int congested = feedback->ecn_ce_count != 0 || (delay_grew && (delivery_congested || member->rising_delay_epochs >= 2 ||
-                                                                   observed_loss > member->baseline_loss_ppm + 20000));
+    int fresh_native_rtt = fresh_rtt && (feedback->rtt_sample_flags & QUICLY_FLEXICAST_RTT_PRESENT) != 0;
+    reason |= update_drain(state, member, feedback, fresh_native_rtt, delay_grew, delivery_congested);
+    /* New external-load hints cannot renew an active impulse or veto fresh
+     * congestion evidence. Explicitly limited delivery remains ineligible. */
+    int drain_step = state->drain.phase == DRAIN_ACTIVE && state->rate > state->drain.target && member->delivery_ceiling_eligible &&
+                     fresh_native_rtt && delay_grew;
+    int congested =
+        feedback->ecn_ce_count != 0 || (delay_grew && (delivery_congested || drain_step || member->rising_delay_epochs >= 2 ||
+                                                       observed_loss > member->baseline_loss_ppm + 20000));
 
     if (congested || delay_grew) {
         /* Any member can veto growth. One sender clock bounds correlated
@@ -447,18 +534,24 @@ static void adaptive_on_feedback(void *_state, const quicly_flexicast_feedback_t
         state->growth_blocked_until = deadline(feedback->now, control_interval(state) * 2);
         state->startup_probes = STARTUP_PROBES;
         member->flat_loss_epochs = 0;
-        reason = feedback->ecn_ce_count != 0 ? QUICLY_FLEXICAST_CC_REASON_ECN : QUICLY_FLEXICAST_CC_REASON_RTT;
+        reason |= feedback->ecn_ce_count != 0 ? QUICLY_FLEXICAST_CC_REASON_ECN : QUICLY_FLEXICAST_CC_REASON_RTT;
         if (congested && control_due(state, feedback->now, state->last_reduction_at, state->last_reduction_epoch)) {
             if (feedback->ecn_ce_count != 0) {
                 state->rate = scale_rate(state->rate, 850000, LOSS_SCALE);
-            } else if (delivery_congested) {
+            } else if (delivery_congested || drain_step) {
                 /* Native history sets an absolute ceiling. Legacy callers
                  * without submission context retain their EWMA ratio policy. */
-                uint64_t next = native_sample ? member->delivery_ceiling
-                                              : scale_rate(state->rate,
-                                                           (uint32_t)((uint64_t)member->recent_delivery_ratio_ppm * LOSS_SCALE /
-                                                                      member->baseline_delivery_ratio_ppm),
-                                                           LOSS_SCALE);
+                uint64_t next = state->rate;
+                if (delivery_congested)
+                    next = native_sample ? member->delivery_ceiling
+                                         : scale_rate(state->rate,
+                                                      (uint32_t)((uint64_t)member->recent_delivery_ratio_ppm * LOSS_SCALE /
+                                                                 member->baseline_delivery_ratio_ppm),
+                                                      LOSS_SCALE);
+                if (drain_step && state->drain.target < next) {
+                    next = state->drain.target;
+                    reason |= QUICLY_FLEXICAST_CC_REASON_DRAIN_CUT;
+                }
                 uint64_t minimum = scale_rate(state->rate, 500000, LOSS_SCALE);
                 uint64_t maximum = scale_rate(state->rate, 900000, LOSS_SCALE);
                 state->rate = next < minimum ? minimum : next > maximum ? maximum : next;
@@ -474,20 +567,32 @@ static void adaptive_on_feedback(void *_state, const quicly_flexicast_feedback_t
                 member->baseline_loss_ppm == 0 ? observed_loss : (member->baseline_loss_ppm * 7 + observed_loss) / 8;
             member->flat_loss_epochs = 0;
         }
-        reason = QUICLY_FLEXICAST_CC_REASON_LOSS;
+        reason |= QUICLY_FLEXICAST_CC_REASON_LOSS;
     } else if (feedback->acked_packets != 0) {
         member->flat_loss_epochs = 0;
-        reason = QUICLY_FLEXICAST_CC_REASON_ACK;
+        reason |= QUICLY_FLEXICAST_CC_REASON_ACK;
         int delivery_supports_growth = has_delivery && member->degraded_delivery_epochs == 0;
         int startup_probe = !has_delivery && state->startup_probes < STARTUP_PROBES &&
                             (!native_sample || (feedback->delivery_rate_sample_epoch == 0 && fresh_rtt));
-        if (control_due(state, feedback->now, state->last_growth_at, state->last_growth_epoch) &&
-            control_due(state, feedback->now, state->last_reduction_at, state->last_reduction_epoch) &&
-            feedback->now >= state->growth_blocked_until && (delivery_supports_growth || startup_probe)) {
+        if (state->drain.phase == DRAIN_ACTIVE) {
+            reason |= QUICLY_FLEXICAST_CC_REASON_GROWTH_FROZEN;
+        } else if (control_due(state, feedback->now, state->last_growth_at, state->last_growth_epoch) &&
+                   control_due(state, feedback->now, state->last_reduction_at, state->last_reduction_epoch) &&
+                   feedback->now >= state->growth_blocked_until && (delivery_supports_growth || startup_probe)) {
             if (external_load(state)) {
                 reason |= QUICLY_FLEXICAST_CC_REASON_EXTERNAL_LOAD | QUICLY_FLEXICAST_CC_REASON_GROWTH_FROZEN;
             } else {
+                uint64_t previous = state->rate;
                 grow_once(state, feedback->now, native_sample && delivery_supports_growth ? 16 : 8);
+                uint64_t effective = clamp_rate(&state->config, state->rate);
+                if (state->hints.aggregate_rate_limit_bytes_per_second != 0 &&
+                    effective > state->hints.aggregate_rate_limit_bytes_per_second)
+                    effective = state->hints.aggregate_rate_limit_bytes_per_second;
+                if (effective > previous) {
+                    if (state->drain.phase == DRAIN_OBSERVING)
+                        reason |= end_drain(state, feedback->now, QUICLY_FLEXICAST_CC_REASON_DRAIN_CLEAR);
+                    state->drain.needs_growth = 0;
+                }
                 if (startup_probe)
                     ++state->startup_probes;
             }
@@ -507,7 +612,7 @@ static void adaptive_on_feedback(void *_state, const quicly_flexicast_feedback_t
 static void adaptive_on_timeout(void *_state, int64_t now, quicly_flexicast_cc_output_t *output)
 {
     adaptive_state_t *state = _state;
-    uint32_t reason = QUICLY_FLEXICAST_CC_REASON_NONE;
+    uint32_t reason = expire_drain(state, now);
     if (state->num_active_members != 0 && now >= state->next_timeout) {
         if (++state->unanswered_probes >= 3) {
             state->rate /= 2;
@@ -520,7 +625,7 @@ static void adaptive_on_timeout(void *_state, int64_t now, quicly_flexicast_cc_o
         /* At the floor, ordinary pacing still permits bounded probe traffic.
          * Silence never authorizes a rate increase or disables congestion. */
         state->next_timeout = deadline(now, state->config.feedback_timeout_msec);
-        reason = QUICLY_FLEXICAST_CC_REASON_TIMEOUT;
+        reason |= QUICLY_FLEXICAST_CC_REASON_TIMEOUT;
     }
     update_output(state, 0, reason, output);
 }
@@ -529,8 +634,7 @@ static void adaptive_set_hints(void *_state, const quicly_flexicast_cc_hints_t *
                                quicly_flexicast_cc_output_t *output)
 {
     adaptive_state_t *state = _state;
-    uint32_t reason = QUICLY_FLEXICAST_CC_REASON_HINT;
-    (void)now;
+    uint32_t reason = QUICLY_FLEXICAST_CC_REASON_HINT | expire_drain(state, now);
     int fresh_load_epoch = hints->external_load_epoch != 0 && hints->external_load_epoch > state->last_external_load_epoch;
     quicly_flexicast_cc_hints_t previous_hints = state->hints;
     state->hints = *hints;
@@ -580,6 +684,13 @@ static void adaptive_get_trace_state(const void *_state, uint64_t member_id, int
     trace->startup_probes = state->startup_probes;
     trace->unanswered_probes = state->unanswered_probes;
     trace->external_load = external_load(state);
+    trace->drain_phase = state->drain.phase;
+    trace->drain_member_id = state->drain.member_id;
+    trace->drain_ceiling_bytes_per_second = state->drain.ceiling;
+    trace->drain_target_bytes_per_second = state->drain.target;
+    trace->drain_started_at = state->drain.started_at;
+    trace->drain_deadline = state->drain.deadline;
+    trace->drain_ended_at = state->drain.ended_at;
     uint32_t divisor = state->hints.delivery_rate_divisor != 0 ? state->hints.delivery_rate_divisor : 1;
     trace->expected_delivery_rate = state->rate / divisor;
     int slot = flexicast_member_map_find(&state->member_map, member_id);
