@@ -80,11 +80,13 @@ static void test_adaptive_growth_probe(void)
 
 static void test_adaptive_absolute_ceiling(void);
 static void test_adaptive_drain(void);
+static void test_adaptive_cadence(void);
 
 static void test_adaptive_context(void)
 {
     test_adaptive_absolute_ceiling();
     test_adaptive_drain();
+    test_adaptive_cadence();
     test_adaptive_growth_probe();
     /* Low application/host sending, missing context and mixed fanout cannot
      * become congestion or teach a radio loss baseline. CE is independent. */
@@ -519,3 +521,4 @@ static void test_adaptive_absolute_ceiling(void)
 }
 
 #include "flexicast-adaptive-drain.inc"
+#include "flexicast-adaptive-cadence.inc"

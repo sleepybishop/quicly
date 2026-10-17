@@ -535,7 +535,16 @@ static void adaptive_on_feedback(void *_state, const quicly_flexicast_feedback_t
         state->startup_probes = STARTUP_PROBES;
         member->flat_loss_epochs = 0;
         reason |= feedback->ecn_ce_count != 0 ? QUICLY_FLEXICAST_CC_REASON_ECN : QUICLY_FLEXICAST_CC_REASON_RTT;
-        if (congested && control_due(state, feedback->now, state->last_reduction_at, state->last_reduction_epoch)) {
+        /* New sending can justify an earlier ceiling cut. Historical samples
+         * retain the ordinary clock. RTT time guards post-cut ACK receipt,
+         * not packet submission; the complete delivery interval is post-cut. */
+        int early_delivery_cut = state->last_reduction_epoch != 0 && native_sample && fresh_delivery &&
+                                 member->delivery_sample_post_cut && delivery_congested && feedback->ecn_ce_count == 0 &&
+                                 (feedback->rtt_sample_flags & QUICLY_FLEXICAST_RTT_PRESENT) != 0 && fresh_rtt && delay_grew &&
+                                 feedback->rtt_sample_at >= state->last_reduction_at &&
+                                 feedback->now >= deadline(state->last_reduction_at, 125);
+        if (congested &&
+            (control_due(state, feedback->now, state->last_reduction_at, state->last_reduction_epoch) || early_delivery_cut)) {
             if (feedback->ecn_ce_count != 0) {
                 state->rate = scale_rate(state->rate, 850000, LOSS_SCALE);
             } else if (delivery_congested || drain_step) {
