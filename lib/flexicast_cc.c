@@ -35,6 +35,13 @@ struct st_quicly_flexicast_cc_t {
 static void normalize_output(quicly_flexicast_cc_t *cc)
 {
     cc->output.rate_bytes_per_second = clamp_rate(&cc->config, cc->output.rate_bytes_per_second);
+    /* A transport budget is a ceiling, even when its fair share is below this
+     * flow's preferred minimum. Enforce it after every controller event. */
+    if (cc->hints.aggregate_rate_limit_bytes_per_second != 0 &&
+        cc->output.rate_bytes_per_second > cc->hints.aggregate_rate_limit_bytes_per_second) {
+        cc->output.rate_bytes_per_second = cc->hints.aggregate_rate_limit_bytes_per_second;
+        cc->output.reason |= QUICLY_FLEXICAST_CC_REASON_RATE_LIMIT;
+    }
     if (cc->output.burst_bytes == 0)
         cc->output.burst_bytes = (uint64_t)cc->config.maximum_datagram_size * 4;
     if (cc->output.burst_bytes < cc->config.maximum_datagram_size)

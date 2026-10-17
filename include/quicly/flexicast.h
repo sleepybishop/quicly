@@ -150,6 +150,7 @@ typedef struct st_quicly_flexicast_member_stats_t {
     uint64_t lost_packets;
     uint64_t lost_bytes;
     uint64_t delivery_rate_bytes_per_second;
+    /** Cumulative CE count for the current key epoch. */
     uint64_t ecn_ce_count;
     uint32_t latest_rtt_msec;
     uint32_t minimum_rtt_msec;
@@ -194,6 +195,13 @@ int quicly_flexicast_send_datagram(quicly_flexicast_flow_t *flow, ptls_iovec_t p
 int quicly_flexicast_send_datagram_at(quicly_flexicast_flow_t *flow, ptls_iovec_t payload, uint8_t *packet, size_t packet_capacity,
                                       size_t *packet_size, uint64_t *packet_number, int64_t now);
 
+/** Records actual UDP submission after protection and local pacing. A zero
+ * member_id applies one native multicast submission to the whole packet.
+ * Replica exceptions use bounded sparse storage; if exhausted, RTT sampling
+ * is skipped rather than including local queue time. now <= 0 explicitly
+ * disables the affected RTT sample when the physical send time is unknown. */
+int quicly_flexicast_mark_submitted(quicly_flexicast_flow_t *flow, uint64_t member_id, uint64_t packet_number, int64_t now);
+
 /* Decrypts in place. The returned payload borrows storage from packet. A packet
  * containing multiple DATAGRAMs returns BUFFER_TOO_SMALL without consuming its
  * packet number; use receive_datagrams_at for general packet reception. PING-
@@ -213,6 +221,12 @@ int quicly_flexicast_receive_datagram_at(quicly_flexicast_flow_t *flow, uint8_t 
  * PING are accepted; PADDING alone does not schedule an acknowledgment. */
 int quicly_flexicast_receive_datagrams_at(quicly_flexicast_flow_t *flow, uint8_t *packet, size_t packet_size,
                                           ptls_iovec_t *payloads, size_t *num_payloads, uint64_t *packet_number, int64_t now);
+
+/** Like receive_datagram_at, with the received IP ECN low two bits:
+ * Not-ECT=0, ECT(1)=1, ECT(0)=2, CE=3. Authenticated new packets contribute
+ * cumulative per-key-epoch ECN counts; duplicates and rejected packets do not. */
+int quicly_flexicast_receive_datagram_ecn_at(quicly_flexicast_flow_t *flow, uint8_t *packet, size_t packet_size,
+                                             ptls_iovec_t *payload, uint64_t *packet_number, int64_t now, uint8_t ecn);
 
 /** Returns INT64_MAX when there is no pending feedback. */
 int64_t quicly_flexicast_get_ack_deadline(const quicly_flexicast_flow_t *flow);

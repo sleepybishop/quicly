@@ -147,18 +147,18 @@ static void test_adaptive_hint_epochs(void)
     hints.external_load_epoch = 11;
     quicly_flexicast_cc_set_hints(cc, &hints, 122);
     quicly_flexicast_cc_get_output(cc, &output);
-    ok(output.rate_bytes_per_second == 16000);
+    ok(output.rate_bytes_per_second == 10000);
     /* Older clean measurements cannot clear the current load episode. */
     for (uint64_t epoch = 1; epoch != 4; ++epoch) {
         hints = (quicly_flexicast_cc_hints_t){.external_load_epoch = epoch};
         quicly_flexicast_cc_set_hints(cc, &hints, 130 + (int64_t)epoch);
     }
     feedback.epoch = 2;
-    feedback.delivery_rate_bytes_per_second = 16000;
+    feedback.delivery_rate_bytes_per_second = 10000;
     feedback.now = 200;
     quicly_flexicast_cc_on_feedback(cc, &feedback);
     quicly_flexicast_cc_get_output(cc, &output);
-    ok(output.rate_bytes_per_second == 16000);
+    ok(output.rate_bytes_per_second == 10000);
     ok((output.reason & QUICLY_FLEXICAST_CC_REASON_GROWTH_FROZEN) != 0);
     for (uint64_t epoch = 12; epoch != 15; ++epoch) {
         hints = (quicly_flexicast_cc_hints_t){.external_load_epoch = epoch};
@@ -168,7 +168,7 @@ static void test_adaptive_hint_epochs(void)
     feedback.now = 250;
     quicly_flexicast_cc_on_feedback(cc, &feedback);
     quicly_flexicast_cc_get_output(cc, &output);
-    ok(output.rate_bytes_per_second > 16000);
+    ok(output.rate_bytes_per_second > 10000);
     quicly_flexicast_cc_free(cc);
 }
 
@@ -187,7 +187,7 @@ static void test_adaptive_maximum_rate_recovery(void)
         quicly_flexicast_cc_on_timeout(cc, output.next_timeout);
         quicly_flexicast_cc_get_output(cc, &output);
     }
-    ok(output.rate_bytes_per_second == UINT64_MAX);
+    ok(output.rate_bytes_per_second == UINT64_MAX / 2);
     quicly_flexicast_cc_free(cc);
 }
 
@@ -306,7 +306,7 @@ static void test_duplicate_ack_delivery_clock(void)
             size_t size, acked, lost, completed;
             quicly_flexicast_member_stats_t stats;
             ok(quicly_flexicast_attach_at(flow, 1, 100) == QUICLY_FLEXICAST_OK);
-            for (unsigned i = 0; i != 2; ++i)
+            for (unsigned i = 0; i != 3; ++i)
                 ok(quicly_flexicast_send_datagram_at(flow, ptls_iovec_init(payload, sizeof(payload)), packet, sizeof(packet), &size,
                                                      &pn, 100 + i) == QUICLY_FLEXICAST_OK);
             quicly_ack_frame_t ack = {.largest_acknowledged = 0, .smallest_acknowledged = 0, .ack_block_lengths = {1}};
@@ -319,8 +319,10 @@ static void test_duplicate_ack_delivery_clock(void)
             }
             ack.largest_acknowledged = ack.smallest_acknowledged = 1;
             ok(quicly_flexicast_ack_frame_at(flow, 1, &ack, &acked, &lost, &completed, 300) == QUICLY_FLEXICAST_OK);
+            ack.largest_acknowledged = ack.smallest_acknowledged = 2;
+            ok(quicly_flexicast_ack_frame_at(flow, 1, &ack, &acked, &lost, &completed, 400) == QUICLY_FLEXICAST_OK);
             ok(quicly_flexicast_get_member_stats(flow, 1, &stats) == QUICLY_FLEXICAST_OK);
-            ok(stats.delivery_rate_bytes_per_second == size * 10 && stats.feedback_epoch == 2);
+            ok(stats.delivery_rate_bytes_per_second == size * 10 && stats.feedback_epoch == 3);
             if (replay)
                 ok(stats.delivery_rate_bytes_per_second == delivery_rate);
             else

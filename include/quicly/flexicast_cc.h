@@ -51,7 +51,13 @@ typedef struct st_quicly_flexicast_cc_config_t {
 
 typedef struct st_quicly_flexicast_cc_hints_t {
     uint32_t active_senders;
+    /** Physical copies charged to the pacer for each logical datagram.
+     * Zero selects one (native multicast); replicated unicast uses its fanout.
+     * Delivery feedback is per receiver and must use the same rate units. */
+    uint32_t delivery_rate_divisor;
     uint64_t median_sender_rate_bytes_per_second;
+    /** A hard share of the physical path budget, including below the configured
+     * minimum rate. Zero means unlimited. */
     uint64_t aggregate_rate_limit_bytes_per_second;
     /** Transport-agnostic load that shares this controller's physical path
      * but is scheduled above the controller. It can suppress growth but is not
@@ -73,6 +79,10 @@ typedef struct st_quicly_flexicast_feedback_t {
     uint64_t lost_bytes;
     uint64_t delivered_bytes;
     uint64_t delivery_rate_bytes_per_second;
+    /** Identifies the completed delivery-rate measurement, independently of
+     * ACK-frame epochs. Repeated ACKs can carry the same published sample.
+     * Zero uses now as the sample identity for callers without this clock. */
+    uint64_t delivery_rate_sample_epoch;
     uint64_t ecn_ce_count;
     uint32_t latest_rtt_msec;
     uint32_t minimum_rtt_msec;
