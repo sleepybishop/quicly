@@ -1171,6 +1171,8 @@ void test_flexicast(void)
     test_ack_range_batches();
     test_ack_rtt_largest_only();
     test_flexicast_cc_regressions();
+    test_flexicast_crypto();
+    test_flexicast_packets();
 
     memset(secret, 0x5a, ptls_openssl_aes128gcmsha256.hash->digest_size);
     memset(wrong_secret, 0xa5, ptls_openssl_aes128gcmsha256.hash->digest_size);

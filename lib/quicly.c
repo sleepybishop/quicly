@@ -8389,6 +8389,31 @@ quicly_error_t quicly_close(quicly_conn_t *conn, quicly_error_t err, const char 
     return ret;
 }
 
+quicly_error_t quicly_flexicast_handle_receive_error(quicly_conn_t *conn, int result)
+{
+    quicly_error_t error, ret;
+
+    if (conn == NULL)
+        return QUICLY_TRANSPORT_ERROR_INTERNAL;
+    switch (result) {
+    case QUICLY_FLEXICAST_ERROR_PROTOCOL_VIOLATION:
+        error = QUICLY_TRANSPORT_ERROR_PROTOCOL_VIOLATION;
+        break;
+    case QUICLY_FLEXICAST_ERROR_FRAME_ENCODING:
+        error = QUICLY_TRANSPORT_ERROR_FRAME_ENCODING;
+        break;
+    case QUICLY_FLEXICAST_ERROR_AEAD_LIMIT_REACHED:
+        error = QUICLY_TRANSPORT_ERROR_AEAD_LIMIT_REACHED;
+        break;
+    default:
+        return 0;
+    }
+    lock_now(conn, 1);
+    ret = initiate_close(conn, error, QUICLY_FRAME_TYPE_PADDING, "Flexicast receive error");
+    unlock_now(conn);
+    return ret;
+}
+
 quicly_error_t quicly_get_or_open_stream(quicly_conn_t *conn, uint64_t stream_id, quicly_stream_t **stream)
 {
     quicly_error_t ret = 0;
@@ -9727,9 +9752,8 @@ static quicly_error_t handle_fc_announce_frame(quicly_conn_t *conn, struct st_qu
     if ((ret = quicly_flexicast_decode_announce_frame(state->frame_start, state->end - state->frame_start, &frame.data.announce,
                                                       &consumed)) != QUICLY_FLEXICAST_OK)
         return flexicast_decode_error(ret);
-    if ((frame.data.announce.ip_version == 4 && !conn->super.ctx->transport_params.flexicast_support.ipv4) ||
-        (frame.data.announce.ip_version == 6 && !conn->super.ctx->transport_params.flexicast_support.ipv6))
-        return QUICLY_TRANSPORT_ERROR_PROTOCOL_VIOLATION;
+    /* The application checks per-flow sequence numbers before deciding whether it can join the advertised address family.
+     * Rejecting an unsupported family here would prevent it from silently discarding a stale FC_ANNOUNCE. */
     state->src = state->frame_start + consumed;
     return deliver_flexicast_frame(conn, &frame);
 }

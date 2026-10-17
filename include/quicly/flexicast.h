@@ -36,6 +36,9 @@ extern "C" {
 #define QUICLY_FLEXICAST_SENT_WINDOW 2048
 #define QUICLY_FLEXICAST_REPLAY_WINDOW 64
 #define QUICLY_FLEXICAST_MAX_DATAGRAM_SIZE 65535
+#define QUICLY_FLEXICAST_DEFAULT_MAX_PACKET_SIZE 1200
+/* Maximum UDP payload that fits both ordinary IPv4 and IPv6 packets. */
+#define QUICLY_FLEXICAST_MAX_PACKET_SIZE 65507
 #define QUICLY_FLEXICAST_DEFAULT_ACK_FREQUENCY 8
 #define QUICLY_FLEXICAST_MAX_ACK_ENCODED_SIZE 2048
 
@@ -68,7 +71,9 @@ typedef enum en_quicly_flexicast_result_t {
     QUICLY_FLEXICAST_ERROR_NOT_FOUND = -9,
     QUICLY_FLEXICAST_ERROR_BUFFER_TOO_SMALL = -10,
     QUICLY_FLEXICAST_ERROR_FRAME_ENCODING = -11,
-    QUICLY_FLEXICAST_ERROR_PROTOCOL_VIOLATION = -12
+    QUICLY_FLEXICAST_ERROR_PROTOCOL_VIOLATION = -12,
+    QUICLY_FLEXICAST_ERROR_AEAD_LIMIT_REACHED = -13,
+    QUICLY_FLEXICAST_ERROR_KEY_UPDATE_REQUIRED = -14
 } quicly_flexicast_result_t;
 
 size_t quicly_flexicast_announce_frame_capacity(const quicly_flexicast_announce_frame_t *frame);
@@ -95,6 +100,13 @@ int quicly_flexicast_send_state(quicly_conn_t *conn, const quicly_flexicast_stat
 int quicly_flexicast_send_key(quicly_conn_t *conn, const quicly_flexicast_key_frame_t *frame);
 /** Queues PATH_ACK feedback for one received flow packet on the unicast connection. */
 int quicly_flexicast_send_path_ack(quicly_conn_t *conn, uint64_t flow_id, uint64_t packet_number);
+/** Closes the associated unicast connection for authenticated protocol/frame
+ * errors or an exhausted authentication-failure budget. Packet-local errors
+ * (including failed authentication below the limit) are ignored. The caller must supply the
+ * correct control connection; possession of a group key does not identify a
+ * particular receiver. Returns zero on success, or the connection-close setup error.
+ * A NULL connection returns QUICLY_TRANSPORT_ERROR_INTERNAL. */
+quicly_error_t quicly_flexicast_handle_receive_error(quicly_conn_t *conn, int result);
 
 typedef struct st_quicly_flexicast_config_t {
     uint64_t flow_id;
@@ -118,6 +130,15 @@ typedef struct st_quicly_flexicast_config_t {
     uint32_t ack_delay_msec;
     uint16_t ack_frequency;
     int64_t now;
+    /** Optional lower cryptographic usage limits. Zero selects conservative
+     * suite-specific QUIC limits; values above those limits are invalid. */
+    uint64_t max_packets_per_key;
+    uint64_t max_authentication_failures;
+    /** Maximum outgoing protected UDP payload, from 1200 through 65507 bytes.
+     * Zero selects 1200. The caller must choose a value supported by every
+     * member and the multicast path and enforce each peer's negotiated
+     * max_datagram_frame_size before attaching it. */
+    size_t max_packet_size;
 } quicly_flexicast_config_t;
 
 typedef struct st_quicly_flexicast_member_stats_t {
@@ -139,10 +160,13 @@ typedef struct st_quicly_flexicast_member_stats_t {
 int quicly_flexicast_flow_create(quicly_flexicast_flow_t **flow, const quicly_flexicast_config_t *config);
 /** Replaces the traffic keys and packet epoch in place. The first packet number
  * must not reuse any packet number previously sent or received on this flow:
- * PATH_ACK has no key-epoch identifier. Congestion-controller and cumulative
+ * PATH_ACK has no key-epoch identifier. Built-in congestion-controller and cumulative
  * known-member measurements are retained, while active delivery membership,
  * replay state, ACK ranges, outstanding packets, and epoch-specific feedback
- * state are reset. */
+ * state are reset. Encryption usage is retained for every previously installed
+ * secret; failed-authentication usage is cumulative for the lifetime of the
+ * flow. A new secret is required after ERROR_KEY_UPDATE_REQUIRED.
+ * ERROR_AEAD_LIMIT_REACHED is terminal, including across rekeys. */
 int quicly_flexicast_flow_rekey(quicly_flexicast_flow_t *flow, ptls_iovec_t traffic_secret, uint64_t first_packet_number,
                                 int64_t now);
 void quicly_flexicast_flow_free(quicly_flexicast_flow_t *flow);
@@ -151,7 +175,7 @@ uint64_t quicly_flexicast_get_flow_id(const quicly_flexicast_flow_t *flow);
 uint64_t quicly_flexicast_get_next_packet_number(const quicly_flexicast_flow_t *flow);
 
 /* member IDs are nonzero; attach is idempotent; after rekey it reactivates a
- * known member while retaining its statistics and controller history */
+ * known member while retaining its statistics and built-in controller history */
 int quicly_flexicast_attach(quicly_flexicast_flow_t *flow, uint64_t member_id);
 int quicly_flexicast_attach_at(quicly_flexicast_flow_t *flow, uint64_t member_id, int64_t now);
 int quicly_flexicast_detach(quicly_flexicast_flow_t *flow, uint64_t member_id);
@@ -170,11 +194,25 @@ int quicly_flexicast_send_datagram(quicly_flexicast_flow_t *flow, ptls_iovec_t p
 int quicly_flexicast_send_datagram_at(quicly_flexicast_flow_t *flow, ptls_iovec_t payload, uint8_t *packet, size_t packet_capacity,
                                       size_t *packet_size, uint64_t *packet_number, int64_t now);
 
-/* Decrypts in place. The returned payload borrows storage from packet. */
+/* Decrypts in place. The returned payload borrows storage from packet. A packet
+ * containing multiple DATAGRAMs returns BUFFER_TOO_SMALL without consuming its
+ * packet number; use receive_datagrams_at for general packet reception. PING-
+ * or PADDING-only packets succeed with payload.base == NULL. A zero-length
+ * DATAGRAM has a non-NULL base. Pass authenticated errors to
+ * quicly_flexicast_handle_receive_error on the associated control connection. */
 int quicly_flexicast_receive_datagram(quicly_flexicast_flow_t *flow, uint8_t *packet, size_t packet_size, ptls_iovec_t *payload,
                                       uint64_t *packet_number);
 int quicly_flexicast_receive_datagram_at(quicly_flexicast_flow_t *flow, uint8_t *packet, size_t packet_size, ptls_iovec_t *payload,
                                          uint64_t *packet_number, int64_t now);
+/** Receives every DATAGRAM in a protected packet without payload copies.
+ * *num_payloads supplies the array capacity and receives the required count.
+ * The output array must not overlap packet.
+ * On BUFFER_TOO_SMALL no packet state or payload entries are committed, but
+ * packet has been decrypted in place: retry using a fresh encrypted copy.
+ * A NULL payloads array is permitted only with zero capacity. PADDING and
+ * PING are accepted; PADDING alone does not schedule an acknowledgment. */
+int quicly_flexicast_receive_datagrams_at(quicly_flexicast_flow_t *flow, uint8_t *packet, size_t packet_size,
+                                          ptls_iovec_t *payloads, size_t *num_payloads, uint64_t *packet_number, int64_t now);
 
 /** Returns INT64_MAX when there is no pending feedback. */
 int64_t quicly_flexicast_get_ack_deadline(const quicly_flexicast_flow_t *flow);

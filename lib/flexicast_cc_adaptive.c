@@ -32,6 +32,7 @@ typedef struct st_adaptive_member_t {
     uint32_t degraded_delivery_epochs;
     uint64_t last_feedback_epoch;
     int rtt_congested;
+    int active;
 } adaptive_member_t;
 
 typedef struct st_adaptive_state_t {
@@ -39,6 +40,7 @@ typedef struct st_adaptive_state_t {
     quicly_flexicast_cc_hints_t hints;
     adaptive_member_t *members;
     size_t num_members;
+    size_t num_active_members;
     flexicast_member_map_t member_map;
     uint64_t rate;
     uint64_t last_growth_epoch;
@@ -68,14 +70,18 @@ static adaptive_member_t *find_member(adaptive_state_t *state, uint64_t id)
 static adaptive_member_t *add_member(adaptive_state_t *state, uint64_t id, int64_t now)
 {
     adaptive_member_t *member = find_member(state, id);
-    if (member != NULL)
-        return member;
-    if (state->num_members == state->config.maximum_members)
-        return NULL;
-    flexicast_member_map_set(&state->member_map, id, state->num_members);
-    member = state->members + state->num_members++;
-    member->id = id;
-    member->last_feedback = now;
+    if (member == NULL) {
+        if (state->num_members == state->config.maximum_members)
+            return NULL;
+        flexicast_member_map_set(&state->member_map, id, state->num_members);
+        member = state->members + state->num_members++;
+        member->id = id;
+    }
+    if (!member->active) {
+        member->active = 1;
+        member->last_feedback = now;
+        ++state->num_active_members;
+    }
     return member;
 }
 
@@ -115,7 +121,9 @@ static void update_output(adaptive_state_t *state, int64_t now, uint64_t limitin
     output->burst_bytes = burst;
     output->inflight_bytes = burst;
     output->limiting_member_id = limiting_member;
-    output->next_timeout = state->next_recovery_probe != 0 ? state->next_recovery_probe : recovery_deadline(state, now);
+    output->next_timeout = state->num_active_members == 0    ? INT64_MAX
+                           : state->next_recovery_probe != 0 ? state->next_recovery_probe
+                                                             : recovery_deadline(state, now);
     output->reason = reason;
 }
 
@@ -128,7 +136,6 @@ static int adaptive_init(void *_state, const quicly_flexicast_cc_config_t *confi
         flexicast_member_map_init(&state->member_map, config->maximum_members) != 0)
         return -1;
     state->rate = config->startup_rate_bytes_per_second;
-    state->next_recovery_probe = recovery_deadline(state, now);
     update_output(state, now, 0, QUICLY_FLEXICAST_CC_REASON_NONE, output);
     return 0;
 }
@@ -143,7 +150,39 @@ static void adaptive_dispose(void *_state)
 static void adaptive_on_member_added(void *_state, uint64_t member_id, int64_t now, quicly_flexicast_cc_output_t *output)
 {
     adaptive_state_t *state = _state;
+    size_t previous_active = state->num_active_members;
     (void)add_member(state, member_id, now);
+    if (previous_active == 0 && state->num_active_members != 0) {
+        state->next_recovery_probe = recovery_deadline(state, now);
+        state->unanswered_recovery_probes = 0;
+    }
+    update_output(state, now, 0, QUICLY_FLEXICAST_CC_REASON_NONE, output);
+}
+
+static void suspend_member(adaptive_state_t *state, adaptive_member_t *member)
+{
+    if (!member->active)
+        return;
+    member->active = 0;
+    --state->num_active_members;
+    if (state->rtt_episode_member_id == member->id) {
+        state->rtt_episode_member_id = 0;
+        state->rtt_clear_epochs = 0;
+    }
+    if (state->num_active_members == 0) {
+        state->next_recovery_probe = 0;
+        state->unanswered_recovery_probes = 0;
+        state->floor_recovery_epochs = 0;
+        state->last_floor_recovery_epoch = 0;
+    }
+}
+
+static void adaptive_on_member_suspended(void *_state, uint64_t member_id, int64_t now, quicly_flexicast_cc_output_t *output)
+{
+    adaptive_state_t *state = _state;
+    adaptive_member_t *member = find_member(state, member_id);
+    if (member != NULL)
+        suspend_member(state, member);
     update_output(state, now, 0, QUICLY_FLEXICAST_CC_REASON_NONE, output);
 }
 
@@ -153,6 +192,7 @@ static void adaptive_on_member_removed(void *_state, uint64_t member_id, int64_t
     adaptive_member_t *member = find_member(state, member_id);
     if (member != NULL) {
         size_t slot = (size_t)(member - state->members), last = state->num_members - 1;
+        suspend_member(state, member);
         flexicast_member_map_remove(&state->member_map, member_id);
         if (slot != last) {
             state->members[slot] = state->members[last];
@@ -190,7 +230,7 @@ static void adaptive_on_epoch_reset(void *_state, int64_t now, quicly_flexicast_
     state->last_floor_recovery_epoch = 0;
     state->rtt_episode_member_id = 0;
     state->rtt_clear_epochs = 0;
-    state->next_recovery_probe = recovery_deadline(state, now);
+    state->next_recovery_probe = state->num_active_members != 0 ? recovery_deadline(state, now) : 0;
     update_output(state, now, 0, QUICLY_FLEXICAST_CC_REASON_NONE, output);
 }
 
@@ -292,7 +332,7 @@ static int has_recent_feedback(const adaptive_state_t *state, int64_t now)
     uint64_t horizon = (uint64_t)state->config.feedback_timeout_msec * 2;
     for (size_t i = 0; i != state->num_members; ++i) {
         int64_t last = state->members[i].last_feedback;
-        if (last > 0 && now >= last && (uint64_t)(now - last) <= horizon)
+        if (state->members[i].active && last > 0 && now >= last && (uint64_t)(now - last) <= horizon)
             return 1;
     }
     return 0;
@@ -536,7 +576,7 @@ static void adaptive_on_timeout(void *_state, int64_t now, quicly_flexicast_cc_o
 {
     adaptive_state_t *state = _state;
     uint32_t reason = QUICLY_FLEXICAST_CC_REASON_NONE;
-    if (state->next_recovery_probe != 0 && now >= state->next_recovery_probe) {
+    if (state->num_active_members != 0 && state->next_recovery_probe != 0 && now >= state->next_recovery_probe) {
         ++state->unanswered_recovery_probes;
         if (state->floor_recovery_epochs != 0) {
             advance_floor_recovery(state, sender_epoch(state, now));
@@ -622,6 +662,7 @@ quicly_flexicast_cc_type_t quicly_flexicast_cc_type_adaptive = {
     .dispose = adaptive_dispose,
     .on_member_added = adaptive_on_member_added,
     .on_member_removed = adaptive_on_member_removed,
+    .on_member_suspended = adaptive_on_member_suspended,
     .on_epoch_reset = adaptive_on_epoch_reset,
     .on_feedback = adaptive_on_feedback,
     .on_timeout = adaptive_on_timeout,

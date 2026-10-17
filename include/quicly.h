@@ -207,7 +207,8 @@ QUICLY_CALLBACK_TYPE(quicly_error_t, stream_open, quicly_stream_t *stream);
  */
 QUICLY_CALLBACK_TYPE(void, receive_datagram_frame, quicly_conn_t *conn, ptls_iovec_t payload);
 /** Called synchronously for FC control frames. Borrowed fields are valid only during the callback.
- * The application owns flow registration, per-flow sequence ordering, and membership transitions. */
+ * The application owns flow registration, per-flow sequence ordering, address-family selection, and membership transitions.
+ * Discard stale announcements before considering their addresses or applying flow updates. */
 QUICLY_CALLBACK_TYPE(quicly_error_t, receive_flexicast_frame, quicly_conn_t *conn, const quicly_flexicast_frame_t *frame);
 /** Receives a PATH_ACK for the experimental Flexicast flow-ID namespace (above the local unicast path limit).
  * ack_delay is converted to milliseconds using the peer's ACK-delay exponent before this callback.

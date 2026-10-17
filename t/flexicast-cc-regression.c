@@ -3,6 +3,9 @@
  * SPDX-License-Identifier: MIT
  */
 #include "picotest.h"
+#include "picotls/openssl.h"
+#include "quicly/defaults.h"
+#include "quicly/flexicast.h"
 #include "quicly/flexicast_cc.h"
 #include "../lib/flexicast_member_map.h"
 
@@ -215,6 +218,136 @@ static void test_member_map_collisions(void)
     flexicast_member_map_dispose(&map);
 }
 
+static quicly_flexicast_flow_t *create_regression_flow(quicly_flexicast_cc_type_t *type)
+{
+    uint8_t secret[PTLS_MAX_DIGEST_SIZE] = {0};
+    quicly_flexicast_flow_t *flow = NULL;
+    quicly_flexicast_config_t config = {.flow_id = 1000,
+                                        .cipher_suite = &ptls_openssl_aes128gcmsha256,
+                                        .crypto_engine = &quicly_default_crypto_engine,
+                                        .traffic_secret = ptls_iovec_init(secret, ptls_openssl_aes128gcmsha256.hash->digest_size),
+                                        .cc_type = type,
+                                        .cc_config = regression_config(),
+                                        .now = 100};
+    ok(quicly_flexicast_flow_create(&flow, &config) == QUICLY_FLEXICAST_OK);
+    return flow;
+}
+
+static void test_rekey_inactive_members(void)
+{
+    quicly_flexicast_cc_type_t *types[] = {&quicly_flexicast_cc_type_multicast, &quicly_flexicast_cc_type_adaptive};
+    for (size_t t = 0; t != sizeof(types) / sizeof(types[0]); ++t) {
+        quicly_flexicast_flow_t *flow = create_regression_flow(types[t]);
+        uint8_t packet[128], next_secret[PTLS_MAX_DIGEST_SIZE] = {1};
+        uint64_t pn;
+        size_t size, acked, lost, completed;
+        quicly_flexicast_cc_output_t output;
+        quicly_flexicast_member_stats_t stats;
+        ok(quicly_flexicast_attach_at(flow, 1, 100) == QUICLY_FLEXICAST_OK);
+        ok(quicly_flexicast_attach_at(flow, 2, 100) == QUICLY_FLEXICAST_OK);
+        for (unsigned i = 0; i != 4; ++i)
+            ok(quicly_flexicast_send_datagram_at(flow, ptls_iovec_init(NULL, 0), packet, sizeof(packet), &size, &pn, 110) ==
+               QUICLY_FLEXICAST_OK);
+        quicly_ack_frame_t ack = {
+            .largest_acknowledged = 3, .smallest_acknowledged = 3, .ack_block_lengths = {1}, .ecn_counts = {0, 0, 1}};
+        ok(quicly_flexicast_ack_frame_at(flow, 1, &ack, &acked, &lost, &completed, 200) == QUICLY_FLEXICAST_OK);
+        quicly_flexicast_cc_get_flow_output(flow, &output);
+        uint64_t learned_rate = output.rate_bytes_per_second;
+        ok(learned_rate == 85000);
+        ack = (quicly_ack_frame_t){.largest_acknowledged = 3, .smallest_acknowledged = 0, .ack_block_lengths = {4}};
+        ok(quicly_flexicast_ack_frame_at(flow, 2, &ack, &acked, &lost, &completed, 201) == QUICLY_FLEXICAST_OK);
+
+        ok(quicly_flexicast_flow_rekey(flow, ptls_iovec_init(next_secret, ptls_openssl_aes128gcmsha256.hash->digest_size), 4,
+                                       300) == QUICLY_FLEXICAST_OK);
+        quicly_flexicast_cc_get_flow_output(flow, &output);
+        ok(quicly_flexicast_num_members(flow) == 0 && output.next_timeout == INT64_MAX);
+        ok(output.limiting_member_id == 0);
+        uint64_t idle_rate = output.rate_bytes_per_second;
+        quicly_flexicast_cc_on_flow_timeout(flow, 1300);
+        quicly_flexicast_cc_get_flow_output(flow, &output);
+        ok(output.timeout_reduction_events == 0 && output.rate_bytes_per_second == idle_rate);
+
+        /* Only member 2 has resumed listening. Member 1 must not constrain
+         * its rate or collect missing-feedback probes. */
+        ok(quicly_flexicast_attach_at(flow, 2, 1400) == QUICLY_FLEXICAST_OK);
+        quicly_flexicast_cc_get_flow_output(flow, &output);
+        ok(output.next_timeout > 1400 && output.next_timeout != INT64_MAX);
+        for (int64_t now = 1500; now <= 1700; now += 100) {
+            ok(quicly_flexicast_send_datagram_at(flow, ptls_iovec_init(NULL, 0), packet, sizeof(packet), &size, &pn, now - 10) ==
+               QUICLY_FLEXICAST_OK);
+            ack = (quicly_ack_frame_t){.largest_acknowledged = pn, .smallest_acknowledged = pn, .ack_block_lengths = {1}};
+            ok(quicly_flexicast_ack_frame_at(flow, 2, &ack, &acked, &lost, &completed, now - 1) == QUICLY_FLEXICAST_OK);
+            quicly_flexicast_cc_on_flow_timeout(flow, now);
+        }
+        quicly_flexicast_cc_get_flow_output(flow, &output);
+        ok(output.timeout_reduction_events == 0);
+        if (types[t] == &quicly_flexicast_cc_type_multicast)
+            ok(output.limiting_member_id == 2 && output.rate_bytes_per_second > learned_rate);
+
+        /* Suspending preserves path history, unlike removing the member. */
+        ok(quicly_flexicast_detach_at(flow, 2, 1800) == QUICLY_FLEXICAST_OK);
+        ok(quicly_flexicast_attach_at(flow, 1, 1800) == QUICLY_FLEXICAST_OK);
+        quicly_flexicast_cc_get_flow_output(flow, &output);
+        ok(output.rate_bytes_per_second == learned_rate && output.next_timeout > 1800);
+        ok(quicly_flexicast_get_member_stats(flow, 1, &stats) == QUICLY_FLEXICAST_OK && stats.delivered_packets == 1);
+        quicly_flexicast_flow_free(flow);
+    }
+}
+
+static void test_duplicate_ack_delivery_clock(void)
+{
+    quicly_flexicast_cc_type_t *types[] = {&quicly_flexicast_cc_type_multicast, &quicly_flexicast_cc_type_adaptive};
+    for (size_t t = 0; t != sizeof(types) / sizeof(types[0]); ++t) {
+        uint64_t delivery_rate = 0;
+        for (unsigned replay = 0; replay != 2; ++replay) {
+            quicly_flexicast_flow_t *flow = create_regression_flow(types[t]);
+            uint8_t packet[256], payload[100] = {0};
+            uint64_t pn;
+            size_t size, acked, lost, completed;
+            quicly_flexicast_member_stats_t stats;
+            ok(quicly_flexicast_attach_at(flow, 1, 100) == QUICLY_FLEXICAST_OK);
+            for (unsigned i = 0; i != 2; ++i)
+                ok(quicly_flexicast_send_datagram_at(flow, ptls_iovec_init(payload, sizeof(payload)), packet, sizeof(packet), &size,
+                                                     &pn, 100 + i) == QUICLY_FLEXICAST_OK);
+            quicly_ack_frame_t ack = {.largest_acknowledged = 0, .smallest_acknowledged = 0, .ack_block_lengths = {1}};
+            ok(quicly_flexicast_ack_frame_at(flow, 1, &ack, &acked, &lost, &completed, 200) == QUICLY_FLEXICAST_OK);
+            if (replay) {
+                ok(quicly_flexicast_ack_frame_at(flow, 1, &ack, &acked, &lost, &completed, 299) == QUICLY_FLEXICAST_OK);
+                ok(acked == 0 && lost == 0 && completed == 0);
+                ok(quicly_flexicast_get_member_stats(flow, 1, &stats) == QUICLY_FLEXICAST_OK);
+                ok(stats.last_feedback_at == 200 && stats.feedback_epoch == 1);
+            }
+            ack.largest_acknowledged = ack.smallest_acknowledged = 1;
+            ok(quicly_flexicast_ack_frame_at(flow, 1, &ack, &acked, &lost, &completed, 300) == QUICLY_FLEXICAST_OK);
+            ok(quicly_flexicast_get_member_stats(flow, 1, &stats) == QUICLY_FLEXICAST_OK);
+            ok(stats.delivery_rate_bytes_per_second == size * 10 && stats.feedback_epoch == 2);
+            if (replay)
+                ok(stats.delivery_rate_bytes_per_second == delivery_rate);
+            else
+                delivery_rate = stats.delivery_rate_bytes_per_second;
+            quicly_flexicast_flow_free(flow);
+        }
+    }
+}
+
+static void test_suspend_legacy_controller(void)
+{
+    struct st_quicly_flexicast_cc_type_t type = quicly_flexicast_cc_type_multicast;
+    quicly_flexicast_cc_config_t config = regression_config();
+    quicly_flexicast_cc_t *cc;
+    quicly_flexicast_cc_output_t output;
+    type.on_member_suspended = NULL;
+    ok(quicly_flexicast_cc_create(&cc, &type, &config, 100) == 0);
+    quicly_flexicast_cc_on_member_added(cc, 1, 100);
+    quicly_flexicast_cc_on_member_suspended(cc, 1, 200);
+    quicly_flexicast_cc_get_output(cc, &output);
+    ok(output.next_timeout == INT64_MAX && output.limiting_member_id == 0);
+    quicly_flexicast_cc_on_member_added(cc, 1, 300);
+    quicly_flexicast_cc_get_output(cc, &output);
+    ok(output.next_timeout == 400 && output.limiting_member_id == 1);
+    quicly_flexicast_cc_free(cc);
+}
+
 void test_flexicast_cc_regressions(void)
 {
     subtest("multicast-zero-time", test_multicast_zero_time);
@@ -223,4 +356,7 @@ void test_flexicast_cc_regressions(void)
     subtest("adaptive-hint-epochs", test_adaptive_hint_epochs);
     subtest("adaptive-maximum-rate-recovery", test_adaptive_maximum_rate_recovery);
     subtest("member-map-collisions", test_member_map_collisions);
+    subtest("rekey-inactive-members", test_rekey_inactive_members);
+    subtest("duplicate-ack-delivery-clock", test_duplicate_ack_delivery_clock);
+    subtest("suspend-legacy-controller", test_suspend_legacy_controller);
 }

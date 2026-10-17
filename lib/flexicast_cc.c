@@ -142,6 +142,21 @@ void quicly_flexicast_cc_on_member_removed(quicly_flexicast_cc_t *cc, uint64_t m
     record_transition(cc, previous_rate);
 }
 
+void quicly_flexicast_cc_on_member_suspended(quicly_flexicast_cc_t *cc, uint64_t member_id, int64_t now)
+{
+    uint64_t previous_rate;
+    if (cc == NULL || member_id == 0)
+        return;
+    previous_rate = cc->output.rate_bytes_per_second;
+    cc->output.reason = QUICLY_FLEXICAST_CC_REASON_NONE;
+    if (cc->type->on_member_suspended != NULL)
+        cc->type->on_member_suspended(cc->state, member_id, now, &cc->output);
+    else if (cc->type->on_member_removed != NULL)
+        cc->type->on_member_removed(cc->state, member_id, now, &cc->output);
+    normalize_output(cc);
+    record_transition(cc, previous_rate);
+}
+
 void quicly_flexicast_cc_on_epoch_reset(quicly_flexicast_cc_t *cc, int64_t now)
 {
     uint64_t previous_rate;

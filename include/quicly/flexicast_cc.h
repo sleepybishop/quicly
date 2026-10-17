@@ -131,6 +131,10 @@ struct st_quicly_flexicast_cc_type_t {
     void (*on_feedback)(void *state, const quicly_flexicast_feedback_t *feedback, quicly_flexicast_cc_output_t *output);
     void (*on_timeout)(void *state, int64_t now, quicly_flexicast_cc_output_t *output);
     void (*set_hints)(void *state, const quicly_flexicast_cc_hints_t *hints, int64_t now, quicly_flexicast_cc_output_t *output);
+    /** Stops considering a member for rate selection and feedback deadlines,
+     * retaining its path history for a later on_member_added. If omitted,
+     * the wrapper falls back to on_member_removed. */
+    void (*on_member_suspended)(void *state, uint64_t member_id, int64_t now, quicly_flexicast_cc_output_t *output);
 };
 
 int quicly_flexicast_cc_create(quicly_flexicast_cc_t **cc, quicly_flexicast_cc_type_t *type,
@@ -138,6 +142,7 @@ int quicly_flexicast_cc_create(quicly_flexicast_cc_t **cc, quicly_flexicast_cc_t
 void quicly_flexicast_cc_free(quicly_flexicast_cc_t *cc);
 void quicly_flexicast_cc_on_member_added(quicly_flexicast_cc_t *cc, uint64_t member_id, int64_t now);
 void quicly_flexicast_cc_on_member_removed(quicly_flexicast_cc_t *cc, uint64_t member_id, int64_t now);
+void quicly_flexicast_cc_on_member_suspended(quicly_flexicast_cc_t *cc, uint64_t member_id, int64_t now);
 void quicly_flexicast_cc_on_epoch_reset(quicly_flexicast_cc_t *cc, int64_t now);
 void quicly_flexicast_cc_on_feedback(quicly_flexicast_cc_t *cc, const quicly_flexicast_feedback_t *feedback);
 void quicly_flexicast_cc_on_timeout(quicly_flexicast_cc_t *cc, int64_t now);

@@ -21,6 +21,7 @@ typedef struct st_multicast_member_t {
     int64_t last_ecn_reduction;
     uint32_t unanswered_feedback_probes;
     int rtt_congested;
+    int active;
     size_t rate_heap_index;
     size_t timeout_heap_index;
 } multicast_member_t;
@@ -39,6 +40,8 @@ typedef enum en_multicast_heap_type_t { MULTICAST_HEAP_RATE, MULTICAST_HEAP_TIME
 static int64_t member_timeout(const multicast_state_t *state, const multicast_member_t *member)
 {
     int64_t base;
+    if (!member->active)
+        return INT64_MAX;
     base = member->last_feedback > member->last_timeout_probe ? member->last_feedback : member->last_timeout_probe;
     return base > INT64_MAX - state->config.feedback_timeout_msec ? INT64_MAX : base + state->config.feedback_timeout_msec;
 }
@@ -56,6 +59,8 @@ static size_t *member_heap_index(multicast_member_t *member, multicast_heap_type
 static int heap_less(const multicast_state_t *state, multicast_heap_type_t type, size_t left_slot, size_t right_slot)
 {
     const multicast_member_t *left = state->members + left_slot, *right = state->members + right_slot;
+    if (left->active != right->active)
+        return left->active;
     if (type == MULTICAST_HEAP_RATE) {
         if (left->rate != right->rate)
             return left->rate < right->rate;
@@ -139,13 +144,23 @@ static multicast_member_t *find_member(multicast_state_t *state, uint64_t id)
 static multicast_member_t *add_member(multicast_state_t *state, uint64_t id, int64_t now)
 {
     multicast_member_t *member = find_member(state, id);
-    if (member != NULL)
+    if (member != NULL) {
+        if (!member->active) {
+            member->active = 1;
+            member->last_feedback = now;
+            member->last_timeout_probe = now;
+            member->unanswered_feedback_probes = 0;
+            heap_update(state, MULTICAST_HEAP_RATE, member);
+            heap_update(state, MULTICAST_HEAP_TIMEOUT, member);
+        }
         return member;
+    }
     if (state->num_members == state->config.maximum_members)
         return NULL;
     flexicast_member_map_set(&state->member_map, id, state->num_members);
     member = state->members + state->num_members++;
     member->id = id;
+    member->active = 1;
     member->rate = clamp_rate(&state->config, state->config.startup_rate_bytes_per_second);
     member->last_feedback = now;
     member->last_timeout_probe = now;
@@ -159,8 +174,12 @@ static multicast_member_t *add_member(multicast_state_t *state, uint64_t id, int
 static void update_output(multicast_state_t *state, int64_t now, uint32_t reason, quicly_flexicast_cc_output_t *output)
 {
     multicast_member_t *limiting = state->num_members != 0 ? state->members + state->rate_heap[0] : NULL;
+    if (limiting != NULL && !limiting->active)
+        limiting = NULL;
     int64_t next_timeout = state->num_members != 0 ? member_timeout(state, state->members + state->timeout_heap[0]) : INT64_MAX;
-    uint64_t rate = limiting != NULL ? limiting->rate : state->config.startup_rate_bytes_per_second;
+    uint64_t rate = limiting != NULL          ? limiting->rate
+                    : state->num_members != 0 ? output->rate_bytes_per_second
+                                              : state->config.startup_rate_bytes_per_second;
     rate = clamp_rate(&state->config, rate);
     uint64_t burst = burst_size(&state->config, rate);
     uint64_t minimum_burst = (uint64_t)state->config.maximum_datagram_size * 4;
@@ -223,6 +242,18 @@ static void multicast_on_member_removed(void *_state, uint64_t member_id, int64_
         }
         memset(state->members + last, 0, sizeof(state->members[last]));
         --state->num_members;
+    }
+    update_output(state, now, QUICLY_FLEXICAST_CC_REASON_NONE, output);
+}
+
+static void multicast_on_member_suspended(void *_state, uint64_t member_id, int64_t now, quicly_flexicast_cc_output_t *output)
+{
+    multicast_state_t *state = _state;
+    multicast_member_t *member = find_member(state, member_id);
+    if (member != NULL && member->active) {
+        member->active = 0;
+        heap_update(state, MULTICAST_HEAP_RATE, member);
+        heap_update(state, MULTICAST_HEAP_TIMEOUT, member);
     }
     update_output(state, now, QUICLY_FLEXICAST_CC_REASON_NONE, output);
 }
@@ -331,6 +362,7 @@ quicly_flexicast_cc_type_t quicly_flexicast_cc_type_multicast = {
     .dispose = multicast_dispose,
     .on_member_added = multicast_on_member_added,
     .on_member_removed = multicast_on_member_removed,
+    .on_member_suspended = multicast_on_member_suspended,
     .on_epoch_reset = multicast_on_epoch_reset,
     .on_feedback = multicast_on_feedback,
     .on_timeout = multicast_on_timeout,

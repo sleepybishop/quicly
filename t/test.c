@@ -352,6 +352,76 @@ static void test_flexicast_control_receive(void)
     ok(handle_path_ack_frame(&conn, &payload) == QUICLY_TRANSPORT_ERROR_PROTOCOL_VIOLATION);
 }
 
+struct st_test_flexicast_announce_order_t {
+    quicly_receive_flexicast_frame_t super;
+    uint64_t latest_sequence;
+    size_t stale, unsupported, applied;
+    uint16_t udp_port;
+    int initialized;
+};
+
+static quicly_error_t test_receive_flexicast_announce_order(quicly_receive_flexicast_frame_t *_self, quicly_conn_t *conn,
+                                                            const quicly_flexicast_frame_t *frame)
+{
+    struct st_test_flexicast_announce_order_t *self = (void *)_self;
+    const quicly_flexicast_announce_frame_t *announce = &frame->data.announce;
+    assert(frame->type == QUICLY_FRAME_TYPE_FC_ANNOUNCE);
+    if (self->initialized && announce->sequence <= self->latest_sequence) {
+        ++self->stale;
+        return 0;
+    }
+    self->initialized = 1;
+    self->latest_sequence = announce->sequence;
+    if ((announce->ip_version == 4 && !conn->super.ctx->transport_params.flexicast_support.ipv4) ||
+        (announce->ip_version == 6 && !conn->super.ctx->transport_params.flexicast_support.ipv6)) {
+        ++self->unsupported;
+        return 0;
+    }
+    ++self->applied;
+    self->udp_port = announce->udp_port;
+    return 0;
+}
+
+static void test_flexicast_announce_order(void)
+{
+    struct st_test_flexicast_announce_order_t observer = {.super = {test_receive_flexicast_announce_order}};
+    quicly_context_t ctx = quic_ctx;
+    ctx.transport_params.enable_multipath = 1;
+    ctx.transport_params.flexicast_support.ipv4 = 1;
+    ctx.transport_params.flexicast_support.ipv6 = 0;
+    ctx.receive_flexicast_frame = &observer.super;
+    quicly_conn_t conn = {0};
+    conn.super.ctx = &ctx;
+    conn.super.remote.transport_params.enable_multipath = 1;
+    conn.super.remote.transport_params.flexicast_support.ipv4 = 1;
+    quicly_flexicast_announce_frame_t announce = {.flow_id = {.len = 1, .bytes = {1}}, .ip_version = 4, .udp_port = 443};
+    const struct {
+        uint64_t sequence;
+        uint8_t ip_version;
+    } inputs[] = {{10, 4}, {9, 6}, {10, 6}, {11, 6}, {12, 4}};
+    uint8_t encoded[128];
+    size_t size;
+    uint64_t offending_type;
+    int ack_only, probe_only;
+    for (size_t i = 0; i != PTLS_ELEMENTSOF(inputs); ++i) {
+        announce.sequence = inputs[i].sequence;
+        announce.ip_version = inputs[i].ip_version;
+        announce.udp_port = 443 + i;
+        ok(quicly_flexicast_encode_announce_frame(encoded, sizeof(encoded), &announce, &size) == 0);
+        ok(handle_payload(&conn, QUICLY_EPOCH_1RTT, 0, NULL, encoded, size, &offending_type, &ack_only, &probe_only) == 0);
+        if (i != 0 && i != PTLS_ELEMENTSOF(inputs) - 1)
+            ok(observer.udp_port == 443 && observer.applied == 1);
+    }
+    ok(observer.stale == 2 && observer.unsupported == 1 && observer.applied == 2);
+    ok(observer.latest_sequence == 12 && observer.udp_port == 447);
+
+    /* Invalid IP versions remain frame-encoding errors, independent of the application's sequence handling. */
+    encoded[7] = 5; /* four-byte type, length, one-byte flow ID, one-byte sequence */
+    ok(handle_payload(&conn, QUICLY_EPOCH_1RTT, 0, NULL, encoded, size, &offending_type, &ack_only, &probe_only) ==
+       QUICLY_TRANSPORT_ERROR_FRAME_ENCODING);
+    ok(observer.applied == 2);
+}
+
 static void test_egress_selection(void)
 {
     quicly_context_t ctx = quic_ctx;
@@ -1964,6 +2034,39 @@ static void test_flexicast_control_exchange(void)
     quicly_free(server);
     quicly_free_default_cid_encryptor(quic_ctx.cid_encryptor);
     quic_ctx = saved_ctx;
+}
+
+static void test_flexicast_receive_error(void)
+{
+    const struct {
+        int result;
+        quicly_error_t error;
+    } fatal[] = {{QUICLY_FLEXICAST_ERROR_PROTOCOL_VIOLATION, QUICLY_TRANSPORT_ERROR_PROTOCOL_VIOLATION},
+                 {QUICLY_FLEXICAST_ERROR_FRAME_ENCODING, QUICLY_TRANSPORT_ERROR_FRAME_ENCODING},
+                 {QUICLY_FLEXICAST_ERROR_AEAD_LIMIT_REACHED, QUICLY_TRANSPORT_ERROR_AEAD_LIMIT_REACHED}};
+    const int packet_local[] = {QUICLY_FLEXICAST_OK, QUICLY_FLEXICAST_ERROR_INVALID, QUICLY_FLEXICAST_ERROR_CRYPTO,
+                                QUICLY_FLEXICAST_ERROR_WRONG_FLOW, QUICLY_FLEXICAST_ERROR_REPLAY};
+    ok(quicly_flexicast_handle_receive_error(NULL, QUICLY_FLEXICAST_ERROR_PROTOCOL_VIOLATION) == QUICLY_TRANSPORT_ERROR_INTERNAL);
+    for (size_t i = 0; i != PTLS_ELEMENTSOF(fatal); ++i) {
+        quicly_conn_t *client, *server;
+        test_setup_connected_peers(&client, &server);
+        for (size_t j = 0; j != PTLS_ELEMENTSOF(packet_local); ++j) {
+            ok(quicly_flexicast_handle_receive_error(client, packet_local[j]) == 0);
+            ok(quicly_get_state(client) == QUICLY_STATE_CONNECTED);
+        }
+        ok(quicly_flexicast_handle_receive_error(client, fatal[i].result) == 0);
+        ok(quicly_get_state(client) == QUICLY_STATE_CLOSING);
+        ok(quicly_get_close_reason(client, NULL, NULL, NULL) == fatal[i].error);
+        ok(quicly_flexicast_handle_receive_error(client, fatal[i].result) == 0);
+        ok(quicly_get_close_reason(client, NULL, NULL, NULL) == fatal[i].error);
+        ok(transmit(client, server) == 1);
+        ok(quicly_get_state(server) == QUICLY_STATE_DRAINING);
+        int is_remote = 0;
+        ok(quicly_get_close_reason(server, NULL, NULL, &is_remote) == fatal[i].error);
+        ok(is_remote);
+        quicly_free(client);
+        quicly_free(server);
+    }
 }
 
 static size_t transmit_multipath(quicly_conn_t *src, quicly_conn_t *dst);
@@ -4173,7 +4276,9 @@ int main(int argc, char **argv)
         subtest("flexicast", test_flexicast);
         subtest("flexicast-control-queue", test_flexicast_control_queue);
         subtest("flexicast-control-receive", test_flexicast_control_receive);
+        subtest("flexicast-announce-order", test_flexicast_announce_order);
         subtest("flexicast-control-exchange", test_flexicast_control_exchange);
+        subtest("flexicast-receive-error", test_flexicast_receive_error);
         goto Exit;
     }
 
@@ -4234,7 +4339,9 @@ int main(int argc, char **argv)
     subtest("flexicast", test_flexicast);
     subtest("flexicast-control-queue", test_flexicast_control_queue);
     subtest("flexicast-control-receive", test_flexicast_control_receive);
+    subtest("flexicast-announce-order", test_flexicast_announce_order);
     subtest("flexicast-control-exchange", test_flexicast_control_exchange);
+    subtest("flexicast-receive-error", test_flexicast_receive_error);
 
     subtest("retransmit", test_retransmit);
     subtest("retransmit-max-stream-data-lower-window", test_retransmit_max_stream_data_lower_window);
