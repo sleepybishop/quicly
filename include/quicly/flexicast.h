@@ -39,7 +39,7 @@ extern "C" {
 #define QUICLY_FLEXICAST_DEFAULT_ACK_FREQUENCY 8
 #define QUICLY_FLEXICAST_MAX_ACK_ENCODED_SIZE 2048
 
-/* draft-navarre-quic-flexicast-02 leaves these frame types as TBD. Keeping
+/* draft-navarre-quic-flexicast-03 leaves these frame types as TBD. Keeping
  * provisional values here makes replacement mechanical when values exist. */
 #define QUICLY_FRAME_TYPE_FC_ANNOUNCE 0x173e00
 #define QUICLY_FRAME_TYPE_FC_STATE 0x173e01
@@ -47,7 +47,9 @@ extern "C" {
 
 #define QUICLY_FLEXICAST_STATE_JOIN 1
 #define QUICLY_FLEXICAST_STATE_LEAVE 2
-#define QUICLY_FLEXICAST_STATE_READY 3
+#define QUICLY_FLEXICAST_STATE_LISTEN 3
+/* Source compatibility with draft -02; the wire action is unchanged in -03. */
+#define QUICLY_FLEXICAST_STATE_READY QUICLY_FLEXICAST_STATE_LISTEN
 
 /* This is an experimental DATAGRAM-only shared-path primitive. Its packet
  * format is intentionally private until Flexicast QUIC wire details settle. */
@@ -135,9 +137,12 @@ typedef struct st_quicly_flexicast_member_stats_t {
 } quicly_flexicast_member_stats_t;
 
 int quicly_flexicast_flow_create(quicly_flexicast_flow_t **flow, const quicly_flexicast_config_t *config);
-/** Replaces the traffic keys and packet epoch in place. Congestion-controller
- * and known-member measurements are retained, while active delivery
- * membership, replay state, ACK ranges, and outstanding packets are reset. */
+/** Replaces the traffic keys and packet epoch in place. The first packet number
+ * must not reuse any packet number previously sent or received on this flow:
+ * PATH_ACK has no key-epoch identifier. Congestion-controller and cumulative
+ * known-member measurements are retained, while active delivery membership,
+ * replay state, ACK ranges, outstanding packets, and epoch-specific feedback
+ * state are reset. */
 int quicly_flexicast_flow_rekey(quicly_flexicast_flow_t *flow, ptls_iovec_t traffic_secret, uint64_t first_packet_number,
                                 int64_t now);
 void quicly_flexicast_flow_free(quicly_flexicast_flow_t *flow);
@@ -174,8 +179,9 @@ int quicly_flexicast_receive_datagram_at(quicly_flexicast_flow_t *flow, uint8_t 
 /** Returns INT64_MAX when there is no pending feedback. */
 int64_t quicly_flexicast_get_ack_deadline(const quicly_flexicast_flow_t *flow);
 int quicly_flexicast_ack_is_due(const quicly_flexicast_flow_t *flow, int64_t now);
-/** Encodes and reliably queues all pending receive ranges on the authenticated
- * unicast connection. force bypasses ACK-frequency and timer checks. */
+/** Encodes and reliably queues up to QUICLY_MAX_ACK_BLOCKS pending receive
+ * ranges on the authenticated unicast connection. Remaining ranges stay due
+ * for the next call. force bypasses ACK-frequency and timer checks. */
 int quicly_flexicast_send_pending_ack(quicly_flexicast_flow_t *flow, quicly_conn_t *conn, int64_t now, int force);
 
 /* Helpers used by quicly's reliable-control queue implementation. */
@@ -187,7 +193,9 @@ void quicly_flexicast_ack_sent(quicly_flexicast_flow_t *flow);
  * paths. complete is set once every currently attached member acknowledged. */
 int quicly_flexicast_ack(quicly_flexicast_flow_t *flow, uint64_t member_id, uint64_t packet_number, int *complete);
 int quicly_flexicast_ack_at(quicly_flexicast_flow_t *flow, uint64_t member_id, uint64_t packet_number, int *complete, int64_t now);
-/** Applies all newly acknowledged packets in a decoded PATH_ACK to one member. */
+/** Applies all newly acknowledged packets in a decoded PATH_ACK to one member.
+ * frame->ack_delay is in milliseconds, as delivered by receive_flexicast_ack;
+ * callers using the raw frame decoder must first apply the peer's ACK-delay exponent. */
 int quicly_flexicast_ack_frame(quicly_flexicast_flow_t *flow, uint64_t member_id, const quicly_ack_frame_t *frame,
                                size_t *num_acked, size_t *num_completed);
 /** Timed variant that also reports packets retired as lost. */

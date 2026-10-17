@@ -5,6 +5,27 @@ Quicly is an IETF [QUIC](https://quicwg.github.io/) protocol implementation, wri
 
 The software is licensed under the MIT License.
 
+Flexicast
+---
+
+This branch provides an experimental DATAGRAM-only Flexicast primitive and unicast control-frame callbacks based on
+[draft-navarre-quic-flexicast-03](https://www.ietf.org/archive/id/draft-navarre-quic-flexicast-03.html).
+Draft 03 names FC_STATE action `0x03` `LISTEN`; `QUICLY_FLEXICAST_STATE_LISTEN` is the current API name, and
+`QUICLY_FLEXICAST_STATE_READY` remains an alias for existing draft 02 callers. The action's wire encoding is unchanged.
+
+Enable Multipath and the appropriate `transport_params.flexicast_support` address families on both peers. The application
+handles flow registration, control-frame sequence ordering, JOIN/LISTEN/LEAVE transitions, multicast socket membership,
+and independently generated traffic secrets. Control frames are restricted to their permitted endpoint roles and 1-RTT
+packets. Rekeying retains cumulative member measurements but requires packet numbers to keep increasing so delayed ACKs
+cannot acknowledge packets from a new key epoch. PATH_ACK uses the negotiated QUIC ACK-delay encoding on the wire;
+`receive_flexicast_ack` supplies the delay in milliseconds to the flow feedback API.
+
+The draft still leaves frame and error code assignments and some wire details unspecified. This implementation retains
+provisional FC frame types `0x173e00`–`0x173e02`, transport parameter `0xedf3` with one octet per address-family boolean,
+and the standard QUIC protocol-violation error for FC protocol violations. Its shared-packet format remains private:
+eight-byte numeric flow IDs occupy a namespace above the unicast path-ID limit. These choices do not establish
+interoperability with other Flexicast implementations or provide multicast STREAM reliability.
+
 How to build
 ---
 

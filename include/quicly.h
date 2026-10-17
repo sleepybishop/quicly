@@ -206,9 +206,12 @@ QUICLY_CALLBACK_TYPE(quicly_error_t, stream_open, quicly_stream_t *stream);
  *
  */
 QUICLY_CALLBACK_TYPE(void, receive_datagram_frame, quicly_conn_t *conn, ptls_iovec_t payload);
-/** Called synchronously for FC control frames. Borrowed fields are valid only during the callback. */
+/** Called synchronously for FC control frames. Borrowed fields are valid only during the callback.
+ * The application owns flow registration, per-flow sequence ordering, and membership transitions. */
 QUICLY_CALLBACK_TYPE(quicly_error_t, receive_flexicast_frame, quicly_conn_t *conn, const quicly_flexicast_frame_t *frame);
-/** Receives a PATH_ACK whose path_id identifies a negotiated Flexicast flow. */
+/** Receives a PATH_ACK for the experimental Flexicast flow-ID namespace (above the local unicast path limit).
+ * ack_delay is converted to milliseconds using the peer's ACK-delay exponent before this callback.
+ * The application must validate the flow ID and associate the authenticated connection with a member. */
 QUICLY_CALLBACK_TYPE(quicly_error_t, receive_flexicast_ack, quicly_conn_t *conn, uint64_t flow_id, const quicly_ack_frame_t *frame);
 /**
  * Called when the connection is closed (i.e., when entering the closing or draining state). Otherwise the callback is not called;
@@ -351,7 +354,7 @@ typedef struct st_quicly_transport_parameters_t {
     uint8_t enable_multipath : 1;
     /** multipath extension maximum path ID */
     uint64_t initial_max_path_id;
-    /** address families supported by draft-navarre-quic-flexicast-02 */
+    /** address families supported by draft-navarre-quic-flexicast-03 */
     struct {
         uint8_t ipv4 : 1;
         uint8_t ipv6 : 1;

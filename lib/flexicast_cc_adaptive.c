@@ -102,6 +102,13 @@ static int64_t recovery_deadline(const adaptive_state_t *state, int64_t now)
 static void update_output(adaptive_state_t *state, int64_t now, uint64_t limiting_member, uint32_t reason,
                           quicly_flexicast_cc_output_t *output)
 {
+    /* The aggregate limit remains in effect across feedback and recovery
+     * events. Keep the controller's rate bounded as well as its output. */
+    if (state->hints.aggregate_rate_limit_bytes_per_second != 0 &&
+        state->rate > state->hints.aggregate_rate_limit_bytes_per_second) {
+        state->rate = state->hints.aggregate_rate_limit_bytes_per_second;
+        reason |= QUICLY_FLEXICAST_CC_REASON_RATE_LIMIT;
+    }
     state->rate = clamp_rate(&state->config, state->rate);
     uint64_t burst = burst_size(&state->config, state->rate);
     output->rate_bytes_per_second = state->rate;
@@ -324,7 +331,9 @@ static int near_floor(const adaptive_state_t *state, uint64_t rate)
 static void apply_floor_recovery_growth(adaptive_state_t *state)
 {
     double divisor = sqrt((double)active_senders(state));
-    uint64_t increase = (uint64_t)((double)state->rate / divisor);
+    /* UINT64_MAX rounds to 2^64 as a double. Avoid an out-of-range cast when
+     * a single sender receives the full rate-sized recovery increase. */
+    uint64_t increase = active_senders(state) == 1 ? state->rate : (uint64_t)((double)state->rate / divisor);
     uint64_t candidate = increase_rate(state->rate, increase);
     uint64_t limit = floor_recovery_limit(state);
     if (candidate > limit)
@@ -555,12 +564,22 @@ static void adaptive_set_hints(void *_state, const quicly_flexicast_cc_hints_t *
 {
     adaptive_state_t *state = _state;
     uint32_t reason = QUICLY_FLEXICAST_CC_REASON_HINT;
+    int fresh_load_epoch = hints->external_load_epoch != 0 && hints->external_load_epoch > state->last_external_load_epoch;
+    quicly_flexicast_cc_hints_t previous_hints = state->hints;
     state->hints = *hints;
+    if (hints->external_load_epoch != 0 && !fresh_load_epoch) {
+        /* A repeated or reordered measurement cannot change the load episode
+         * or supply another recovery observation. Other hints remain live. */
+        state->hints.external_load_epoch = previous_hints.external_load_epoch;
+        state->hints.external_load_queued_bytes = previous_hints.external_load_queued_bytes;
+        state->hints.external_load_oldest_age_msec = previous_hints.external_load_oldest_age_msec;
+        state->hints.external_load_fraction_ppm = previous_hints.external_load_fraction_ppm;
+    }
     if (hints->aggregate_rate_limit_bytes_per_second != 0 && state->rate > hints->aggregate_rate_limit_bytes_per_second) {
         state->rate = hints->aggregate_rate_limit_bytes_per_second;
         reason |= QUICLY_FLEXICAST_CC_REASON_RATE_LIMIT;
     }
-    if (hints->external_load_epoch != 0 && hints->external_load_epoch != state->last_external_load_epoch) {
+    if (fresh_load_epoch) {
         state->last_external_load_epoch = hints->external_load_epoch;
         if (hints->external_load_queued_bytes != 0 || hints->external_load_oldest_age_msec != 0 ||
             hints->external_load_fraction_ppm > EXTERNAL_LOAD_CLEAR_PPM) {
@@ -577,12 +596,13 @@ static void adaptive_set_hints(void *_state, const quicly_flexicast_cc_hints_t *
             state->external_load_seen = 0;
             state->external_load_clear_epochs = 0;
         }
-    } else if (hints->external_load_queued_bytes != 0 || hints->external_load_oldest_age_msec != 0) {
+    } else if (hints->external_load_epoch == 0 &&
+               (hints->external_load_queued_bytes != 0 || hints->external_load_oldest_age_msec != 0)) {
         state->external_load_seen = 1;
         state->external_load_clear_epochs = 0;
         reason |= QUICLY_FLEXICAST_CC_REASON_EXTERNAL_LOAD;
     }
-    if (state->floor_recovery_epochs == 0 &&
+    if ((fresh_load_epoch || hints->external_load_epoch == 0) && state->floor_recovery_epochs == 0 &&
         (hints->external_load_queued_bytes != 0 || hints->external_load_oldest_age_msec != 0) &&
         state->rate < external_load_recovery_ceiling(state) && has_recent_feedback(state, now)) {
         uint64_t increase = state->rate;

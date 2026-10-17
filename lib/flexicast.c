@@ -137,7 +137,7 @@ int quicly_flexicast_decode_announce_frame(const uint8_t *src, size_t len, quicl
 static int valid_state_action(uint64_t action)
 {
     return action == QUICLY_FLEXICAST_STATE_JOIN || action == QUICLY_FLEXICAST_STATE_LEAVE ||
-           action == QUICLY_FLEXICAST_STATE_READY;
+           action == QUICLY_FLEXICAST_STATE_LISTEN;
 }
 
 size_t quicly_flexicast_state_frame_capacity(const quicly_flexicast_state_frame_t *frame)
@@ -345,9 +345,10 @@ int quicly_flexicast_flow_create(quicly_flexicast_flow_t **flow, const quicly_fl
     int ret;
 
     if (flow == NULL || config == NULL || config->flow_id == 0 || config->flow_id > PTLS_QUICINT_MAX ||
-        config->first_packet_number > PTLS_QUICINT_MAX || config->cipher_suite == NULL || config->crypto_engine == NULL ||
-        config->crypto_engine->setup_cipher == NULL || config->crypto_engine->encrypt_packet == NULL ||
-        config->traffic_secret.base == NULL || config->traffic_secret.len != config->cipher_suite->hash->digest_size)
+        config->first_packet_number > PTLS_QUICINT_MAX || config->cipher_suite == NULL || config->cipher_suite->hash == NULL ||
+        config->cipher_suite->aead == NULL || config->crypto_engine == NULL || config->crypto_engine->setup_cipher == NULL ||
+        config->crypto_engine->encrypt_packet == NULL || config->traffic_secret.base == NULL ||
+        config->traffic_secret.len != config->cipher_suite->hash->digest_size)
         return QUICLY_FLEXICAST_ERROR_INVALID;
     max_members = config->max_members != 0 ? config->max_members : QUICLY_FLEXICAST_DEFAULT_MAX_MEMBERS;
     if (max_members > QUICLY_FLEXICAST_HARD_MAX_MEMBERS)
@@ -415,6 +416,11 @@ int quicly_flexicast_flow_rekey(quicly_flexicast_flow_t *flow, ptls_iovec_t traf
     if (flow == NULL || traffic_secret.base == NULL || traffic_secret.len != flow->cipher_suite->hash->digest_size ||
         first_packet_number > PTLS_QUICINT_MAX)
         return QUICLY_FLEXICAST_ERROR_INVALID;
+    /* PATH_ACK carries no key generation, and a repeated secret must not
+     * reuse an AEAD nonce. Keep packet numbers unique across rekeys. */
+    if (flow->egress.aead != NULL && (first_packet_number < flow->next_packet_number ||
+                                      (flow->received.initialized && first_packet_number <= flow->received.largest)))
+        return QUICLY_FLEXICAST_ERROR_INVALID;
     if (flow->crypto_engine->setup_cipher(flow->crypto_engine, flow->crypto_conn, QUICLY_EPOCH_1RTT, 1, &egress_hp, &egress_aead,
                                           flow->cipher_suite->aead, flow->cipher_suite->hash, traffic_secret.base) != 0)
         goto Error;
@@ -448,6 +454,9 @@ int quicly_flexicast_flow_rekey(quicly_flexicast_flow_t *flow, ptls_iovec_t traf
             continue;
         flow->members[i].active = 0;
         flow->members[i].loss_cursor = first_packet_number;
+        flow->members[i].stats.largest_acknowledged = 0;
+        flow->members[i].stats.ecn_ce_count = 0;
+        flow->members[i].stats.last_feedback_at = 0;
     }
     /* Feedback for the old packet-number epoch cannot satisfy a deadline in
      * the new one. Preserve learned path rates, but restart controller-local
@@ -666,6 +675,10 @@ static int decode_header(quicly_flexicast_flow_t *flow, uint8_t *packet, size_t 
     }
     expected = flow->received.initialized ? flow->received.largest + 1 : flow->first_packet_number;
     *packet_number = quicly_determine_packet_number(truncated, pn_length * 8, expected);
+    if (*packet_number < flow->first_packet_number)
+        return QUICLY_FLEXICAST_ERROR_REPLAY;
+    if (*packet_number > PTLS_QUICINT_MAX)
+        return QUICLY_FLEXICAST_ERROR_INVALID;
     *payload_from = pn_offset + pn_length;
     plaintext_size = ptls_aead_decrypt(flow->ingress.aead, packet + *payload_from, packet + *payload_from,
                                        packet_size - *payload_from, *packet_number, packet, *payload_from);
@@ -674,26 +687,31 @@ static int decode_header(quicly_flexicast_flow_t *flow, uint8_t *packet, size_t 
     return (int)plaintext_size;
 }
 
-static int update_replay_window(quicly_flexicast_flow_t *flow, uint64_t packet_number)
+static int is_replayed_packet(const quicly_flexicast_flow_t *flow, uint64_t packet_number)
+{
+    if (!flow->received.initialized || packet_number > flow->received.largest)
+        return 0;
+    uint64_t distance = flow->received.largest - packet_number;
+    return distance >= QUICLY_FLEXICAST_REPLAY_WINDOW || (flow->received.mask & (UINT64_C(1) << distance)) != 0;
+}
+
+static void update_replay_window(quicly_flexicast_flow_t *flow, uint64_t packet_number)
 {
     uint64_t distance;
     if (!flow->received.initialized) {
         flow->received.initialized = 1;
         flow->received.largest = packet_number;
         flow->received.mask = 1;
-        return QUICLY_FLEXICAST_OK;
+        return;
     }
     if (packet_number > flow->received.largest) {
         distance = packet_number - flow->received.largest;
         flow->received.mask = distance >= QUICLY_FLEXICAST_REPLAY_WINDOW ? 1 : (flow->received.mask << distance) | 1;
         flow->received.largest = packet_number;
-        return QUICLY_FLEXICAST_OK;
+        return;
     }
     distance = flow->received.largest - packet_number;
-    if (distance >= QUICLY_FLEXICAST_REPLAY_WINDOW || (flow->received.mask & ((uint64_t)1 << distance)) != 0)
-        return QUICLY_FLEXICAST_ERROR_REPLAY;
     flow->received.mask |= (uint64_t)1 << distance;
-    return QUICLY_FLEXICAST_OK;
 }
 
 int quicly_flexicast_receive_datagram_at(quicly_flexicast_flow_t *flow, uint8_t *packet, size_t packet_size, ptls_iovec_t *payload,
@@ -702,7 +720,7 @@ int quicly_flexicast_receive_datagram_at(quicly_flexicast_flow_t *flow, uint8_t 
     const uint8_t *src, *end;
     uint64_t frame_type;
     size_t payload_from;
-    int plaintext_size, ret;
+    int plaintext_size;
     quicly_datagram_frame_t frame;
 
     if (flow == NULL || packet == NULL || payload == NULL || packet_number == NULL)
@@ -718,13 +736,16 @@ int quicly_flexicast_receive_datagram_at(quicly_flexicast_flow_t *flow, uint8_t 
         ++src;
     if (src != end)
         return QUICLY_FLEXICAST_ERROR_INVALID;
-    int is_new_largest = !flow->received.initialized || *packet_number > flow->received.largest;
-    if ((ret = update_replay_window(flow, *packet_number)) != QUICLY_FLEXICAST_OK)
-        return ret;
-    if (is_new_largest)
-        flow->received.largest_received_at = now;
+    if (is_replayed_packet(flow, *packet_number))
+        return QUICLY_FLEXICAST_ERROR_REPLAY;
+    int is_pending_largest = flow->received.ack_ranges.num_ranges == 0 ||
+                             *packet_number >= flow->received.ack_ranges.ranges[flow->received.ack_ranges.num_ranges - 1].end;
     if (quicly_ranges_add(&flow->received.ack_ranges, *packet_number, *packet_number + 1) != 0)
         return QUICLY_FLEXICAST_ERROR_NO_MEMORY;
+    /* Do not consume replay state if allocating the ACK range failed. */
+    update_replay_window(flow, *packet_number);
+    if (is_pending_largest)
+        flow->received.largest_received_at = now;
     if (flow->received.ack_eliciting_since_ack++ == 0)
         flow->received.ack_pending_since = now;
     *payload = frame.payload;
@@ -764,18 +785,23 @@ int quicly_flexicast_encode_pending_ack(quicly_flexicast_flow_t *flow, uint8_t *
     uint8_t *end;
     uint64_t ecn_counts[3] = {0};
     uint64_t ack_delay = 0;
-    if (flow == NULL || dst == NULL || encoded_size == NULL || flow->received.ack_ranges.num_ranges == 0 ||
-        flow->received.ack_ranges.num_ranges > QUICLY_MAX_ACK_BLOCKS || capacity < 2)
+    quicly_ranges_t ranges;
+    if (flow == NULL || dst == NULL || encoded_size == NULL || flow->received.ack_ranges.num_ranges == 0 || capacity < 2)
         return QUICLY_FLEXICAST_ERROR_INVALID;
-    if (now > flow->received.largest_received_at && flow->received.largest_received_at > 0) {
-        ack_delay = (uint64_t)(now - flow->received.largest_received_at);
+    ranges = flow->received.ack_ranges;
+    /* A receive burst can accumulate more ranges than fit in one ACK. Send
+     * the oldest batch first, retaining the remainder for the next call. */
+    if (ranges.num_ranges > QUICLY_MAX_ACK_BLOCKS)
+        ranges.num_ranges = QUICLY_MAX_ACK_BLOCKS;
+    if (ranges.num_ranges == flow->received.ack_ranges.num_ranges && now > flow->received.largest_received_at) {
+        ack_delay = (uint64_t)now - (uint64_t)flow->received.largest_received_at;
         if (ack_delay > flow->received.ack_delay_msec)
             ack_delay = flow->received.ack_delay_msec;
     }
-    /* Flexicast PATH_ACK encodes this extension-owned value directly in
-     * milliseconds; it does not use the connection ACK-delay exponent. */
-    if ((end = quicly_encode_path_ack_frame(dst, dst + capacity - 1, flow->flow_id, &flow->received.ack_ranges, ecn_counts,
-                                            ack_delay)) == NULL)
+    /* PATH_ACK uses the ACK-delay exponent advertised on the authenticated
+     * unicast connection, with microseconds as its unscaled unit. */
+    ack_delay = (ack_delay * 1000) >> QUICLY_LOCAL_ACK_DELAY_EXPONENT;
+    if ((end = quicly_encode_path_ack_frame(dst, dst + capacity - 1, flow->flow_id, &ranges, ecn_counts, ack_delay)) == NULL)
         return QUICLY_FLEXICAST_ERROR_BUFFER_TOO_SMALL;
     *end++ = QUICLY_FRAME_TYPE_PING;
     *encoded_size = end - dst;
@@ -787,6 +813,11 @@ void quicly_flexicast_ack_sent(quicly_flexicast_flow_t *flow)
     if (flow == NULL)
         return;
     ++flow->received.ack_frames_sent;
+    if (flow->received.ack_ranges.num_ranges > QUICLY_MAX_ACK_BLOCKS) {
+        quicly_ranges_drop_by_range_indices(&flow->received.ack_ranges, 0, QUICLY_MAX_ACK_BLOCKS);
+        flow->received.ack_eliciting_since_ack = flow->received.ack_frequency;
+        return;
+    }
     flow->received.ack_ranges.num_ranges = 0;
     flow->received.ack_eliciting_since_ack = 0;
     flow->received.ack_pending_since = 0;
@@ -806,7 +837,7 @@ static void update_rtt(quicly_flexicast_member_stats_t *stats, const quicly_flex
     sample = clamp_msec((uint64_t)(now - sent->sent_at));
     if (stats->minimum_rtt_msec == 0 || sample < stats->minimum_rtt_msec)
         stats->minimum_rtt_msec = sample;
-    if ((uint64_t)sample > (uint64_t)stats->minimum_rtt_msec + ack_delay_msec)
+    if ((uint64_t)sample >= (uint64_t)stats->minimum_rtt_msec + ack_delay_msec)
         sample -= ack_delay_msec;
     stats->latest_rtt_msec = sample;
     if (stats->smoothed_rtt_msec == 0)
@@ -823,7 +854,9 @@ static int acknowledge_packet(quicly_flexicast_flow_t *flow, int member_index, u
 
     if (sent->pending_count == 0 || sent->packet_number != packet_number || !sent_has_member(flow, sent, (size_t)member_index))
         return 0;
-    if (feedback->acked_packets == 0)
+    /* ACK delay refers to the frame's largest packet. An older newly ACKed
+     * packet cannot provide an RTT sample when that largest was already ACKed. */
+    if (packet_number == feedback->largest_acknowledged)
         update_rtt(stats, sent, now, feedback->ack_delay_msec);
     (void)sent_clear_member(flow, sent, (size_t)member_index);
     ++feedback->acked_packets;
@@ -989,6 +1022,10 @@ int quicly_flexicast_ack_frame_at(quicly_flexicast_flow_t *flow, uint64_t member
     *num_acked = 0;
     *num_lost = 0;
     *num_completed = 0;
+    /* Reliably queued feedback from the previous key generation can arrive
+     * after FC_KEY. It must not update this epoch's CE count or liveness. */
+    if (frame->largest_acknowledged < flow->first_packet_number)
+        return QUICLY_FLEXICAST_OK;
     previous_feedback_at = flow->members[member_index].stats.last_feedback_at;
     largest = frame->largest_acknowledged;
     for (uint64_t i = 0; i <= frame->num_gaps; ++i) {
