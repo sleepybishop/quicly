@@ -990,6 +990,26 @@ static quicly_error_t on_invalid_ack(quicly_sentmap_t *map, const quicly_sent_pa
     return 0;
 }
 
+static int next_grease_quic_bit(ptls_context_t *tlsctx)
+{
+    static __thread struct {
+        uint64_t bits;
+        unsigned remaining;
+        void (*random_bytes)(void *, size_t);
+    } cached_rand;
+
+    /* consume every random bit, amortizing the RNG call across 64 packets */
+    if (cached_rand.remaining == 0 || cached_rand.random_bytes != tlsctx->random_bytes) {
+        cached_rand.random_bytes = tlsctx->random_bytes;
+        tlsctx->random_bytes(&cached_rand.bits, sizeof(cached_rand.bits));
+        cached_rand.remaining = sizeof(cached_rand.bits) * 8;
+    }
+    int bit = cached_rand.bits & 1;
+    cached_rand.bits >>= 1;
+    --cached_rand.remaining;
+    return bit;
+}
+
 static uint64_t calc_next_pn_to_skip(ptls_context_t *tlsctx, uint64_t next_pn, uint32_t cwnd, uint64_t mtu)
 {
     static __thread struct {
@@ -4030,12 +4050,8 @@ static quicly_error_t commit_send_packet(quicly_conn_t *conn, quicly_send_contex
     }
     quicly_encode16(s->dst_payload_from - QUICLY_SEND_PN_SIZE, (uint16_t)conn->egress.packet_number);
 
-    if (conn->super.remote.transport_params.grease_quic_bit) {
-        uint8_t rand_val;
-        conn->super.ctx->tls->random_bytes(&rand_val, 1);
-        if ((rand_val & 1) == 0)
-            *s->target.first_byte_at &= ~QUICLY_QUIC_BIT;
-    }
+    if (conn->super.remote.transport_params.grease_quic_bit && !next_grease_quic_bit(conn->super.ctx->tls))
+        *s->target.first_byte_at &= ~QUICLY_QUIC_BIT;
 
     /* encrypt the packet */
     s->dst += s->target.cipher->aead->algo->tag_size;

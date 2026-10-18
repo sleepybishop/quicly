@@ -520,6 +520,28 @@ static size_t decode_packet_once(quicly_context_t *ctx, const uint8_t *bytes, si
     return quicly_decode_packet(ctx, &decoded, bytes, len, &off);
 }
 
+static const uint64_t grease_random_words[] = {0, UINT64_MAX, UINT64_C(0x0123456789abcdef)};
+static size_t grease_random_calls;
+
+static void grease_random_bytes(void *buf, size_t len)
+{
+    ok(len == sizeof(grease_random_words[0]));
+    assert(grease_random_calls < PTLS_ELEMENTSOF(grease_random_words));
+    memcpy(buf, &grease_random_words[grease_random_calls++], len);
+}
+
+static void test_grease_random_bits(void)
+{
+    ptls_context_t tlsctx = {.random_bytes = grease_random_bytes};
+
+    for (size_t word = 0; word != PTLS_ELEMENTSOF(grease_random_words); ++word) {
+        for (unsigned bit = 0; bit != 64; ++bit) {
+            ok(next_grease_quic_bit(&tlsctx) == ((grease_random_words[word] >> bit) & 1));
+            ok(grease_random_calls == word + 1);
+        }
+    }
+}
+
 static void test_grease_quic_bit(void)
 {
     static const uint8_t version_negotiation[] = {0x80, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1};
@@ -3255,6 +3277,7 @@ int main(int argc, char **argv)
     subtest("test-retry-aead", test_retry_aead);
     subtest("transport-parameters", test_transport_parameters);
     subtest("grease-quic-bit", test_grease_quic_bit);
+    subtest("grease-random-bits", test_grease_random_bits);
     subtest("cid", test_cid);
     subtest("simple", test_simple);
     subtest("stream-concurrency", test_stream_concurrency);
