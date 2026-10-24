@@ -68,11 +68,11 @@ static void test_time_detection(void)
 
     /* commit 3 packets (pn=0..2); check that loss timer is not active */
     ok(quicly_sentmap_prepare(&loss.sentmap, 0, now, QUICLY_EPOCH_INITIAL) == 0);
-    quicly_sentmap_commit(&loss.sentmap, 10, 0, 0);
+    quicly_sentmap_commit(&loss.sentmap, 10, 0);
     ok(quicly_sentmap_prepare(&loss.sentmap, 1, now, QUICLY_EPOCH_INITIAL) == 0);
-    quicly_sentmap_commit(&loss.sentmap, 10, 0, 0);
+    quicly_sentmap_commit(&loss.sentmap, 10, 0);
     ok(quicly_sentmap_prepare(&loss.sentmap, 2, now, QUICLY_EPOCH_INITIAL) == 0);
-    quicly_sentmap_commit(&loss.sentmap, 10, 0, 0);
+    quicly_sentmap_commit(&loss.sentmap, 10, 0);
     ok(quicly_loss_detect_loss(&loss, now, quicly_spec_context.transport_params.max_ack_delay, 0, on_loss_detected) == 0);
     ok(loss.loss_time == INT64_MAX);
 
@@ -112,13 +112,13 @@ static void test_pn_detection(void)
 
     /* commit 4 packets (pn=0..3); check that loss timer is not active */
     ok(quicly_sentmap_prepare(&loss.sentmap, 0, now, QUICLY_EPOCH_INITIAL) == 0);
-    quicly_sentmap_commit(&loss.sentmap, 10, 0, 0);
+    quicly_sentmap_commit(&loss.sentmap, 10, 0);
     ok(quicly_sentmap_prepare(&loss.sentmap, 1, now, QUICLY_EPOCH_INITIAL) == 0);
-    quicly_sentmap_commit(&loss.sentmap, 10, 0, 0);
+    quicly_sentmap_commit(&loss.sentmap, 10, 0);
     ok(quicly_sentmap_prepare(&loss.sentmap, 2, now, QUICLY_EPOCH_INITIAL) == 0);
-    quicly_sentmap_commit(&loss.sentmap, 10, 0, 0);
+    quicly_sentmap_commit(&loss.sentmap, 10, 0);
     ok(quicly_sentmap_prepare(&loss.sentmap, 3, now, QUICLY_EPOCH_INITIAL) == 0);
-    quicly_sentmap_commit(&loss.sentmap, 10, 0, 0);
+    quicly_sentmap_commit(&loss.sentmap, 10, 0);
     ok(quicly_loss_detect_loss(&loss, now, quicly_spec_context.transport_params.max_ack_delay, 0, on_loss_detected) == 0);
     ok(loss.loss_time == INT64_MAX);
 
@@ -151,9 +151,9 @@ static void test_slow_cert_verify(void)
 
     /* sent Handshake+1RTT packet */
     ok(quicly_sentmap_prepare(&loss.sentmap, 1, now, QUICLY_EPOCH_HANDSHAKE) == 0);
-    quicly_sentmap_commit(&loss.sentmap, 10, 0, 0);
+    quicly_sentmap_commit(&loss.sentmap, 10, 0);
     ok(quicly_sentmap_prepare(&loss.sentmap, 2, now, QUICLY_EPOCH_1RTT) == 0);
-    quicly_sentmap_commit(&loss.sentmap, 10, 0, 0);
+    quicly_sentmap_commit(&loss.sentmap, 10, 0);
     last_retransmittable_sent_at[QUICLY_EPOCH_HANDSHAKE] = now;
     last_retransmittable_sent_at[QUICLY_EPOCH_1RTT] = now;
     quicly_loss_update_alarm(&loss, now, last_retransmittable_sent_at, (1u << QUICLY_EPOCH_HANDSHAKE) | (1u << QUICLY_EPOCH_1RTT),
@@ -222,28 +222,30 @@ static void test_late_ack_threshold_adjustment(void)
 static void test_overdue_alarm(void)
 {
     quicly_loss_t loss;
+    double last_sent[QUICLY_NUM_EPOCHS] = {INFINITY, INFINITY, INFINITY, 100};
+    unsigned outstanding_epochs = 1u << QUICLY_EPOCH_1RTT;
     quicly_loss_init(&loss, &quicly_spec_context.egress[0].loss, 40, &quicly_spec_context.transport_params.max_ack_delay,
                      &quicly_spec_context.transport_params.ack_delay_exponent);
-    double last_sent[QUICLY_NUM_EPOCHS] = {100, INFINITY, INFINITY, INFINITY};
-    quicly_loss_update_alarm(&loss, 100, last_sent, 1, 1, 0, 1, 1, 1);
+    quicly_loss_update_alarm(&loss, 100, last_sent, outstanding_epochs, 1, 1, 1, 1, 1);
     int64_t deadline = loss.alarm_at;
     ok(deadline > 100);
 
     /* ACK processing and sends on other paths must not indefinitely defer PTO. */
     for (int i = 0; i != 4; ++i) {
         int64_t at = deadline + i * 25;
-        quicly_loss_update_alarm(&loss, at, last_sent, 1, 1, 0, 1, 0, 1);
+        quicly_loss_update_alarm(&loss, at, last_sent, outstanding_epochs, 1, 1, 1, 0, 1);
         ok(loss.alarm_at <= at);
     }
-    quicly_loss_update_alarm(&loss, deadline + 100, last_sent, 1, 1, 0, 1, 1, 1);
+    quicly_loss_update_alarm(&loss, deadline + 100, last_sent, outstanding_epochs, 1, 1, 1, 1, 1);
     ok(loss.alarm_at > deadline + 100);
 
     /* The same rule applies to time-threshold loss detection. */
     loss.loss_time = deadline;
-    quicly_loss_update_alarm(&loss, deadline + 101, last_sent, 1, 1, 0, 1, 0, 1);
+    quicly_loss_update_alarm(&loss, deadline + 101, last_sent, outstanding_epochs, 1, 1, 1, 0, 1);
     ok(loss.alarm_at <= deadline + 101);
-    loss.loss_time = INT64_MAX; /* model discarding the outstanding packet-number space */
-    quicly_loss_update_alarm(&loss, deadline + 101, last_sent, 0, 0, 0, 1, 0, 1);
+    /* Loss detection clears its deadline once no more time-threshold losses remain. With no PTO space, disable the alarm. */
+    loss.loss_time = INT64_MAX;
+    quicly_loss_update_alarm(&loss, deadline + 101, last_sent, 0, 0, 1, 1, 0, 1);
     ok(loss.alarm_at == INT64_MAX);
     ok(loss.loss_time == INT64_MAX);
     quicly_loss_dispose(&loss);
@@ -411,7 +413,7 @@ static void test_submillisecond_timers(void)
     const uint8_t ack_delay_exponent = 3;
     quicly_loss_init(&loss, &quicly_spec_context.egress[0].loss, 20, &max_ack_delay, &ack_delay_exponent);
     ok(quicly_sentmap_prepare(&loss.sentmap, 0, sent_at, QUICLY_EPOCH_1RTT) == 0);
-    quicly_sentmap_commit(&loss.sentmap, 10, 0, 0);
+    quicly_sentmap_commit(&loss.sentmap, 10, 0);
 
     /* ACK of a later packet supplies a 125us RTT, while packet 0 remains outstanding. */
     quicly_loss_on_ack_received(&loss, 1, UINT64_MAX, 2, QUICLY_EPOCH_1RTT, sent_at + 0.125, sent_at, 0,
@@ -483,7 +485,7 @@ static void test_fractional_loss_deadline(void)
         quicly_loss_t loss;
         quicly_loss_init(&loss, &quicly_spec_context.egress[0].loss, 20, &max_ack_delay, &ack_delay_exponent);
         ok(quicly_sentmap_prepare(&loss.sentmap, 0, sent_at, QUICLY_EPOCH_1RTT) == 0);
-        quicly_sentmap_commit(&loss.sentmap, 10, 0, 0);
+        quicly_sentmap_commit(&loss.sentmap, 10, 0);
         quicly_loss_on_ack_received(&loss, 1, UINT64_MAX, 2, QUICLY_EPOCH_1RTT, sent_at + 0.913, sent_at, 0,
                                     QUICLY_LOSS_ACK_RECEIVED_KIND_ACK_ELICITING);
 
@@ -507,7 +509,7 @@ static void test_fractional_sentmap_timers(void)
                      &quicly_spec_context.transport_params.ack_delay_exponent);
     for (uint64_t pn = 0; pn != 2; ++pn) {
         ok(quicly_sentmap_prepare(&loss.sentmap, pn, sent_at, QUICLY_EPOCH_1RTT) == 0);
-        quicly_sentmap_commit(&loss.sentmap, 10, 0, 0);
+        quicly_sentmap_commit(&loss.sentmap, 10, 0);
     }
     quicly_sentmap_iter_t iter;
     quicly_sentmap_init_iter(&loss.sentmap, &iter);
@@ -540,7 +542,7 @@ static void send_ack_eliciting(quicly_loss_t *loss, uint64_t pn, size_t epoch, i
 {
     now = sent_at;
     ok(quicly_sentmap_prepare(&loss->sentmap, pn, now, epoch) == 0);
-    quicly_sentmap_commit(&loss->sentmap, 10, 0, 0);
+    quicly_sentmap_commit(&loss->sentmap, 10, 0);
 }
 
 static void init_persistent_congestion_test(quicly_loss_t *loss)
@@ -641,6 +643,37 @@ static void test_persistent_congestion(void)
     quicly_loss_dispose(&loss);
 }
 
+static void test_persistent_congestion_pmtud(void)
+{
+    static const struct {
+        int64_t sent_at[3];
+        unsigned probe_mask;
+        unsigned expected_persistent_congestion;
+    } tests[] = {
+        {{11, 200, 400}, 7, 0}, /* Probe loss alone is not congestion. */
+        {{11, 390, 400}, 1, 0}, /* A probe cannot start a persistent-congestion period. */
+        {{11, 21, 400}, 4, 0},  /* A probe cannot extend a persistent-congestion period. */
+        {{11, 200, 400}, 2, 1}, /* Ordinary packet losses can still span a lost probe. */
+    };
+
+    for (size_t i = 0; i != PTLS_ELEMENTSOF(tests); ++i) {
+        quicly_loss_t loss;
+        init_persistent_congestion_test(&loss);
+        for (size_t p = 0; p != PTLS_ELEMENTSOF(tests[i].sent_at); ++p) {
+            ok(quicly_sentmap_prepare(&loss.sentmap, p + 1, tests[i].sent_at[p], QUICLY_EPOCH_1RTT) == 0);
+            loss.sentmap._pending_packet->data.packet.is_pmtud_probe = (tests[i].probe_mask & (1u << p)) != 0;
+            quicly_sentmap_commit(&loss.sentmap, 1200, 0);
+        }
+        send_ack_eliciting(&loss, 6, QUICLY_EPOCH_1RTT, 401);
+        now = 420;
+        acked(&loss, 6, QUICLY_EPOCH_1RTT);
+        detect_loss_after_ack(&loss);
+        ok(num_packets_lost == 3);
+        ok(num_persistent_congestion == tests[i].expected_persistent_congestion);
+        quicly_loss_dispose(&loss);
+    }
+}
+
 void test_loss(void)
 {
     subtest("overdue-alarm", test_overdue_alarm);
@@ -656,4 +689,5 @@ void test_loss(void)
     subtest("late-ack-threshold-adjustment", test_late_ack_threshold_adjustment);
     subtest("rtt-floor", test_rtt_floor);
     subtest("persistent-congestion", test_persistent_congestion);
+    subtest("persistent-congestion-pmtud", test_persistent_congestion_pmtud);
 }

@@ -81,7 +81,7 @@ static void detect_persistent_congestion(quicly_loss_t *loss, uint32_t max_ack_d
 
     quicly_sentmap_init_iter(&loss->sentmap, &iter);
     while ((sent = quicly_sentmap_get(&iter))->packet_number != UINT64_MAX) {
-        if (sent->packet_number >= loss->persistent_congestion.first_rtt_sample_pn && sent->ack_eliciting &&
+        if (sent->packet_number >= loss->persistent_congestion.first_rtt_sample_pn && sent->ack_eliciting && !sent->is_pmtud_probe &&
             sent->cc_bytes_in_flight == 0) {
             /* ACKed entries have already left the sentmap, so consult the retained ACK history for gaps. An outstanding packet
              * does not interrupt the period; RFC 9002 Section 7.6.2 only excludes periods containing an acknowledged packet. */
@@ -136,7 +136,8 @@ quicly_error_t quicly_loss_detect_loss_after_ack(quicly_loss_t *loss, int64_t no
         int64_t largest_acked_signed = loss->largest_acked_packet_plus1.per_epoch[sent->ack_epoch] - 1;
         if ((int64_t)sent->packet_number < largest_acked_signed && (CHECK_TIME_THRESHOLD(sent) || CHECK_PACKET_THRESHOLD(sent))) {
             if (sent->cc_bytes_in_flight != 0) {
-                if (sent->ack_eliciting && loss->persistent_congestion.first_rtt_sample_pn <= sent->packet_number)
+                if (sent->ack_eliciting && !sent->is_pmtud_probe &&
+                    loss->persistent_congestion.first_rtt_sample_pn <= sent->packet_number)
                     newly_lost_ack_eliciting = 1;
                 on_loss_detected(loss, sent, !CHECK_PACKET_THRESHOLD(sent));
                 if ((ret = quicly_sentmap_update(&loss->sentmap, &iter, QUICLY_SENTMAP_EVENT_LOST)) != 0)

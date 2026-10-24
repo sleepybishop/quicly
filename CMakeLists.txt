@@ -47,6 +47,7 @@ SET(PICOTLS_OPENSSL_FILES
     deps/picotls/lib/picotls.c)
 
 SET(QUICLY_LIBRARY_FILES
+    lib/bplus_ranges.c
     lib/frame.c
     lib/flexicast.c
     lib/flexicast_cc.c
@@ -69,6 +70,7 @@ SET(QUICLY_LIBRARY_FILES
 
 SET(UNITTEST_SOURCE_FILES
     deps/picotest/picotest.c
+    t/bplus_ranges.c
     t/cc.c
     t/flexicast.c
     t/flexicast-cc-regression.c

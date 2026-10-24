@@ -440,7 +440,6 @@ static void test_downstream(void)
         subtest("75%", loss_core);
         time_spent[i] = quic_now - 1;
     }
-    /* Combined epoch PTO and packet-header greasing improve the deterministic median. */
     subtest("down-stats-75%", loss_check_stats, time_spent, 6, 8900, 21000, 2200, 4000, 15200);
     validate_server_address = 0;
 
@@ -500,7 +499,7 @@ static void test_bidirectional(void)
         subtest("75%", loss_core);
         time_spent[i] = quic_now - 1;
     }
-    /* Combined epoch PTO, packet-header greasing, and revised handshake probes change recovery timing. */
+    /* Keep the established combined-feature recovery bounds for the deterministic loss schedule. */
     subtest("bidi-stats-75%", loss_check_stats, time_spent, 35, 250000, 320000, 80000, 170000, 760000);
     validate_server_address = 0;
 
