@@ -4420,7 +4420,7 @@ static void cc_test_receive_datagram(quicly_conn_t *server, cc_test_datagram_t *
     }
 }
 
-static void do_test_multipath_cc_limited_drain_and_resume(size_t busy_path)
+static void do_test_multipath_cc_limited_drain_and_resume(size_t busy_path, int discard_tail)
 {
     quicly_context_t original = quic_ctx;
     int64_t saved_now = quic_now;
@@ -4498,8 +4498,7 @@ static void do_test_multipath_cc_limited_drain_and_resume(size_t busy_path)
     ok(busy->loss.sentmap.bytes_in_flight == 0);
     ok(scheduler_can_send(client));
 
-    /* Keep DATAGRAMs queued behind a second full window. The ACKs leave sendable work on this path until the last queued
-     * packet is emitted; a fresh small burst immediately after that must be app-limited without waiting for another ACK. */
+    /* keep DATAGRAMs queued behind a second full window; emitting or discarding the queued tail ends CC limitation */
     num_packets = 0;
     while (busy->loss.sentmap.bytes_in_flight < busy_cwnd && num_packets != PTLS_ELEMENTSOF(flight))
         cc_test_send_datagram(client, busy_path, &flight[num_packets++]);
@@ -4517,24 +4516,33 @@ static void do_test_multipath_cc_limited_drain_and_resume(size_t busy_path)
     ok(busy->cc.cwnd > busy_cwnd);
     busy_cwnd = busy->cc.cwnd;
     cc_test_datagram_t queued[2];
-    for (size_t i = 0; i != PTLS_ELEMENTSOF(queued); ++i)
-        cc_test_send_queued_datagram(client, busy_path, &queued[i]);
+    if (discard_tail) {
+        quicly_discard_datagram_frames(client, busy_path);
+    } else {
+        for (size_t i = 0; i != PTLS_ELEMENTSOF(queued); ++i)
+            cc_test_send_queued_datagram(client, busy_path, &queued[i]);
+    }
     ok(quicly_get_num_datagram_frames_path(client, busy_path) == 0);
     for (size_t i = 0; i != PTLS_ELEMENTSOF(small); ++i)
         cc_test_send_datagram(client, busy_path, &small[i]);
     ok(busy->loss.sentmap.bytes_in_flight < busy_cwnd / 2);
-    for (size_t i = 0; i != PTLS_ELEMENTSOF(queued); ++i) {
-        cc_test_receive_datagram(server, &queued[i]);
-        quic_now += QUICLY_DELAYED_ACK_TIMEOUT;
-        ok(transmit_multipath(server, client) != 0);
+    if (!discard_tail) {
+        for (size_t i = 0; i != PTLS_ELEMENTSOF(queued); ++i) {
+            cc_test_receive_datagram(server, &queued[i]);
+            quic_now += QUICLY_DELAYED_ACK_TIMEOUT;
+            ok(transmit_multipath(server, client) != 0);
+        }
+        ok(busy->cc.cwnd > busy_cwnd);
+        busy_cwnd = busy->cc.cwnd;
     }
-    ok(busy->cc.cwnd > busy_cwnd);
-    busy_cwnd = busy->cc.cwnd;
+    uint32_t bytes_to_mtu_increase = busy->cc.state.pico.bytes_to_mtu_increase;
     for (size_t i = 0; i != PTLS_ELEMENTSOF(small); ++i) {
         cc_test_receive_datagram(server, &small[i]);
         quic_now += QUICLY_DELAYED_ACK_TIMEOUT;
         ok(transmit_multipath(server, client) != 0);
         ok(busy->cc.cwnd == busy_cwnd);
+        /* even an ACK smaller than an MTU must not accumulate credit toward later window growth */
+        ok(busy->cc.state.pico.bytes_to_mtu_increase == bytes_to_mtu_increase);
         ok(idle->cc.cwnd == idle_cwnd);
     }
     ok(busy->loss.sentmap.bytes_in_flight == 0);
@@ -4547,8 +4555,10 @@ static void do_test_multipath_cc_limited_drain_and_resume(size_t busy_path)
 
 static void test_multipath_cc_limited_drain_and_resume(void)
 {
-    subtest("path-zero-busy", do_test_multipath_cc_limited_drain_and_resume, 0);
-    subtest("path-one-busy", do_test_multipath_cc_limited_drain_and_resume, 1);
+    subtest("path-zero-busy", do_test_multipath_cc_limited_drain_and_resume, 0, 0);
+    subtest("path-one-busy", do_test_multipath_cc_limited_drain_and_resume, 1, 0);
+    subtest("path-zero-discard", do_test_multipath_cc_limited_drain_and_resume, 0, 1);
+    subtest("path-one-discard", do_test_multipath_cc_limited_drain_and_resume, 1, 1);
 }
 
 /* Loss statistics must not depend on how many random bytes unrelated tests consumed. */

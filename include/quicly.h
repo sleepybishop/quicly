@@ -1791,6 +1791,11 @@ size_t quicly_get_max_datagram_frames_path(quicly_conn_t *conn, size_t path_inde
  */
 void quicly_send_datagram_frames_path(quicly_conn_t *conn, size_t path_index, ptls_iovec_t *datagrams, size_t num_datagrams);
 int quicly_has_datagram_frames(quicly_conn_t *conn);
+#define QUICLY_AMTQ_ADAPTER_API 1
+/* current path/peer framing limit for one DATAGRAM payload; zero if unavailable */
+size_t quicly_get_datagram_payload_limit(quicly_conn_t *conn, size_t path_index);
+/* discard locally queued DATAGRAMs on this path before send */
+void quicly_discard_datagram_frames(quicly_conn_t *conn, size_t path_index);
 /**
  * Sets CC to the specified type. Returns a boolean indicating if the operation was successful.
  */
