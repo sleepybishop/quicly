@@ -67,5 +67,9 @@ void test_received_cid(void);
 void test_local_cid(void);
 void test_jumpstart(void);
 void test_cc(void);
+void test_flexicast(void);
+void test_flexicast_cc_regressions(void);
+void test_flexicast_crypto(void);
+void test_flexicast_packets(void);
 
 #endif
