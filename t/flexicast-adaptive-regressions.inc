@@ -1,5 +1,4 @@
-/* Deterministic controller regressions. These exercise control invariants;
- * transport/network latency still requires an end-to-end benchmark. */
+/* deterministic adaptive controller regressions */
 #include <stdbool.h>
 
 static quicly_flexicast_cc_t *adaptive_test_new(uint64_t startup, uint64_t minimum, size_t members)
@@ -70,7 +69,7 @@ static void test_adaptive_regressions(void)
         feedback.epoch = epoch;
         feedback.now = 100 + epoch * 100;
         quicly_flexicast_cc_on_feedback(cc, &feedback);
-        /* A healthy receiver must not offset the limiting receiver's cut. */
+        /* a healthy receiver does not offset the limiting receiver's cut */
         quicly_flexicast_feedback_t healthy = feedback;
         healthy.member_id = 2;
         healthy.delivery_rate_bytes_per_second = 100000;
@@ -167,7 +166,7 @@ static void test_adaptive_regressions(void)
     }
     output = adaptive_test_output(cc);
     ok(output.rate_bytes_per_second == 100000 && output.rate_reduction_events == 0);
-    /* Stable standing delay holds; a rising queue with unchanged useful rate cuts. */
+    /* stable standing delay holds while a rising queue cuts rate */
     for (uint64_t epoch = 21; epoch <= 24; ++epoch) {
         feedback.epoch = epoch;
         feedback.now = 250 * epoch;

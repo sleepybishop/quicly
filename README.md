@@ -19,6 +19,9 @@ and independently generated traffic secrets. Control frames are restricted to th
 packets. Rekeying retains cumulative member measurements but requires packet numbers to keep increasing so delayed ACKs
 cannot acknowledge packets from a new key epoch. PATH_ACK uses the negotiated QUIC ACK-delay encoding on the wire;
 `receive_flexicast_ack` supplies the delay in milliseconds to the flow feedback API.
+Pending feedback reports the newest 64 receive ranges and retains them for repetition in later ACKs. Queued and
+retransmitted PATH_ACK frames include elapsed receiver delay so multicast RTT estimation can account for unicast
+queueing and retransmission. The configured ACK delay controls when feedback becomes due, rather than capping the reported delay.
 
 Use `quicly_flexicast_receive_datagrams_at` to receive all DATAGRAM frames in a packet without copying their payloads.
 The singular receive API remains available for packets containing at most one DATAGRAM; it returns

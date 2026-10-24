@@ -1,5 +1,4 @@
-/* Native measurement provenance: these tests use actual packet construction,
- * socket-submission accounting, ACK ranges, and the controller callback. */
+/* native measurement provenance tests */
 static quicly_flexicast_send_context_t provenance_context(uint64_t rate, uint32_t fanout, uint32_t flags)
 {
     return (quicly_flexicast_send_context_t){.pacing_rate_bytes_per_second = rate, .physical_fanout = fanout,
@@ -61,8 +60,7 @@ static void test_feedback_provenance(void)
         ok(test_last_feedback.rtt_sample_epoch == rtt_epoch && test_last_feedback.rtt_sample_at == 230);
         ok(test_last_feedback.rtt_ack_delay_msec == 0 && test_last_feedback.ack_delay_msec == 25);
 
-        /* Rekey clears publication identity/context, independently of retained
-         * statistics, then publishes the new rate/fanout without old flags. */
+        /* rekey clears publication context independently of retained statistics */
         secret[0]++;
         ok(quicly_flexicast_flow_rekey(flow, ptls_iovec_init(secret, sizeof(secret)), 100, 600) == 0);
         ok(quicly_flexicast_attach_at(flow, 1, 600) == 0);
@@ -84,9 +82,7 @@ static void test_feedback_provenance(void)
     }
     ok(rates[0] == rates[1]);
 
-    /* Mixing either rate or fanout within a bucket cannot be interpreted as
-     * one coherent capacity measurement. Missing context stays explicitly
-     * native/unknown, never a legacy-controller fallback. */
+    /* mixing rate or fanout within a bucket marks the sample mixed and invalid */
     for (int kind = 0; kind != 3; ++kind) {
         quicly_flexicast_flow_t *flow = create_cc_flow(1000, secret);
         ok(quicly_flexicast_attach_at(flow, 1, 100) == 0);
@@ -158,8 +154,7 @@ static void test_feedback_provenance(void)
     ok(!(test_last_feedback.rtt_sample_flags & QUICLY_FLEXICAST_RTT_ACK_DELAY_INCONSISTENT));
     quicly_flexicast_flow_free(flow);
 
-    /* The only explicitly limited packet is lost. Its evidence still marks
-     * the later ACK interval spanning the gap, then expires at a new boundary. */
+    /* lost limited packets still mark spanning ACK intervals until the watermark passes */
     for (int cause = 0; cause != 2; ++cause) {
         uint32_t flag = cause == 0 ? QUICLY_FLEXICAST_SAMPLE_APP_LIMITED : QUICLY_FLEXICAST_SAMPLE_HOST_LIMITED;
         quicly_flexicast_send_context_t limited = provenance_context(1000000, 2, flag);
@@ -185,8 +180,7 @@ static void test_feedback_provenance(void)
         secret[0]++;
         ok(quicly_flexicast_flow_rekey(flow, ptls_iovec_init(secret, sizeof(secret)), 100, 1000) == 0);
         ok(quicly_flexicast_attach_at(flow, 1, 1000) == 0);
-        /* Restart this synthetic clock to prove that the old watermark was
-         * cleared, rather than merely overtaken by a later timestamp. */
+        /* restart synthetic clock to verify rekey cleared the old watermark */
         for (int i = 0; i != 3; ++i) {
             pn = provenance_send(flow, 100 + i * 20, &context, &size);
             regression_ack(flow, 1, pn, pn, 0, 110 + i * 20);
@@ -196,8 +190,7 @@ static void test_feedback_provenance(void)
         quicly_flexicast_flow_free(flow);
     }
 
-    /* More than 4096 successful member submissions sharing one actual time
-     * and context must not fill the sparse exception table. */
+    /* shared submission timestamps and context do not fill the sparse exception table */
     flow = create_cc_flow(1000, secret);
     for (uint64_t member = 1; member <= 4; ++member)
         ok(quicly_flexicast_attach_at(flow, member, 100) == 0);

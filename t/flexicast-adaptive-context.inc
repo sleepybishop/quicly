@@ -1,6 +1,4 @@
-/* Real transport samples carry immutable send context and independent RTT
- * identity. Exercise ineligible samples and timing boundaries, not throughput
- * expectations: those belong to the shaped-network and model harnesses. */
+/* adaptive controller send-context and RTT identity tests */
 static quicly_flexicast_feedback_t adaptive_context_sample(uint64_t epoch, int64_t now, uint64_t physical_rate,
                                                           uint32_t fanout, uint64_t delivered_rate, uint32_t rtt)
 {
@@ -17,8 +15,7 @@ static quicly_flexicast_feedback_t adaptive_context_sample(uint64_t epoch, int64
         .rtt_sample_flags = QUICLY_FLEXICAST_RTT_PRESENT | QUICLY_FLEXICAST_RTT_VALID, .now = now};
 }
 
-/* The established native probe is smaller; bootstrap and legacy growth keep
- * their previous gains. Exercise the selector and existing scheduling bounds. */
+/* established native growth probe vs bootstrap and legacy gains */
 static void test_adaptive_growth_probe(void)
 {
     for (size_t mode = 0; mode != 3; ++mode) { /* native delivery, native startup, legacy delivery */
@@ -50,8 +47,7 @@ static void test_adaptive_growth_probe(void)
         }
     }
 
-    /* The datagram floor, median catch-up limit and aggregate hard ceiling
-     * still constrain native established probes after gain selection. */
+    /* datagram floor, median catch-up limit, and aggregate cap constrain growth probes */
     quicly_flexicast_cc_t *cc = adaptive_test_new(8000, 2000, 1);
     quicly_flexicast_feedback_t feedback = adaptive_context_sample(1, 200, 8000, 1, 8000, 20);
     quicly_flexicast_cc_on_feedback(cc, &feedback);
@@ -88,8 +84,7 @@ static void test_adaptive_context(void)
     test_adaptive_drain();
     test_adaptive_cadence();
     test_adaptive_growth_probe();
-    /* Low application/host sending, missing context and mixed fanout cannot
-     * become congestion or teach a radio loss baseline. CE is independent. */
+    /* limited, missing, or mixed context cannot trigger delivery cuts or radio baseline learning */
     const uint32_t unusable[] = {QUICLY_FLEXICAST_SAMPLE_PRESENT,
         QUICLY_FLEXICAST_SAMPLE_PRESENT | QUICLY_FLEXICAST_SAMPLE_VALID | QUICLY_FLEXICAST_SAMPLE_APP_LIMITED,
         QUICLY_FLEXICAST_SAMPLE_PRESENT | QUICLY_FLEXICAST_SAMPLE_VALID | QUICLY_FLEXICAST_SAMPLE_HOST_LIMITED,
@@ -115,8 +110,7 @@ static void test_adaptive_context(void)
         quicly_flexicast_cc_free(cc);
     }
 
-    /* Historical fanout overrides today's hint; changing context must not
-     * blend a low per-receiver rate into a new one-copy delivery sample. */
+    /* historical fanout overrides current divisor hint */
     quicly_flexicast_cc_t *cc = adaptive_test_new(100000, 2000, 1);
     quicly_flexicast_cc_hints_t hints = {.delivery_rate_divisor = 1};
     quicly_flexicast_cc_set_hints(cc, &hints, 100);
@@ -127,8 +121,7 @@ static void test_adaptive_context(void)
     ok(adaptive_test_output(cc).rate_bytes_per_second == 100000);
     quicly_flexicast_cc_free(cc);
 
-    /* Clock-bucket boundaries do not admit two growths or correlated cuts
-     * one millisecond apart. The default interval stays 250 ms. */
+    /* clock-bucket boundaries do not allow consecutive updates 1 ms apart */
     for (size_t cut = 0; cut != 2; ++cut) {
         cc = adaptive_test_new(100000, 2000, 32);
         const int64_t times[] = {249, 250, 498, 499};
@@ -150,7 +143,7 @@ static void test_adaptive_context(void)
         quicly_flexicast_cc_free(cc);
     }
 
-    /* RTT trends use elapsed sample time as well, not wall bucket edges. */
+    /* RTT trends use elapsed sample time rather than bucket edges */
     cc = adaptive_test_new(100000, 2000, 1);
     const int64_t trend_times[] = {249, 250, 499, 500, 749};
     for (size_t step = 0; step != 5; ++step) {
@@ -162,8 +155,7 @@ static void test_adaptive_context(void)
     ok(adaptive_test_output(cc).rate_bytes_per_second == 90000);
     quicly_flexicast_cc_free(cc);
 
-    /* Repeated RTT provenance cannot extend an expired hold or create trends.
-     * A fresh delivery sample can grow once that hold has elapsed. */
+    /* repeated RTT sample epoch does not extend an expired hold */
     cc = adaptive_test_new(100000, 2000, 1);
     feedback = adaptive_context_sample(1, 200, 100000, 1, 100000, 80);
     quicly_flexicast_cc_on_feedback(cc, &feedback);
@@ -174,8 +166,7 @@ static void test_adaptive_context(void)
     ok(adaptive_test_output(cc).rate_bytes_per_second == 106250);
     quicly_flexicast_cc_free(cc);
 
-    /* New identities do not make impossible or stale RTT timestamps fresh.
-     * Without fresh clean RTT, a low rate cannot be learned as radio loss. */
+    /* invalid or stale RTT timestamps cannot trigger cuts or baseline learning */
     for (size_t invalid_rtt = 0; invalid_rtt != 4; ++invalid_rtt) {
         cc = adaptive_test_new(100000, 2000, 1);
         ok(quicly_flexicast_cc_enable_trace(cc, 1) == 0);
@@ -213,8 +204,7 @@ static void test_adaptive_context(void)
     ok(clean_event.state_after.degraded_delivery_epochs == 1); /* three unusable RTTs did not teach */
     quicly_flexicast_cc_free(cc);
 
-    /* One receiver's standing queue vetoes clean-baseline learning for the
-     * whole sender until the hold expires, even on another receiver's ACKs. */
+    /* standing queue on one receiver blocks baseline learning for the whole sender */
     cc = adaptive_test_new(100000, 2000, 2);
     ok(quicly_flexicast_cc_enable_trace(cc, 1) == 0);
     for (uint64_t epoch = 1; epoch <= 6; ++epoch) {
@@ -231,8 +221,7 @@ static void test_adaptive_context(void)
     ok(adaptive_test_output(cc).rate_bytes_per_second == 100000);
     quicly_flexicast_cc_free(cc);
 
-    /* An RFC-valid unadjusted RTT can contain an inconsistent ACK delay.
-     * Preserve telemetry, but it cannot freeze growth indefinitely. */
+    /* inconsistent ACK delay does not freeze growth indefinitely */
     cc = adaptive_test_new(100000, 2000, 1);
     feedback = adaptive_context_sample(1, 200, 100000, 1, 100000, 26);
     feedback.minimum_rtt_msec = 2;
@@ -247,8 +236,7 @@ static void test_adaptive_context(void)
     ok(adaptive_test_output(cc).rate_bytes_per_second == 90312);
     quicly_flexicast_cc_free(cc);
 
-    /* Before the first published delivery sample, fresh clean RTT permits
-     * bounded startup. Duplicate frames cannot spend another probe. */
+    /* fresh clean RTT permits bounded startup before the first delivery sample */
     cc = adaptive_test_new(100000, 2000, 1);
     feedback = adaptive_context_sample(1, 200, 0, 0, 0, 20);
     feedback.delivery_rate_sample_epoch = 0;
@@ -270,9 +258,7 @@ static void test_adaptive_context(void)
 }
 
 
-/* An absolute ceiling belongs to the historical sending context, not to each
- * subsequently reduced current rate. Hold RTT flat to isolate delivery cuts
- * from the independently retained RTT-trend and loss responses. */
+/* helper for historical send-context ceiling tests */
 static quicly_flexicast_feedback_t adaptive_ceiling_old_sample(uint64_t epoch, int64_t now, uint64_t physical_rate,
                                                              uint32_t fanout, uint64_t delivered_rate, uint32_t rtt)
 {
@@ -293,8 +279,7 @@ static quicly_flexicast_cc_t *adaptive_ceiling_after_first_cut(void)
 
 static void test_adaptive_absolute_ceiling(void)
 {
-    /* A 20 KB/s capacity observation permits bounded steps toward a fixed
-     * 16 KB/s drain target, never 20% of today's already reduced rate. */
+    /* bounded steps toward a fixed drain target without compounding below the ceiling */
     quicly_flexicast_cc_t *cc = adaptive_test_new(100000, 2000, 1);
     ok(quicly_flexicast_cc_enable_trace(cc, 1) == 0);
     const int64_t times[] = {200, 449, 450, 699, 700, 950, 1200};
@@ -313,8 +298,7 @@ static void test_adaptive_absolute_ceiling(void)
     ok(event.state_after.last_reduction_at == 700); /* no-op ceilings consume no cut clock */
     quicly_flexicast_cc_free(cc);
 
-    /* Historical fanout, rather than today's scheduler hint, converts a
-     * receiver's delivery into the same aggregate ceiling for 1/2/4 copies. */
+    /* historical fanout scales per-receiver delivery into the aggregate ceiling */
     const uint32_t fanouts[] = {1, 2, 4};
     for (size_t i = 0; i != sizeof(fanouts) / sizeof(fanouts[0]); ++i) {
         cc = adaptive_test_new(100000, 2000, 1);
@@ -329,8 +313,7 @@ static void test_adaptive_absolute_ceiling(void)
         quicly_flexicast_cc_free(cc);
     }
 
-    /* Exact duplicates, split frames repeating a delivery publication, and
-     * unusable independent RTT provenance cannot spend another delivery cut. */
+    /* duplicate epochs and unusable RTT provenance do not trigger another cut */
     for (size_t mode = 0; mode != 6; ++mode) {
         cc = adaptive_ceiling_after_first_cut();
         quicly_flexicast_feedback_t feedback = adaptive_ceiling_old_sample(2, 500, 100000, 1, 10000, 80);
@@ -356,8 +339,7 @@ static void test_adaptive_absolute_ceiling(void)
         quicly_flexicast_cc_free(cc);
     }
 
-    /* Unusable delivery context stays unusable even when it would imply an
-     * attractive low ceiling. No new path may bypass the provenance checks. */
+    /* unusable delivery context cannot bypass provenance checks */
     const uint32_t invalid_flags[] = {QUICLY_FLEXICAST_SAMPLE_PRESENT,
         QUICLY_FLEXICAST_SAMPLE_PRESENT | QUICLY_FLEXICAST_SAMPLE_VALID | QUICLY_FLEXICAST_SAMPLE_APP_LIMITED,
         QUICLY_FLEXICAST_SAMPLE_PRESENT | QUICLY_FLEXICAST_SAMPLE_VALID | QUICLY_FLEXICAST_SAMPLE_HOST_LIMITED,
@@ -393,8 +375,7 @@ static void test_adaptive_absolute_ceiling(void)
         quicly_flexicast_cc_free(cc);
     }
 
-    /* The freshness boundary is inclusive. The next millisecond was rejected
-     * above; an observation exactly one feedback timeout old remains usable. */
+    /* freshness boundary is inclusive at one feedback timeout */
     cc = adaptive_ceiling_after_first_cut();
     quicly_flexicast_feedback_t feedback = adaptive_ceiling_old_sample(2, 1500, 100000, 1, 10000, 80);
     feedback.delivery_sample_acked_at_start = 400;
@@ -403,8 +384,7 @@ static void test_adaptive_absolute_ceiling(void)
     ok(adaptive_test_output(cc).rate_bytes_per_second == 25000);
     quicly_flexicast_cc_free(cc);
 
-    /* Old sending cannot teach a new radio baseline or authorize growth,
-     * even after the congestion hold expires and fresh RTT is clean. */
+    /* pre-cut sending cannot teach a radio baseline or authorize growth */
     for (size_t healthy = 0; healthy != 2; ++healthy) {
         cc = adaptive_ceiling_after_first_cut();
         ok(quicly_flexicast_cc_enable_trace(cc, 1) == 0);
@@ -419,8 +399,7 @@ static void test_adaptive_absolute_ceiling(void)
         quicly_flexicast_cc_free(cc);
     }
 
-    /* A learned 50% radio delivery fraction means 10 KB/s observed delivery
-     * supports a 20 KB/s ceiling, not a 10 KB/s congestion target. */
+    /* learned 50% radio delivery baseline scales the ceiling */
     cc = adaptive_test_new(100000, 2000, 1);
     ok(quicly_flexicast_cc_enable_trace(cc, 1) == 0);
     for (uint64_t epoch = 1; epoch <= 4; ++epoch) {
@@ -437,8 +416,7 @@ static void test_adaptive_absolute_ceiling(void)
     }
     quicly_flexicast_cc_free(cc);
 
-    /* Even at/below the delivery ceiling, independent congestion evidence is
-     * active. CE retains its 15% response; fresh queue plus loss retains 10%. */
+    /* independent ECN and loss responses remain active below the delivery ceiling */
     for (size_t ce = 0; ce != 2; ++ce) {
         cc = adaptive_ceiling_after_first_cut();
         feedback = adaptive_ceiling_old_sample(2, 500, 100000, 1, 80000, 80);
@@ -453,8 +431,7 @@ static void test_adaptive_absolute_ceiling(void)
         quicly_flexicast_cc_free(cc);
     }
 
-    /* Random loss with flat, clean RTT is not congestion, including when
-     * valid historical delivery would otherwise suggest a lower ceiling. */
+    /* random loss with flat, clean RTT does not cut rate */
     cc = adaptive_ceiling_after_first_cut();
     for (uint64_t epoch = 2; epoch <= 7; ++epoch) {
         feedback = adaptive_ceiling_old_sample(epoch, epoch * 250, 100000, 1, 10000, 20);
@@ -464,8 +441,7 @@ static void test_adaptive_absolute_ceiling(void)
     }
     quicly_flexicast_cc_free(cc);
 
-    /* Large but legal rates overflow a naive delivery*fanout*1,000,000
-     * intermediate. The absolute target and step bound remain exact. */
+    /* large rates avoid intermediate overflow */
     const uint64_t large = UINT64_C(1) << 62;
     quicly_flexicast_cc_config_t config = {.maximum_members = 1,
         .startup_rate_bytes_per_second = large, .minimum_rate_bytes_per_second = 2000,
@@ -483,9 +459,7 @@ static void test_adaptive_absolute_ceiling(void)
     }
     quicly_flexicast_cc_free(cc);
 
-    /* A product that exceeds UINT64_MAX saturates at the historical offered
-     * rate, never wraps into a spuriously low capacity. This deliberately
-     * contradictory current hint must not change the recorded ceiling. */
+    /* products exceeding UINT64_MAX saturate at the historical offered rate */
     cc = adaptive_ceiling_after_first_cut();
     ok(quicly_flexicast_cc_enable_trace(cc, 1) == 0);
     feedback = adaptive_ceiling_old_sample(2, 500, UINT64_MAX, UINT32_MAX, UINT64_MAX, 80);
@@ -495,8 +469,7 @@ static void test_adaptive_absolute_ceiling(void)
     ok(adaptive_test_output(cc).rate_bytes_per_second == 50000);
     quicly_flexicast_cc_free(cc);
 
-    /* Direct callers without native provenance retain the original ratio
-     * policy; they must not manufacture a historical absolute ceiling. */
+    /* legacy callers without native provenance retain the ratio policy */
     cc = adaptive_test_new(100000, 2000, 1);
     ok(quicly_flexicast_cc_enable_trace(cc, 1) == 0);
     feedback = adaptive_context_sample(1, 200, 100000, 1, 20000, 80);
@@ -507,8 +480,7 @@ static void test_adaptive_absolute_ceiling(void)
     ok(adaptive_test_output(cc).rate_bytes_per_second == 50000);
     quicly_flexicast_cc_free(cc);
 
-    /* The configured minimum remains a floor even when a valid ceiling is
-     * below it; epoch reset must allow fresh publication identities again. */
+    /* configured minimum remains a floor and epoch reset allows fresh publication epochs */
     cc = adaptive_test_new(4000, 2000, 1);
     feedback = adaptive_ceiling_old_sample(1, 200, 4000, 1, 1, 80);
     quicly_flexicast_cc_on_feedback(cc, &feedback);

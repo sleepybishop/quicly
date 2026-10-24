@@ -214,6 +214,15 @@ static void test_flexicast_control_queue(void)
     conn.super.ctx = &ctx;
     conn.super.remote.transport_params.enable_multipath = 1;
     conn.super.remote.transport_params.flexicast_support.ipv4 = 1;
+    ok(quicly_flexicast_is_negotiated(&conn));
+    conn.super.remote.transport_params.flexicast_support.ipv4 = 0;
+    conn.super.remote.transport_params.flexicast_support.ipv6 = 1;
+    ok(!quicly_flexicast_is_negotiated(&conn));
+    ctx.transport_params.flexicast_support.ipv6 = 1;
+    ok(quicly_flexicast_is_negotiated(&conn));
+    ctx.transport_params.flexicast_support.ipv6 = 0;
+    conn.super.remote.transport_params.flexicast_support.ipv4 = 1;
+    conn.super.remote.transport_params.flexicast_support.ipv6 = 0;
 
     uint64_t packet_numbers[] = {0, 63, 64, 16383, 16384, PTLS_QUICINT_MAX};
     for (size_t i = 0; i != PTLS_ELEMENTSOF(packet_numbers); ++i) {
@@ -226,6 +235,23 @@ static void test_flexicast_control_queue(void)
         ok(quicly_decode_ack_frame(&src, end, &ack, 0) == 0);
         ok(ack.largest_acknowledged == packet_numbers[i] && ack.smallest_acknowledged == packet_numbers[i]);
         ok(src + 1 == end && *src == QUICLY_FRAME_TYPE_PING);
+        /* delay can grow to every varint width without changing ranges or the trailing PING */
+        static const int64_t elapsed[] = {0, 1, 1000, INT64_C(10000000), INT64_MAX - 1, 1};
+        for (size_t j = 0; j != PTLS_ELEMENTSOF(elapsed); ++j) {
+            control->ack.queued_at = 1;
+            refresh_flexicast_ack_delay(control, 1 + elapsed[j]);
+            src = control->encoded;
+            end = src + control->encoded_size;
+            ok(quicly_decodev(&src, end) == QUICLY_FRAME_TYPE_PATH_ACK);
+            ok(quicly_decodev(&src, end) == PTLS_QUICINT_MAX);
+            ok(quicly_decode_ack_frame(&src, end, &ack, 0) == 0);
+            uint64_t expected = elapsed[j] == INT64_MAX - 1
+                                    ? PTLS_QUICINT_MAX
+                                    : ((uint64_t)elapsed[j] * 1000) >> QUICLY_LOCAL_ACK_DELAY_EXPONENT;
+            ok(ack.ack_delay == expected);
+            ok(ack.largest_acknowledged == packet_numbers[i] && ack.smallest_acknowledged == packet_numbers[i]);
+            ok(src + 1 == end && *src == QUICLY_FRAME_TYPE_PING);
+        }
         conn.egress.flexicast_control.head = NULL;
         conn.egress.flexicast_control.tail_ref = NULL;
         conn.egress.flexicast_control.count = 0;
@@ -245,7 +271,7 @@ static void test_flexicast_control_queue(void)
     conn.egress.flexicast_control.tail_ref = NULL;
     conn.egress.flexicast_control.count = 0;
 
-    /* Frames cannot be split between QUIC packets; reject oversized keys before allocating or queueing them. */
+    /* frames cannot be split across QUIC packets; reject oversized keys before queueing */
     conn.super.local.bidi.next_stream_id = 1;
     uint8_t oversized_key[2048] = {0};
     quicly_flexicast_key_frame_t key = {
@@ -256,8 +282,11 @@ static void test_flexicast_control_queue(void)
     quicly_flexicast_announce_frame_t announce = {.flow_id = state.flow_id, .ip_version = 6};
     ok(quicly_flexicast_send_announce(&conn, &announce) == QUICLY_FLEXICAST_ERROR_PROTOCOL_VIOLATION);
     ok(conn.egress.flexicast_control.count == 0);
+    conn.super.remote.transport_params.flexicast_support.ipv6 = 1;
+    ok(quicly_flexicast_send_announce(&conn, &announce) == QUICLY_FLEXICAST_ERROR_PROTOCOL_VIOLATION);
+    ok(conn.egress.flexicast_control.count == 0);
 
-    /* Retransmission generation prevents an older lost copy from rescheduling the latest copy; a late ACK still retires it. */
+    /* retransmission generation prevents an older lost copy from rescheduling the latest copy */
     conn.super.local.bidi.next_stream_id = 0;
     ok(quicly_flexicast_send_state(&conn, &state) == 0);
     control = conn.egress.flexicast_control.head;
@@ -309,7 +338,7 @@ static void test_flexicast_control_receive(void)
     int ack_only, probe_only;
     quicly_flexicast_state_frame_t state = {.flow_id = {.bytes = {1}, .len = 1}, .action = QUICLY_FLEXICAST_STATE_LISTEN};
     ok(quicly_flexicast_encode_state_frame(encoded, sizeof(encoded), &state, &encoded_size) == 0);
-    /* LISTEN is receiver-only, and every Flexicast control frame is restricted to 1-RTT. */
+    /* LISTEN is receiver-only, and every flexicast control frame is restricted to 1-RTT */
     ok(handle_payload(&conn, QUICLY_EPOCH_1RTT, 0, NULL, encoded, encoded_size, &offending_type, &ack_only, &probe_only) ==
        QUICLY_TRANSPORT_ERROR_PROTOCOL_VIOLATION);
     conn.super.local.bidi.next_stream_id = 1;
@@ -323,13 +352,13 @@ static void test_flexicast_control_receive(void)
        QUICLY_TRANSPORT_ERROR_FRAME_ENCODING);
     conn.super.remote.transport_params.flexicast_support.ipv4 = 1;
 
-    /* Receive-side ACK dispatch must use the path limit advertised locally, even when the peer advertised another limit. */
+    /* receive-side ACK dispatch must use the locally advertised path limit */
     uint8_t path_ack[] = {2, 0, 0, 0, 0};
     struct st_quicly_handle_payload_state_t payload = {
         .src = path_ack, .end = path_ack + sizeof(path_ack), .frame_type = QUICLY_FRAME_TYPE_PATH_ACK, .epoch = QUICLY_EPOCH_1RTT};
     conn.super.local.max_path_id = 4;
     conn.super.remote.max_path_id = 1;
-    ok(handle_path_ack_frame(&conn, &payload) == 0); /* uncreated unicast path, not Flexicast */
+    ok(handle_path_ack_frame(&conn, &payload) == 0); /* uncreated unicast path, not flexicast */
     path_ack[0] = 9;
     payload.src = path_ack;
     conn.super.remote.max_path_id = 12;
@@ -415,7 +444,7 @@ static void test_flexicast_announce_order(void)
     ok(observer.stale == 2 && observer.unsupported == 1 && observer.applied == 2);
     ok(observer.latest_sequence == 12 && observer.udp_port == 447);
 
-    /* Invalid IP versions remain frame-encoding errors, independent of the application's sequence handling. */
+    /* invalid IP versions remain frame-encoding errors */
     encoded[7] = 5; /* four-byte type, length, one-byte flow ID, one-byte sequence */
     ok(handle_payload(&conn, QUICLY_EPOCH_1RTT, 0, NULL, encoded, size, &offending_type, &ack_only, &probe_only) ==
        QUICLY_TRANSPORT_ERROR_FRAME_ENCODING);
@@ -732,7 +761,7 @@ static void test_transport_parameters(void)
         ok(decoded.initial_max_path_id == 0);
     }
 
-    { /* Flexicast address-family support is layered on MPQUIC. */
+    { /* flexicast address-family support is layered on MPQUIC */
         static const uint8_t flexicast[] = {
             QUICLY_TRANSPORT_PARAMETER_ID_INITIAL_MAX_PATH_ID, 1, 0, 0x80, 0x00, 0xed, 0xf3, 2, 1, 1};
         memset(&decoded, 0x55, sizeof(decoded));
@@ -742,7 +771,7 @@ static void test_transport_parameters(void)
         ok(decoded.flexicast_support.ipv6);
     }
 
-    { /* Flexicast is ignored without MPQUIC; malformed values and duplicates are invalid. */
+    { /* flexicast is ignored without MPQUIC; malformed values and duplicates are invalid */
         static const uint8_t without_multipath[] = {0x80, 0x00, 0xed, 0xf3, 2, 1, 1};
         static const uint8_t nonempty[] = {QUICLY_TRANSPORT_PARAMETER_ID_INITIAL_MAX_PATH_ID, 1, 0, 0x80, 0x00, 0xed, 0xf3, 1, 1};
         static const uint8_t duplicate[] = {QUICLY_TRANSPORT_PARAMETER_ID_INITIAL_MAX_PATH_ID,
@@ -772,7 +801,7 @@ static void test_transport_parameters(void)
            QUICLY_TRANSPORT_ERROR_TRANSPORT_PARAMETER);
     }
 
-    { /* Advertising neither address family is a Flexicast protocol violation. */
+    { /* advertising neither address family is a flexicast protocol violation */
         static const uint8_t no_address_family[] = {
             QUICLY_TRANSPORT_PARAMETER_ID_INITIAL_MAX_PATH_ID, 1, 0, 0x80, 0x00, 0xed, 0xf3, 2, 0, 0};
         ok(quicly_decode_transport_parameter_list(&decoded, NULL, NULL, NULL, NULL, no_address_family,
@@ -780,7 +809,37 @@ static void test_transport_parameters(void)
            QUICLY_TRANSPORT_ERROR_PROTOCOL_VIOLATION);
     }
 
-    { /* The encoder and decoder round-trip both extension advertisements. */
+    { /* ignored values need no validation; multipath can appear before or after flexicast */
+        static const struct {
+            uint8_t len, value[3];
+        } cases[] = {{0, {0}}, {1, {1}}, {2, {2, 0}}, {2, {0, 0}}, {3, {1, 1, 1}}};
+        for (size_t i = 0; i != PTLS_ELEMENTSOF(cases); ++i) {
+            for (size_t order = 0; order != 3; ++order) {
+                uint8_t encoded[32], *dst = encoded;
+                if (order == 1) {
+                    *dst++ = QUICLY_TRANSPORT_PARAMETER_ID_INITIAL_MAX_PATH_ID;
+                    *dst++ = 1;
+                    *dst++ = 0;
+                }
+                dst = quicly_encodev(dst, QUICLY_TRANSPORT_PARAMETER_ID_FLEXICAST_SUPPORT);
+                *dst++ = cases[i].len;
+                memcpy(dst, cases[i].value, cases[i].len);
+                dst += cases[i].len;
+                if (order == 2) {
+                    *dst++ = QUICLY_TRANSPORT_PARAMETER_ID_INITIAL_MAX_PATH_ID;
+                    *dst++ = 1;
+                    *dst++ = 0;
+                }
+                quicly_error_t expected = order == 0 ? 0 : i == 3 ? QUICLY_TRANSPORT_ERROR_PROTOCOL_VIOLATION
+                                                                 : QUICLY_TRANSPORT_ERROR_TRANSPORT_PARAMETER;
+                ok(quicly_decode_transport_parameter_list(&decoded, NULL, NULL, NULL, NULL, encoded, dst) == expected);
+                if (order == 0)
+                    ok(!decoded.flexicast_support.ipv4 && !decoded.flexicast_support.ipv6);
+            }
+        }
+    }
+
+    { /* encoder and decoder round-trip both extension advertisements */
         quicly_transport_parameters_t params = quicly_spec_context.transport_params;
         ptls_buffer_t encoded;
         params.enable_multipath = 1;
@@ -794,6 +853,24 @@ static void test_transport_parameters(void)
         ok(decoded.flexicast_support.ipv4);
         ok(decoded.flexicast_support.ipv6);
         ptls_buffer_dispose(&encoded);
+
+        /* omit flexicast when neither explicit nor implicit multipath support is configured */
+        params.enable_multipath = 0;
+        for (size_t i = 0; i != 2; ++i) {
+            params.initial_max_path_id = i;
+            ptls_buffer_init(&encoded, "", 0);
+            ok(quicly_encode_transport_parameter_list(&encoded, &params, NULL, NULL, NULL, NULL, 0) == 0);
+            const uint8_t *src = encoded.base, *end = src + encoded.off;
+            int found_flexicast = 0;
+            while (src != end) {
+                uint64_t id = quicly_decodev(&src, end), len = quicly_decodev(&src, end);
+                assert(len <= end - src);
+                found_flexicast |= id == QUICLY_TRANSPORT_PARAMETER_ID_FLEXICAST_SUPPORT;
+                src += len;
+            }
+            ok(found_flexicast == (i != 0));
+            ptls_buffer_dispose(&encoded);
+        }
     }
 
     static const uint8_t dup_bytes[] = {0x05, 0x04, 0x80, 0x10, 0x00, 0x00, 0x05, 0x04, 0x80, 0x10, 0x00, 0x00};
@@ -2279,6 +2356,133 @@ static void test_flexicast_control_exchange(void)
     ok(flexicast_control_received[1] == 3 && flexicast_received_action == QUICLY_FLEXICAST_STATE_LEAVE);
     ok(client->egress.flexicast_control.count == 0 && server->egress.flexicast_control.count == 0);
 
+    quicly_free(client);
+    quicly_free(server);
+    quicly_free_default_cid_encryptor(quic_ctx.cid_encryptor);
+    quic_ctx = saved_ctx;
+}
+
+static quicly_error_t test_receive_flexicast_ack_timing(quicly_receive_flexicast_ack_t *self, quicly_conn_t *conn,
+                                                        uint64_t flow_id, const quicly_ack_frame_t *frame)
+{
+    test_flexicast_ack_delay = frame->ack_delay;
+    return 0;
+}
+
+static int exchange_flexicast_until_idle(quicly_conn_t *client, quicly_conn_t *server)
+{
+    for (size_t i = 0; i != 100; ++i) {
+        int64_t client_at = quicly_get_first_timeout(client), server_at = quicly_get_first_timeout(server);
+        int64_t next_at = client_at < server_at ? client_at : server_at;
+        if (next_at > quic_now) {
+            if (next_at - quic_now > QUICLY_DEFAULT_MAX_ACK_DELAY)
+                return 1;
+            quic_now = next_at;
+        }
+        if (client_at <= server_at)
+            transmit(client, server);
+        else
+            transmit(server, client);
+    }
+    ok(!"flexicast control exchange did not become idle");
+    return 0;
+}
+
+static void test_flexicast_control_send_timing(void)
+{
+    static quicly_receive_flexicast_frame_t receive_control = {test_receive_flexicast_control};
+    static quicly_receive_flexicast_ack_t receive_ack = {test_receive_flexicast_ack_timing};
+    quicly_context_t saved_ctx = quic_ctx;
+    char cid_key[] = "0123456789abcdef";
+    quic_ctx.cid_encryptor = quicly_new_default_cid_encryptor(&ptls_openssl_quiclb, &ptls_openssl_aes128ecb, &ptls_openssl_sha256,
+                                                              ptls_iovec_init(cid_key, strlen(cid_key)));
+    quic_ctx.transport_params.initial_max_path_id = 4;
+    quic_ctx.transport_params.flexicast_support.ipv4 = 1;
+    quic_ctx.receive_flexicast_frame = &receive_control;
+    quic_ctx.receive_flexicast_ack = &receive_ack;
+    quicly_conn_t *client, *server;
+    test_setup_connected_peers(&client, &server);
+
+    /* cached negotiation during 0-RTT cannot release queued control frames */
+    quicly_flexicast_state_frame_t state = {.flow_id = {.bytes = {1}, .len = 1}, .action = QUICLY_FLEXICAST_STATE_JOIN};
+    ok(quicly_flexicast_send_state(client, &state) == 0);
+    ok(quicly_flexicast_send_path_ack(client, 12345, 42) == 0);
+    client->application->one_rtt_writable = 0;
+    quicly_address_t dest, src;
+    struct iovec datagrams[8];
+    uint8_t packetsbuf[PTLS_ELEMENTSOF(datagrams) * QUICLY_MIN_CLIENT_INITIAL_SIZE];
+    size_t num_datagrams = PTLS_ELEMENTSOF(datagrams);
+    quicly_stats_t before, after;
+    quicly_get_stats(client, &before);
+    ok(quicly_send(client, &dest, &src, datagrams, &num_datagrams, packetsbuf, sizeof(packetsbuf)) == 0);
+    quicly_get_stats(client, &after);
+    ok(after.num_frames_sent.fc_state == before.num_frames_sent.fc_state);
+    ok(after.num_frames_sent.path_ack == before.num_frames_sent.path_ack);
+    ok(client->egress.flexicast_control.count == 2);
+    ok((client->egress.pending_flows & QUICLY_PENDING_FLOW_OTHERS_BIT) != 0);
+    client->application->one_rtt_writable = 1;
+    if (!exchange_flexicast_until_idle(client, server))
+        goto Exit;
+    ok(client->egress.flexicast_control.count == 0);
+    if (client->egress.flexicast_control.count != 0)
+        goto Exit;
+
+    /* hold the first ACK in the queue, then lose its packet; the retransmission includes both delays */
+    int64_t queued_at = quic_now;
+    ok(quicly_flexicast_send_path_ack(client, 12345, 43) == 0);
+    quic_now += 17;
+    num_datagrams = PTLS_ELEMENTSOF(datagrams);
+    ok(quicly_send(client, &dest, &src, datagrams, &num_datagrams, packetsbuf, sizeof(packetsbuf)) == 0);
+    ok(num_datagrams != 0);
+    quicly_flexicast_control_t *control = client->egress.flexicast_control.head;
+    ok(control != NULL && control->sender == QUICLY_SENDER_STATE_UNACKED);
+    const uint8_t *p = control->encoded, *end = p + control->encoded_size;
+    quicly_ack_frame_t ack;
+    ok(quicly_decodev(&p, end) == QUICLY_FRAME_TYPE_PATH_ACK);
+    ok(quicly_decodev(&p, end) == 12345);
+    ok(quicly_decode_ack_frame(&p, end, &ack, 0) == 0);
+    ok(ack.ack_delay == (17 * 1000) >> QUICLY_LOCAL_ACK_DELAY_EXPONENT);
+    test_flexicast_ack_delay = UINT64_MAX;
+    for (size_t i = 0; i != 20 && test_flexicast_ack_delay == UINT64_MAX; ++i) {
+        int64_t at = quicly_get_first_timeout(client);
+        quic_now = at > quic_now ? at : quic_now + 1;
+        transmit(client, server);
+    }
+    ok(test_flexicast_ack_delay == quic_now - queued_at);
+    ok(quic_now - queued_at > 17);
+    if (!exchange_flexicast_until_idle(client, server))
+        goto Exit;
+    ok(client->egress.flexicast_control.count == 0);
+
+    /* the timestamp used to encode a pending ACK can precede the enqueue callback's clock */
+    uint8_t secret[32] = {0}, multicast_packet[256];
+    quicly_flexicast_config_t config = {.flow_id = 12345,
+                                        .cipher_suite = &ptls_openssl_aes128gcmsha256,
+                                        .crypto_engine = &quicly_default_crypto_engine,
+                                        .traffic_secret = ptls_iovec_init(secret, sizeof(secret))};
+    quicly_flexicast_flow_t *source, *receiver;
+    ok(quicly_flexicast_flow_create(&source, &config) == 0);
+    ok(quicly_flexicast_flow_create(&receiver, &config) == 0);
+    ok(quicly_flexicast_attach(source, 1) == 0);
+    uint64_t packet_number;
+    size_t packet_size;
+    ptls_iovec_t payload;
+    int64_t received_at = quic_now;
+    ok(quicly_flexicast_send_datagram_at(source, ptls_iovec_init("ack", 3), multicast_packet, sizeof(multicast_packet),
+                                         &packet_size, &packet_number, received_at - 10) == 0);
+    ok(quicly_flexicast_receive_datagram_at(receiver, multicast_packet, packet_size, &payload, &packet_number, received_at) == 0);
+    quic_now += 20;
+    ok(quicly_flexicast_send_pending_ack(receiver, client, received_at + 10, 1) == 0);
+    quic_now += 10;
+    test_flexicast_ack_delay = UINT64_MAX;
+    transmit(client, server);
+    ok(test_flexicast_ack_delay == 30);
+    exchange_flexicast_until_idle(client, server);
+    ok(client->egress.flexicast_control.count == 0);
+    quicly_flexicast_flow_free(receiver);
+    quicly_flexicast_flow_free(source);
+
+Exit:
     quicly_free(client);
     quicly_free(server);
     quicly_free_default_cid_encryptor(quic_ctx.cid_encryptor);
@@ -5073,8 +5277,7 @@ static void do_test_multipath_cc_limited_drain_and_resume(size_t busy_path, int 
     ok(busy->loss.sentmap.bytes_in_flight == 0);
     ok(scheduler_can_send(client));
 
-    /* Keep DATAGRAMs queued behind a second full window. The ACKs leave sendable work on this path until the queued tail
-     * is emitted or discarded; a fresh small burst immediately after that must be app-limited without another ACK. */
+    /* keep DATAGRAMs queued behind a second full window; emitting or discarding the queued tail ends CC limitation */
     num_packets = 0;
     while (busy->loss.sentmap.bytes_in_flight < busy_cwnd && num_packets != PTLS_ELEMENTSOF(flight))
         cc_test_send_datagram(client, busy_path, &flight[num_packets++]);
@@ -5117,7 +5320,7 @@ static void do_test_multipath_cc_limited_drain_and_resume(size_t busy_path, int 
         quic_now += QUICLY_DELAYED_ACK_TIMEOUT;
         ok(transmit_multipath(server, client) != 0);
         ok(busy->cc.cwnd == busy_cwnd);
-        /* Even an ACK smaller than an MTU must not accumulate credit toward later window growth. */
+        /* even an ACK smaller than an MTU must not accumulate credit toward later window growth */
         ok(busy->cc.state.pico.bytes_to_mtu_increase == bytes_to_mtu_increase);
         ok(idle->cc.cwnd == idle_cwnd);
     }
@@ -5564,6 +5767,7 @@ int main(int argc, char **argv)
         subtest("flexicast-control-receive", test_flexicast_control_receive);
         subtest("flexicast-announce-order", test_flexicast_announce_order);
         subtest("flexicast-control-exchange", test_flexicast_control_exchange);
+        subtest("flexicast-control-send-timing", test_flexicast_control_send_timing);
         subtest("flexicast-receive-error", test_flexicast_receive_error);
         goto Exit;
     }
@@ -5634,6 +5838,7 @@ int main(int argc, char **argv)
     subtest("flexicast-control-receive", test_flexicast_control_receive);
     subtest("flexicast-announce-order", test_flexicast_announce_order);
     subtest("flexicast-control-exchange", test_flexicast_control_exchange);
+    subtest("flexicast-control-send-timing", test_flexicast_control_send_timing);
     subtest("flexicast-receive-error", test_flexicast_receive_error);
     subtest("stop-sending-open", test_stop_sending_after_shutdown, 0);
     subtest("stop-sending-before-fin", test_stop_sending_after_shutdown, 1);

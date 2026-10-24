@@ -1,7 +1,3 @@
-/*
- * Copyright (c) 2026 Joseph Calderon
- * SPDX-License-Identifier: MIT
- */
 #include "picotest.h"
 #include "picotls/openssl.h"
 #include "quicly/defaults.h"
@@ -79,7 +75,7 @@ static void test_multicast_feedback_epochs(void)
     quicly_flexicast_cc_on_feedback(cc, &feedback);
     quicly_flexicast_cc_get_output(cc, &output);
     ok(output.rate_bytes_per_second == 700000 && output.loss_reduction_events == 1);
-    /* Replayed reports must not defer the missing-feedback deadline. */
+    /* replayed reports do not defer the missing-feedback deadline */
     quicly_flexicast_cc_on_timeout(cc, 500);
     quicly_flexicast_cc_get_output(cc, &output);
     ok(output.next_timeout == 600);
@@ -148,7 +144,7 @@ static void test_adaptive_hint_epochs(void)
     quicly_flexicast_cc_set_hints(cc, &hints, 122);
     quicly_flexicast_cc_get_output(cc, &output);
     ok(output.rate_bytes_per_second == 10000);
-    /* Older clean measurements cannot clear the current load episode. */
+    /* older clean measurements do not clear the current load episode */
     for (uint64_t epoch = 1; epoch != 4; ++epoch) {
         hints = (quicly_flexicast_cc_hints_t){.external_load_epoch = epoch};
         quicly_flexicast_cc_set_hints(cc, &hints, 130 + (int64_t)epoch);
@@ -170,6 +166,43 @@ static void test_adaptive_hint_epochs(void)
     quicly_flexicast_cc_get_output(cc, &output);
     ok(output.rate_bytes_per_second > 10000);
     quicly_flexicast_cc_free(cc);
+}
+
+static void test_adaptive_sender_growth(void)
+{
+    const struct {
+        uint32_t active_senders;
+        uint64_t increase[2];
+    } cases[] = {{0, {125000, 125000000}},
+                 {1, {125000, 125000000}},
+                 {4, {62500, 62500000}},
+                 {9, {41666, 41666666}},
+                 {16, {31250, 31250000}},
+                 {18446744, {1200, 29103}},
+                 {18446745, {1200, 29103}},
+                 {UINT32_MAX, {1200, 1907}}};
+    const uint64_t rates[] = {1000000, 1000000000};
+
+    /* exercise both the datagram floor and proportional growth around the old scaled-sender overflow */
+    for (size_t i = 0; i != PTLS_ELEMENTSOF(cases); ++i) {
+        for (size_t j = 0; j != PTLS_ELEMENTSOF(rates); ++j) {
+            quicly_flexicast_cc_config_t config = regression_config();
+            quicly_flexicast_cc_t *cc;
+            quicly_flexicast_cc_output_t output;
+            config.startup_rate_bytes_per_second = rates[j];
+            config.maximum_rate_bytes_per_second = 0;
+            ok(quicly_flexicast_cc_create(&cc, &quicly_flexicast_cc_type_adaptive, &config, 0) == 0);
+            quicly_flexicast_cc_on_member_added(cc, 1, 0);
+            quicly_flexicast_cc_hints_t hints = {.active_senders = cases[i].active_senders};
+            quicly_flexicast_cc_set_hints(cc, &hints, 0);
+            quicly_flexicast_feedback_t feedback = {.member_id = 1, .epoch = 1, .acked_packets = 1, .now = 100};
+            quicly_flexicast_cc_on_feedback(cc, &feedback);
+            quicly_flexicast_cc_get_output(cc, &output);
+            ok(output.rate_bytes_per_second == rates[j] + cases[i].increase[j]);
+            ok(output.ack_growth_events == 1);
+            quicly_flexicast_cc_free(cc);
+        }
+    }
 }
 
 static void test_adaptive_maximum_rate_recovery(void)
@@ -196,7 +229,7 @@ static void test_member_map_collisions(void)
     flexicast_member_map_t map = {0};
     uint64_t ids[32];
     ok(flexicast_member_map_init(&map, 32) == 0);
-    /* All probe chains wrap around the end of the table. */
+    /* all probe chains wrap around the end of the table */
     for (uint64_t id = 1, count = 0; count != 32; ++id) {
         if ((flexicast_member_hash(id) & (map.capacity - 1)) == map.capacity - 1)
             ids[count++] = id;
@@ -267,8 +300,7 @@ static void test_rekey_inactive_members(void)
         quicly_flexicast_cc_get_flow_output(flow, &output);
         ok(output.timeout_reduction_events == 0 && output.rate_bytes_per_second == idle_rate);
 
-        /* Only member 2 has resumed listening. Member 1 must not constrain
-         * its rate or collect missing-feedback probes. */
+        /* suspended member 1 does not constrain rate or collect missing-feedback probes */
         ok(quicly_flexicast_attach_at(flow, 2, 1400) == QUICLY_FLEXICAST_OK);
         quicly_flexicast_cc_get_flow_output(flow, &output);
         ok(output.next_timeout > 1400 && output.next_timeout != INT64_MAX);
@@ -284,7 +316,7 @@ static void test_rekey_inactive_members(void)
         if (types[t] == &quicly_flexicast_cc_type_multicast)
             ok(output.limiting_member_id == 2 && output.rate_bytes_per_second > learned_rate);
 
-        /* Suspending preserves path history, unlike removing the member. */
+        /* suspending preserves path history */
         ok(quicly_flexicast_detach_at(flow, 2, 1800) == QUICLY_FLEXICAST_OK);
         ok(quicly_flexicast_attach_at(flow, 1, 1800) == QUICLY_FLEXICAST_OK);
         quicly_flexicast_cc_get_flow_output(flow, &output);
@@ -356,6 +388,7 @@ void test_flexicast_cc_regressions(void)
     subtest("multicast-feedback-epochs", test_multicast_feedback_epochs);
     subtest("adaptive-rate-limit", test_adaptive_rate_limit);
     subtest("adaptive-hint-epochs", test_adaptive_hint_epochs);
+    subtest("adaptive-sender-growth", test_adaptive_sender_growth);
     subtest("adaptive-maximum-rate-recovery", test_adaptive_maximum_rate_recovery);
     subtest("member-map-collisions", test_member_map_collisions);
     subtest("rekey-inactive-members", test_rekey_inactive_members);

@@ -1,7 +1,3 @@
-/*
- * Copyright (c) 2026 Joseph Calderon
- * SPDX-License-Identifier: MIT
- */
 #include "flexicast_cc_internal.h"
 #include "flexicast_member_map.h"
 
@@ -115,7 +111,7 @@ static int64_t deadline(int64_t now, uint64_t delay)
     return delay > (uint64_t)(INT64_MAX - now) ? INT64_MAX : now + (int64_t)delay;
 }
 
-/* Decisions are separated by elapsed time, not by wall-clock bucket edges. */
+/* separate decisions by elapsed time rather than wall-clock bucket edges */
 static int control_due(const adaptive_state_t *state, int64_t now, int64_t previous, uint64_t previous_epoch)
 {
     return previous_epoch == 0 || now >= deadline(previous, control_interval(state));
@@ -137,8 +133,7 @@ static uint32_t expire_drain(adaptive_state_t *state, int64_t now)
 
 static void update_output(adaptive_state_t *state, uint64_t member_id, uint32_t reason, quicly_flexicast_cc_output_t *output)
 {
-    /* The aggregate limit remains in effect across feedback and recovery
-     * events. Keep the controller's rate bounded as well as its output. */
+    /* keep the controller rate and output bounded by the aggregate rate limit */
     state->rate = clamp_rate(&state->config, state->rate);
     if (state->hints.aggregate_rate_limit_bytes_per_second != 0 &&
         state->rate > state->hints.aggregate_rate_limit_bytes_per_second) {
@@ -262,9 +257,20 @@ static void adaptive_on_epoch_reset(void *_state, int64_t now, quicly_flexicast_
     update_output(state, 0, reason, output);
 }
 
-/* The ceiling is in physical bytes/second. Cap before every potentially
- * overflowing product: delivery * fanout / clean_fraction cannot exceed the
- * historical pacing rate, even for extreme direct-controller inputs. */
+static uint32_t ratio_ppm(uint64_t numerator, uint64_t denominator)
+{
+    if (numerator == 0 || denominator == 0)
+        return 0;
+    if (numerator >= denominator)
+        return LOSS_SCALE;
+    while (numerator > UINT64_MAX / LOSS_SCALE) {
+        numerator >>= 1;
+        denominator >>= 1;
+    }
+    return (uint32_t)(numerator * LOSS_SCALE / denominator);
+}
+
+/* cap before multiplying so delivery * fanout / clean_fraction cannot overflow */
 static uint64_t delivery_rate_ceiling(uint64_t delivery, uint32_t fanout, uint32_t clean_fraction, uint64_t reference)
 {
     if (delivery > reference / fanout)
@@ -302,8 +308,7 @@ static int update_delivery_ratio(adaptive_state_t *state, adaptive_member_t *mem
             feedback->delivery_sample_sent_at_end > feedback->delivery_sample_acked_at_end ||
             feedback->delivery_sample_acked_at_end > feedback->now ||
             feedback->now > deadline(feedback->delivery_sample_acked_at_end, state->config.feedback_timeout_msec)) {
-            /* Unknown or limited sending cannot distinguish available capacity
-             * from offered load. */
+            /* unknown or limited sending cannot distinguish capacity from offered load */
             member->recent_delivery_rate = 0;
             member->delivery_reference_rate = 0;
             member->degraded_delivery_epochs = 0;
@@ -326,13 +331,11 @@ static int update_delivery_ratio(adaptive_state_t *state, adaptive_member_t *mem
         uint32_t clean_fraction = member->baseline_delivery_ratio_ppm != 0 ? member->baseline_delivery_ratio_ppm : LOSS_SCALE;
         member->delivery_ceiling = delivery_rate_ceiling(sample_rate, divisor, clean_fraction, reference_rate);
         member->delivery_ceiling_eligible = 1;
-        member->delivery_sample_ratio_ppm =
-            sample_rate >= expected ? LOSS_SCALE : (uint32_t)((double)sample_rate / (double)expected * LOSS_SCALE);
+        member->delivery_sample_ratio_ppm = ratio_ppm(sample_rate, expected);
         member->delivery_sample_post_cut =
             state->last_reduction_epoch == 0 || feedback->delivery_sample_sent_at_start >= state->last_reduction_at;
         if (!member->delivery_sample_post_cut) {
-            /* Old sending can still bound capacity, but cannot justify growth or
-             * teach a clean baseline for the new rate. Keep that history separate. */
+            /* pre-cut sending can bound capacity, but cannot justify growth or baseline learning */
             member->recent_delivery_rate = 0;
             member->degraded_delivery_epochs = 0;
             return 0;
@@ -344,12 +347,8 @@ static int update_delivery_ratio(adaptive_state_t *state, adaptive_member_t *mem
     else
         member->recent_delivery_rate =
             member->recent_delivery_rate / 4 * 3 + sample_rate / 4 + (member->recent_delivery_rate % 4 * 3 + sample_rate % 4) / 4;
-    /* Native samples use the rate and fanout at submission. Legacy direct
-     * callers retain their current-rate convention. Never blend native rates
-     * from different sending contexts or count repeated publications twice. */
-    uint32_t sample = member->recent_delivery_rate >= expected
-                          ? LOSS_SCALE
-                          : (uint32_t)((double)member->recent_delivery_rate / (double)expected * LOSS_SCALE);
+    /* native samples use submission rate and fanout; legacy callers use current rate */
+    uint32_t sample = ratio_ppm(member->recent_delivery_rate, expected);
     if (member->baseline_delivery_ratio_ppm == 0)
         member->baseline_delivery_ratio_ppm = LOSS_SCALE;
     member->recent_delivery_ratio_ppm = sample;
@@ -404,8 +403,7 @@ static void learn_clean_delivery_ratio(adaptive_member_t *member)
     if (member->baseline_delivery_ratio_ppm == 0 || member->recent_delivery_ratio_ppm == 0)
         return;
     if (member->degraded_delivery_epochs >= 4) {
-        /* Stable delivery loss without queue growth is the radio baseline.
-         * Neither repairs nor a congestion sample may teach this baseline. */
+        /* stable delivery loss without queue growth updates the radio baseline */
         member->baseline_delivery_ratio_ppm = member->recent_delivery_ratio_ppm;
         member->degraded_delivery_epochs = 0;
     } else if (member->degraded_delivery_epochs == 0) {
@@ -417,8 +415,10 @@ static void learn_clean_delivery_ratio(adaptive_member_t *member)
 
 static uint32_t loss_ppm(const quicly_flexicast_feedback_t *feedback)
 {
-    double total = (double)feedback->acked_packets + (double)feedback->lost_packets;
-    return total == 0 ? 0 : (uint32_t)((double)feedback->lost_packets / total * LOSS_SCALE);
+    uint64_t total = UINT64_MAX - feedback->acked_packets < feedback->lost_packets
+                         ? UINT64_MAX
+                         : feedback->acked_packets + feedback->lost_packets;
+    return ratio_ppm(feedback->lost_packets, total);
 }
 
 static int external_load(const adaptive_state_t *state)
@@ -427,9 +427,7 @@ static int external_load(const adaptive_state_t *state)
            state->hints.external_load_oldest_age_msec != 0;
 }
 
-/* Observe for one sender interval before using a single current capacity
- * sample. The short impulse is an experiment, not a persistent rate cap:
- * neither later samples nor correlated receivers can move its target/deadline. */
+/* observe for one sender interval before activating a bounded drain episode */
 static uint32_t update_drain(adaptive_state_t *state, const adaptive_member_t *member, const quicly_flexicast_feedback_t *feedback,
                              int fresh_native_rtt, int delay_grew, int delivery_congested)
 {
@@ -519,8 +517,7 @@ static void adaptive_on_feedback(void *_state, const quicly_flexicast_feedback_t
                                            : has_delivery && member->degraded_delivery_epochs != 0;
     int fresh_native_rtt = fresh_rtt && (feedback->rtt_sample_flags & QUICLY_FLEXICAST_RTT_PRESENT) != 0;
     reason |= update_drain(state, member, feedback, fresh_native_rtt, delay_grew, delivery_congested);
-    /* New external-load hints cannot renew an active impulse or veto fresh
-     * congestion evidence. Explicitly limited delivery remains ineligible. */
+    /* external load cannot renew an active drain episode or veto fresh congestion */
     int drain_step = state->drain.phase == DRAIN_ACTIVE && state->rate > state->drain.target && member->delivery_ceiling_eligible &&
                      fresh_native_rtt && delay_grew;
     int congested =
@@ -528,16 +525,12 @@ static void adaptive_on_feedback(void *_state, const quicly_flexicast_feedback_t
                                                        observed_loss > member->baseline_loss_ppm + 20000));
 
     if (congested || delay_grew) {
-        /* Any member can veto growth. One sender clock bounds correlated
-         * receiver reports, but persistent congestion can reduce again on the
-         * next clock tick without first requiring an impossible clean queue. */
+        /* any member can veto growth; one sender clock bounds correlated reductions */
         state->growth_blocked_until = deadline(feedback->now, control_interval(state) * 2);
         state->startup_probes = STARTUP_PROBES;
         member->flat_loss_epochs = 0;
         reason |= feedback->ecn_ce_count != 0 ? QUICLY_FLEXICAST_CC_REASON_ECN : QUICLY_FLEXICAST_CC_REASON_RTT;
-        /* New sending can justify an earlier ceiling cut. Historical samples
-         * retain the ordinary clock. RTT time guards post-cut ACK receipt,
-         * not packet submission; the complete delivery interval is post-cut. */
+        /* post-cut sending and post-cut RTT allow an early ceiling cut after 125 ms */
         int early_delivery_cut = state->last_reduction_epoch != 0 && native_sample && fresh_delivery &&
                                  member->delivery_sample_post_cut && delivery_congested && feedback->ecn_ce_count == 0 &&
                                  (feedback->rtt_sample_flags & QUICLY_FLEXICAST_RTT_PRESENT) != 0 && fresh_rtt && delay_grew &&
@@ -548,8 +541,7 @@ static void adaptive_on_feedback(void *_state, const quicly_flexicast_feedback_t
             if (feedback->ecn_ce_count != 0) {
                 state->rate = scale_rate(state->rate, 850000, LOSS_SCALE);
             } else if (delivery_congested || drain_step) {
-                /* Native history sets an absolute ceiling. Legacy callers
-                 * without submission context retain their EWMA ratio policy. */
+                /* native history sets an absolute ceiling; legacy callers use EWMA ratio */
                 uint64_t next = state->rate;
                 if (delivery_congested)
                     next = native_sample ? member->delivery_ceiling
@@ -631,8 +623,7 @@ static void adaptive_on_timeout(void *_state, int64_t now, quicly_flexicast_cc_o
             state->last_reduction_at = now;
             state->growth_blocked_until = deadline(now, control_interval(state) * 2);
         }
-        /* At the floor, ordinary pacing still permits bounded probe traffic.
-         * Silence never authorizes a rate increase or disables congestion. */
+        /* silence never authorizes a rate increase or clears congestion */
         state->next_timeout = deadline(now, state->config.feedback_timeout_msec);
         reason |= QUICLY_FLEXICAST_CC_REASON_TIMEOUT;
     }
@@ -648,8 +639,7 @@ static void adaptive_set_hints(void *_state, const quicly_flexicast_cc_hints_t *
     quicly_flexicast_cc_hints_t previous_hints = state->hints;
     state->hints = *hints;
     if (hints->external_load_epoch != 0 && !fresh_load_epoch) {
-        /* A repeated or reordered measurement cannot change the load episode
-         * or supply another recovery observation. Other hints remain live. */
+        /* ignore repeated or reordered external-load epochs while keeping other hints */
         state->hints.external_load_epoch = previous_hints.external_load_epoch;
         state->hints.external_load_queued_bytes = previous_hints.external_load_queued_bytes;
         state->hints.external_load_oldest_age_msec = previous_hints.external_load_oldest_age_msec;

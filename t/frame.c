@@ -59,7 +59,7 @@ static void test_ack_decode_underflow(void)
         const uint8_t pat[] = {2, 0, 1, 0, 3, 0}, *src = pat;
         ok(quicly_decode_ack_frame(&src, pat + sizeof(pat), &decoded, 0) != 0);
     }
-    { /* Ranges beyond the retained limit must still be checked for underflow. */
+    { /* ranges beyond the retained limit must still be checked for underflow */
         uint8_t pat[2 * QUICLY_ACK_MAX_GAPS + 32], *end = pat;
         const uint8_t *src = pat;
         end = quicly_encodev(end, 2 * QUICLY_ACK_MAX_GAPS);

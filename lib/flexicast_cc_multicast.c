@@ -1,7 +1,3 @@
-/*
- * Copyright (c) 2026 Joseph Calderon
- * SPDX-License-Identifier: MIT
- */
 #include "flexicast_cc_internal.h"
 #include "flexicast_member_map.h"
 
@@ -312,9 +308,7 @@ static void multicast_on_feedback(void *_state, const quicly_flexicast_feedback_
         }
         reason |= QUICLY_FLEXICAST_CC_REASON_LOSS;
     } else if (queue_delay_grew(member->minimum_rtt, feedback->latest_rtt_msec)) {
-        /* One elevated queue is one congestion episode. Repeated ACKs from
-         * that episode freeze growth instead of multiplying the rate down to
-         * the floor. A normal RTT sample rearms the detector. */
+        /* treat one elevated queue episode as a single reduction until normal RTT rearms */
         if (!member->rtt_congested)
             member->rate = scale_rate(member->rate, 7, 10);
         member->rtt_congested = 1;

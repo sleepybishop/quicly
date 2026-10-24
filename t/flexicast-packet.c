@@ -1,24 +1,3 @@
-/*
- * Copyright (c) 2026 Joseph Calderon
- *
- * Permission is hereby granted, free of charge, to any person obtaining a copy
- * of this software and associated documentation files (the "Software"), to
- * deal in the Software without restriction, including without limitation the
- * rights to use, copy, modify, merge, publish, distribute, sublicense, and/or
- * sell copies of the Software, and to permit persons to whom the Software is
- * furnished to do so, subject to the following conditions:
- *
- * The above copyright notice and this permission notice shall be included in
- * all copies or substantial portions of the Software.
- *
- * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
- * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
- * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
- * AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
- * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING
- * FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS
- * IN THE SOFTWARE.
- */
 #include "picotls/openssl.h"
 #include "quicly/defaults.h"
 #include "quicly/flexicast.h"
@@ -41,8 +20,7 @@ static quicly_flexicast_flow_t *packet_flow(uint64_t first_packet_number, size_t
     return flow;
 }
 
-/* Construct independent wire packets, without the Flexicast sender's fixed
- * packet-number width or DATAGRAM framing choices. */
+/* construct independent wire packets */
 static size_t protect_packet(uint8_t *packet, unsigned pn_length, uint64_t pn, uint8_t flags,
                              const uint8_t *plain, size_t plain_size)
 {
@@ -82,7 +60,7 @@ static void test_packet_layouts(void)
     };
     const size_t sizes[] = {6, 5, 7, 7, 7, 5};
     for (unsigned pn_length = 1; pn_length <= 4; ++pn_length) {
-        /* Cross each truncated-number boundary with a nonzero epoch floor. */
+        /* cross each truncated-number boundary with a nonzero epoch floor */
         uint64_t first_pn = UINT64_C(1) << (pn_length * 8);
         quicly_flexicast_flow_t *flow = packet_flow(first_pn, 0);
         for (size_t i = 0; i != PTLS_ELEMENTSOF(layouts); ++i) {
@@ -140,6 +118,12 @@ static void test_packet_atomicity(void)
     count = 2;
     ok(quicly_flexicast_receive_datagrams_at(flow, packet, size, payloads, &count, &pn, 10) == 0);
     ok(count == 2 && pn == 0 && quicly_flexicast_ack_is_due(flow, 10));
+    size = protect_packet(packet, 2, 0, 0, two, sizeof(two));
+    payloads[0] = ptls_iovec_init(NULL, 99);
+    count = 1;
+    ok(quicly_flexicast_receive_datagrams_at(flow, packet, size, payloads, &count, &pn, 11) ==
+       QUICLY_FLEXICAST_ERROR_REPLAY);
+    ok(count == 1 && payloads[0].base == NULL && payloads[0].len == 99);
     quicly_flexicast_flow_free(flow);
 }
 
@@ -238,24 +222,17 @@ static void test_padding_history_bound(void)
     size = protect_packet(packet, 2, num_padding * 2, 0, plain, sizeof(plain));
     count = 0;
     ok(quicly_flexicast_receive_datagrams_at(flow, packet, size, NULL, &count, &pn, num_padding) == 0);
-    size_t ranges = 0, batches = 0;
-    uint64_t smallest = UINT64_MAX, largest = 0;
-    while (quicly_flexicast_ack_is_due(flow, num_padding) && batches <= QUICLY_FLEXICAST_SENT_WINDOW / QUICLY_MAX_ACK_BLOCKS) {
-        ok(quicly_flexicast_encode_pending_ack(flow, encoded, sizeof(encoded), num_padding, &encoded_size) == 0);
-        const uint8_t *src = encoded, *end = src + encoded_size;
-        ok(quicly_decodev(&src, end) == QUICLY_FRAME_TYPE_PATH_ACK);
-        ok(quicly_decodev(&src, end) == packet_flow_id);
-        quicly_ack_frame_t ack;
-        ok(quicly_decode_ack_frame(&src, end, &ack, 0) == 0);
-        if (batches == 0)
-            smallest = ack.smallest_acknowledged;
-        largest = ack.largest_acknowledged;
-        ranges += ack.num_gaps + 1;
-        ++batches;
-        quicly_flexicast_ack_sent(flow);
-    }
-    ok(ranges == QUICLY_FLEXICAST_SENT_WINDOW);
-    ok(smallest == 18 && largest == num_padding * 2);
+    ok(quicly_flexicast_ack_is_due(flow, num_padding));
+    ok(quicly_flexicast_encode_pending_ack(flow, encoded, sizeof(encoded), num_padding, &encoded_size) == 0);
+    const uint8_t *src = encoded, *end = src + encoded_size;
+    ok(quicly_decodev(&src, end) == QUICLY_FRAME_TYPE_PATH_ACK);
+    ok(quicly_decodev(&src, end) == packet_flow_id);
+    quicly_ack_frame_t ack;
+    ok(quicly_decode_ack_frame(&src, end, &ack, 0) == 0);
+    ok(ack.num_gaps + 1 == QUICLY_MAX_ACK_BLOCKS);
+    ok(ack.smallest_acknowledged == (num_padding - QUICLY_MAX_ACK_BLOCKS + 1) * 2 &&
+       ack.largest_acknowledged == num_padding * 2);
+    quicly_flexicast_ack_sent(flow);
     ok(!quicly_flexicast_ack_is_due(flow, num_padding));
     quicly_flexicast_flow_free(flow);
 }

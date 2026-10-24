@@ -1,6 +1,4 @@
-/* A conditional faster cut is permitted by new send-side evidence, not merely
- * another ACK or a new wall-clock bucket. These are deterministic policy tests;
- * useful transport latency and throughput must be measured independently. */
+/* conditional faster cut policy tests */
 static void test_adaptive_cadence(void)
 {
     quicly_flexicast_cc_t *cc = adaptive_ceiling_after_first_cut();
@@ -19,16 +17,14 @@ static void test_adaptive_cadence(void)
     ok(adaptive_test_output(cc).rate_reduction_events == 4);
     quicly_flexicast_cc_free(cc);
 
-    /* A historical ceiling just below today's rate still uses the existing
-     * minimum 10% decrease, even on the accelerated branch. */
+    /* ceiling just below current rate still applies the minimum 10% decrease */
     cc = adaptive_ceiling_after_first_cut();
     quicly_flexicast_feedback_t near_ceiling = adaptive_context_sample(2, 325, 100000, 1, 48000, 80);
     quicly_flexicast_cc_on_feedback(cc, &near_ceiling);
     ok(adaptive_test_output(cc).rate_bytes_per_second == 45000);
     quicly_flexicast_cc_free(cc);
 
-    /* A sample spanning any pre-cut sending retains the normal 250 ms path.
-     * Equality of the send boundary is intentionally inclusive. */
+    /* samples spanning pre-cut sending retain the normal 250 ms path */
     for (size_t post_cut = 0; post_cut != 2; ++post_cut) {
         cc = adaptive_ceiling_after_first_cut();
         quicly_flexicast_feedback_t feedback = adaptive_context_sample(2, 325, 50000, 1, 10000, 80);
@@ -46,9 +42,7 @@ static void test_adaptive_cadence(void)
         quicly_flexicast_cc_free(cc);
     }
 
-    /* RTT receipt is an independent watermark. A fresh measurement completed
-     * exactly at the prior cut is allowed even when its packet was sent before
-     * it. The stricter inferred-packet-send diagnostic is not this policy. */
+    /* RTT receipt is an independent watermark */
     for (size_t at_cut = 0; at_cut != 2; ++at_cut) {
         cc = adaptive_ceiling_after_first_cut();
         quicly_flexicast_feedback_t feedback = adaptive_context_sample(2, 325, 50000, 1, 10000, 80);
@@ -59,8 +53,7 @@ static void test_adaptive_cadence(void)
         quicly_flexicast_cc_free(cc);
     }
 
-    /* Neither exact/republication duplicates nor malformed, unknown or
-     * supply-limited provenance may enter the faster path. */
+    /* duplicates or invalid provenance cannot enter the faster path */
     for (size_t invalid = 0; invalid != 20; ++invalid) {
         cc = adaptive_ceiling_after_first_cut();
         quicly_flexicast_feedback_t feedback = adaptive_context_sample(2, 325, 50000, 1, 10000, 80);
@@ -91,8 +84,7 @@ static void test_adaptive_cadence(void)
         quicly_flexicast_cc_free(cc);
     }
 
-    /* A rejected publication's identity is consumed. Fixing its flags in a
-     * later split ACK cannot make the same publication new evidence. */
+    /* rejected publication epoch is consumed and cannot be reused */
     cc = adaptive_ceiling_after_first_cut();
     quicly_flexicast_feedback_t feedback = adaptive_context_sample(2, 325, 50000, 1, 10000, 80);
     feedback.delivery_sample_flags |= QUICLY_FLEXICAST_SAMPLE_HOST_LIMITED;
@@ -106,9 +98,7 @@ static void test_adaptive_cadence(void)
     ok(adaptive_test_output(cc).rate_bytes_per_second == 25000);
     quicly_flexicast_cc_free(cc);
 
-    /* Historical fanout controls the physical ceiling, regardless of the
-     * current scheduler's hint. A native lower rate alone is not congestion
-     * without fresh queue evidence. */
+    /* historical fanout controls the physical ceiling */
     const uint32_t fanouts[] = {1, 2, 4};
     for (size_t i = 0; i != sizeof(fanouts) / sizeof(fanouts[0]); ++i) {
         cc = adaptive_ceiling_after_first_cut();
@@ -128,8 +118,7 @@ static void test_adaptive_cadence(void)
     }
     quicly_flexicast_cc_free(cc);
 
-    /* All members share the latest actual reduction clock. Correlated member
-     * feedback at the same time cannot spend 32 cuts; 124 ms remains too soon. */
+    /* all members share the reduction clock */
     cc = adaptive_test_new(100000, 2000, 32);
     feedback = adaptive_context_sample(1, 200, 100000, 1, 10000, 80);
     quicly_flexicast_cc_on_feedback(cc, &feedback);
@@ -139,8 +128,7 @@ static void test_adaptive_cadence(void)
         for (uint64_t member = 1; member <= 32; ++member) {
             feedback = adaptive_context_sample(step + 2, group_times[step], 50000, 1, 1000, 80);
             feedback.member_id = member;
-            /* Even allow a same-millisecond send boundary for later members:
-             * the sender clock, independently of old context, must protect us. */
+            /* allow same-millisecond send boundary for later members */
             feedback.delivery_sample_sent_at_start = group_times[step];
             feedback.delivery_sample_sent_at_end = group_times[step];
             feedback.delivery_sample_acked_at_start = group_times[step] - 1;
@@ -152,8 +140,7 @@ static void test_adaptive_cadence(void)
     ok(adaptive_test_output(cc).rate_reduction_events == 3);
     quicly_flexicast_cc_free(cc);
 
-    /* CE never takes the faster path, even with otherwise eligible delivery.
-     * An early delivery cut resets the shared clock for the following CE. */
+    /* CE never takes the faster path */
     for (size_t first_early = 0; first_early != 2; ++first_early) {
         cc = adaptive_ceiling_after_first_cut();
         feedback = adaptive_context_sample(2, 325, 50000, 1, 10000, 80);
@@ -171,8 +158,7 @@ static void test_adaptive_cadence(void)
         quicly_flexicast_cc_free(cc);
     }
 
-    /* Fresh queued RTT plus independent loss remains a 10% cut at 250 ms;
-     * a full delivery rate supplies no excuse to accelerate it. */
+    /* fresh queued RTT plus loss stays on the 250 ms path */
     cc = adaptive_ceiling_after_first_cut();
     for (size_t step = 0; step != 2; ++step) {
         feedback = adaptive_context_sample(step + 2, step ? 450 : 325, 50000, 1, 50000, 80);
@@ -192,8 +178,7 @@ static void test_adaptive_cadence(void)
     }
     quicly_flexicast_cc_free(cc);
 
-    /* Legacy direct callers retain their previous ratio policy and 250 ms
-     * reduction interval, even if they happen to populate unused timestamps. */
+    /* legacy callers without sample flags retain the 250 ms interval */
     cc = adaptive_test_new(100000, 2000, 1);
     for (size_t step = 0; step != 3; ++step) {
         feedback = adaptive_context_sample(step + 1, step == 0 ? 200 : step == 1 ? 325 : 450,
@@ -205,8 +190,7 @@ static void test_adaptive_cadence(void)
     }
     quicly_flexicast_cc_free(cc);
 
-    /* Growth stays on its 250 ms clock. Faster delivery cuts must not
-     * shorten growth/probing intervals as a side effect. */
+    /* growth stays on its 250 ms clock */
     cc = adaptive_test_new(100000, 2000, 1);
     const int64_t growth_times[] = {200, 325, 450};
     const uint64_t growth_rates[] = {106250, 106250, 112890};
@@ -218,8 +202,7 @@ static void test_adaptive_cadence(void)
     }
     quicly_flexicast_cc_free(cc);
 
-    /* Floor and aggregate-cap no-ops retain their established semantics. The
-     * floor can stop an early cut; a lower aggregate cap still takes priority. */
+    /* floor and aggregate-cap no-ops retain established semantics */
     cc = adaptive_test_new(100000, 30000, 1);
     ok(quicly_flexicast_cc_enable_trace(cc, 1) == 0);
     for (uint64_t epoch = 1; epoch <= 3; ++epoch) {
@@ -240,8 +223,7 @@ static void test_adaptive_cadence(void)
     ok(adaptive_test_output(cc).rate_bytes_per_second == 1000);
     quicly_flexicast_cc_free(cc);
 
-    /* A configured ordinary interval shorter than 125 ms remains available;
-     * adding the conditional alternative cannot slow the original path. */
+    /* configured ordinary interval shorter than 125 ms remains available */
     quicly_flexicast_cc_config_t config = {.maximum_members = 1,
         .startup_rate_bytes_per_second = 100000, .minimum_rate_bytes_per_second = 2000,
         .maximum_rate_bytes_per_second = 1000000, .maximum_datagram_size = 1200,

@@ -206,13 +206,9 @@ QUICLY_CALLBACK_TYPE(quicly_error_t, stream_open, quicly_stream_t *stream);
  *
  */
 QUICLY_CALLBACK_TYPE(void, receive_datagram_frame, quicly_conn_t *conn, ptls_iovec_t payload);
-/** Called synchronously for FC control frames. Borrowed fields are valid only during the callback.
- * The application owns flow registration, per-flow sequence ordering, address-family selection, and membership transitions.
- * Discard stale announcements before considering their addresses or applying flow updates. */
+/* called synchronously for FC control frames; application owns flow state, sequence ordering, and membership */
 QUICLY_CALLBACK_TYPE(quicly_error_t, receive_flexicast_frame, quicly_conn_t *conn, const quicly_flexicast_frame_t *frame);
-/** Receives a PATH_ACK for the experimental Flexicast flow-ID namespace (above the local unicast path limit).
- * ack_delay is converted to milliseconds using the peer's ACK-delay exponent before this callback.
- * The application must validate the flow ID and associate the authenticated connection with a member. */
+/* receives a PATH_ACK for a flexicast flow ID (above local max_path_id) with ack_delay in msec */
 QUICLY_CALLBACK_TYPE(quicly_error_t, receive_flexicast_ack, quicly_conn_t *conn, uint64_t flow_id, const quicly_ack_frame_t *frame);
 /**
  * Called when the connection is closed (i.e., when entering the closing or draining state). Otherwise the callback is not called;
@@ -483,9 +479,9 @@ struct st_quicly_context_t {
      * callback for receiving datagram frame
      */
     quicly_receive_datagram_frame_t *receive_datagram_frame;
-    /** callback for draft-navarre-quic-flexicast control frames */
+    /* callback for draft-navarre-quic-flexicast control frames */
     quicly_receive_flexicast_frame_t *receive_flexicast_frame;
-    /** callback for PATH_ACK feedback referring to a Flexicast Flow ID */
+    /* callback for PATH_ACK feedback referring to a flexicast flow ID */
     quicly_receive_flexicast_ack_t *receive_flexicast_ack;
     /**
      * callback called when a connection enters closing or draining
@@ -1870,12 +1866,9 @@ size_t quicly_get_num_datagram_frames_path(quicly_conn_t *conn, size_t path_inde
 void quicly_send_datagram_frames_path(quicly_conn_t *conn, size_t path_index, ptls_iovec_t *datagrams, size_t num_datagrams);
 int quicly_has_datagram_frames(quicly_conn_t *conn);
 #define QUICLY_AMTQ_ADAPTER_API 1
-/** Current path/peer framing limit for one DATAGRAM application payload.
- * Zero means 1-RTT/path/DATAGRAM support or queue capacity is unavailable.
- * Congestion and pacing still govern when queued frames can leave. */
+/* current path/peer framing limit for one DATAGRAM payload; zero if unavailable */
 size_t quicly_get_datagram_payload_limit(quicly_conn_t *conn, size_t path_index);
-/** Discard locally queued DATAGRAMs on this path; already emitted packets
- * cannot be recalled. Call before send after application authorization changes. */
+/* discard locally queued DATAGRAMs on this path before send */
 void quicly_discard_datagram_frames(quicly_conn_t *conn, size_t path_index);
 /**
  * Sets CC to the specified type. Returns a boolean indicating if the operation was successful.

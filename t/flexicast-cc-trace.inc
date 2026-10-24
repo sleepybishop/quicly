@@ -1,5 +1,4 @@
-/* Trace state is observational: enabling, overflowing, draining and disabling
- * a ring must not change any controller output or transition counter. */
+/* trace state is observational and must not change controller output */
 static void trace_test_event(quicly_flexicast_cc_t *cc, size_t step)
 {
     int64_t now = 100 + (int64_t)step * 1000;
