@@ -49,6 +49,9 @@ SET(PICOTLS_OPENSSL_FILES
 SET(QUICLY_LIBRARY_FILES
     lib/bplus_ranges.c
     lib/frame.c
+    lib/flexicast_cc.c
+    lib/flexicast_cc_multicast.c
+    lib/flexicast_cc_adaptive.c
     lib/cc-cubic.c
     lib/cc-pico.c
     lib/defaults.c
