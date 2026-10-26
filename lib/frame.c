@@ -190,3 +190,218 @@ uint8_t *quicly_encode_close_frame(uint8_t *const base, uint64_t error_code, uin
 {
     return base + encode_close_frame(base, error_code, offending_frame_type, reason_phrase);
 }
+
+static int valid_flow_id(const quicly_flexicast_flow_id_t *flow_id)
+{
+    return flow_id != NULL && flow_id->len >= 1 && flow_id->len <= QUICLY_FLEXICAST_MAX_FLOW_ID_SIZE;
+}
+
+static int valid_varint(uint64_t value)
+{
+    return value <= PTLS_QUICINT_MAX;
+}
+
+static size_t frame_prefix_capacity(uint64_t frame_type, const quicly_flexicast_flow_id_t *flow_id, uint64_t sequence)
+{
+    if (!valid_flow_id(flow_id) || !valid_varint(sequence))
+        return 0;
+    return quicly_encodev_capacity(frame_type) + 1 + flow_id->len + quicly_encodev_capacity(sequence);
+}
+
+static uint8_t *encode_frame_prefix(uint8_t *dst, uint64_t frame_type, const quicly_flexicast_flow_id_t *flow_id, uint64_t sequence)
+{
+    dst = quicly_encodev(dst, frame_type);
+    *dst++ = flow_id->len;
+    memcpy(dst, flow_id->bytes, flow_id->len);
+    dst += flow_id->len;
+    return quicly_encodev(dst, sequence);
+}
+
+static int decode_frame_prefix(const uint8_t **src, const uint8_t *end, uint64_t expected_type, quicly_flexicast_flow_id_t *flow_id,
+                               uint64_t *sequence)
+{
+    uint64_t frame_type;
+
+    if ((frame_type = quicly_decodev(src, end)) == UINT64_MAX || frame_type != expected_type || *src == end)
+        return QUICLY_FLEXICAST_ERROR_FRAME_ENCODING;
+    flow_id->len = *(*src)++;
+    if (!valid_flow_id(flow_id) || (size_t)(end - *src) < flow_id->len)
+        return QUICLY_FLEXICAST_ERROR_FRAME_ENCODING;
+    memcpy(flow_id->bytes, *src, flow_id->len);
+    *src += flow_id->len;
+    if ((*sequence = quicly_decodev(src, end)) == UINT64_MAX)
+        return QUICLY_FLEXICAST_ERROR_FRAME_ENCODING;
+    return QUICLY_FLEXICAST_OK;
+}
+
+size_t quicly_flexicast_announce_frame_capacity(const quicly_flexicast_announce_frame_t *frame)
+{
+    size_t prefix, address_size;
+
+    if (frame == NULL || (frame->ip_version != 4 && frame->ip_version != 6) ||
+        (prefix = frame_prefix_capacity(QUICLY_FRAME_TYPE_FC_ANNOUNCE, &frame->flow_id, frame->sequence)) == 0)
+        return 0;
+    address_size = frame->ip_version == 4 ? 4 : 16;
+    return prefix + 1 + 2 * address_size + 2 + 8;
+}
+
+int quicly_flexicast_encode_announce_frame(uint8_t *dst, size_t capacity, const quicly_flexicast_announce_frame_t *frame,
+                                           size_t *encoded_size)
+{
+    size_t required, address_size;
+    uint8_t *start = dst;
+
+    if (dst == NULL || encoded_size == NULL || (required = quicly_flexicast_announce_frame_capacity(frame)) == 0)
+        return QUICLY_FLEXICAST_ERROR_INVALID;
+    if (capacity < required)
+        return QUICLY_FLEXICAST_ERROR_BUFFER_TOO_SMALL;
+    address_size = frame->ip_version == 4 ? 4 : 16;
+    dst = encode_frame_prefix(dst, QUICLY_FRAME_TYPE_FC_ANNOUNCE, &frame->flow_id, frame->sequence);
+    *dst++ = frame->ip_version;
+    memcpy(dst, frame->source_ip, address_size);
+    dst += address_size;
+    memcpy(dst, frame->group_ip, address_size);
+    dst += address_size;
+    dst = quicly_encode16(dst, frame->udp_port);
+    dst = quicly_encode64(dst, frame->ack_delay_msec);
+    *encoded_size = dst - start;
+    return QUICLY_FLEXICAST_OK;
+}
+
+int quicly_flexicast_decode_announce_frame(const uint8_t *src, size_t len, quicly_flexicast_announce_frame_t *frame,
+                                           size_t *consumed)
+{
+    const uint8_t *start = src, *end;
+    size_t address_size;
+    int ret;
+
+    if (src == NULL || frame == NULL || consumed == NULL)
+        return QUICLY_FLEXICAST_ERROR_INVALID;
+    end = src + len;
+    memset(frame, 0, sizeof(*frame));
+    if ((ret = decode_frame_prefix(&src, end, QUICLY_FRAME_TYPE_FC_ANNOUNCE, &frame->flow_id, &frame->sequence)) != 0)
+        return ret;
+    if (src == end || (*src != 4 && *src != 6))
+        return QUICLY_FLEXICAST_ERROR_FRAME_ENCODING;
+    frame->ip_version = *src++;
+    address_size = frame->ip_version == 4 ? 4 : 16;
+    if ((size_t)(end - src) < 2 * address_size + 2 + 8)
+        return QUICLY_FLEXICAST_ERROR_FRAME_ENCODING;
+    memcpy(frame->source_ip, src, address_size);
+    src += address_size;
+    memcpy(frame->group_ip, src, address_size);
+    src += address_size;
+    frame->udp_port = quicly_decode16(&src);
+    frame->ack_delay_msec = quicly_decode64(&src);
+    *consumed = src - start;
+    return QUICLY_FLEXICAST_OK;
+}
+
+static int valid_state_action(uint64_t action)
+{
+    return action == QUICLY_FLEXICAST_STATE_JOIN || action == QUICLY_FLEXICAST_STATE_LEAVE ||
+           action == QUICLY_FLEXICAST_STATE_LISTEN;
+}
+
+size_t quicly_flexicast_state_frame_capacity(const quicly_flexicast_state_frame_t *frame)
+{
+    size_t prefix;
+
+    if (frame == NULL || !valid_state_action(frame->action) ||
+        (prefix = frame_prefix_capacity(QUICLY_FRAME_TYPE_FC_STATE, &frame->flow_id, frame->sequence)) == 0)
+        return 0;
+    return prefix + 8;
+}
+
+int quicly_flexicast_encode_state_frame(uint8_t *dst, size_t capacity, const quicly_flexicast_state_frame_t *frame,
+                                        size_t *encoded_size)
+{
+    size_t required;
+    uint8_t *start = dst;
+
+    if (dst == NULL || encoded_size == NULL || (required = quicly_flexicast_state_frame_capacity(frame)) == 0)
+        return QUICLY_FLEXICAST_ERROR_INVALID;
+    if (capacity < required)
+        return QUICLY_FLEXICAST_ERROR_BUFFER_TOO_SMALL;
+    dst = encode_frame_prefix(dst, QUICLY_FRAME_TYPE_FC_STATE, &frame->flow_id, frame->sequence);
+    dst = quicly_encode64(dst, frame->action);
+    *encoded_size = dst - start;
+    return QUICLY_FLEXICAST_OK;
+}
+
+int quicly_flexicast_decode_state_frame(const uint8_t *src, size_t len, quicly_flexicast_state_frame_t *frame, size_t *consumed)
+{
+    const uint8_t *start = src, *end;
+    int ret;
+
+    if (src == NULL || frame == NULL || consumed == NULL)
+        return QUICLY_FLEXICAST_ERROR_INVALID;
+    end = src + len;
+    memset(frame, 0, sizeof(*frame));
+    if ((ret = decode_frame_prefix(&src, end, QUICLY_FRAME_TYPE_FC_STATE, &frame->flow_id, &frame->sequence)) != 0)
+        return ret;
+    if ((size_t)(end - src) < 8)
+        return QUICLY_FLEXICAST_ERROR_FRAME_ENCODING;
+    frame->action = quicly_decode64(&src);
+    if (!valid_state_action(frame->action))
+        return QUICLY_FLEXICAST_ERROR_PROTOCOL_VIOLATION;
+    *consumed = src - start;
+    return QUICLY_FLEXICAST_OK;
+}
+
+size_t quicly_flexicast_key_frame_capacity(const quicly_flexicast_key_frame_t *frame)
+{
+    size_t prefix, key_len_capacity;
+
+    if (frame == NULL || !valid_varint(frame->first_packet_number) || frame->key.len > PTLS_QUICINT_MAX ||
+        (frame->key.len != 0 && frame->key.base == NULL) ||
+        (prefix = frame_prefix_capacity(QUICLY_FRAME_TYPE_FC_KEY, &frame->flow_id, frame->sequence)) == 0)
+        return 0;
+    key_len_capacity = quicly_encodev_capacity(frame->key.len);
+    if (frame->key.len > SIZE_MAX - prefix - quicly_encodev_capacity(frame->first_packet_number) - key_len_capacity - 8)
+        return 0;
+    return prefix + quicly_encodev_capacity(frame->first_packet_number) + key_len_capacity + frame->key.len + 8;
+}
+
+int quicly_flexicast_encode_key_frame(uint8_t *dst, size_t capacity, const quicly_flexicast_key_frame_t *frame,
+                                      size_t *encoded_size)
+{
+    size_t required;
+    uint8_t *start = dst;
+
+    if (dst == NULL || encoded_size == NULL || (required = quicly_flexicast_key_frame_capacity(frame)) == 0)
+        return QUICLY_FLEXICAST_ERROR_INVALID;
+    if (capacity < required)
+        return QUICLY_FLEXICAST_ERROR_BUFFER_TOO_SMALL;
+    dst = encode_frame_prefix(dst, QUICLY_FRAME_TYPE_FC_KEY, &frame->flow_id, frame->sequence);
+    dst = quicly_encodev(dst, frame->first_packet_number);
+    dst = quicly_encodev(dst, frame->key.len);
+    if (frame->key.len != 0)
+        memcpy(dst, frame->key.base, frame->key.len);
+    dst += frame->key.len;
+    dst = quicly_encode64(dst, frame->algorithm);
+    *encoded_size = dst - start;
+    return QUICLY_FLEXICAST_OK;
+}
+
+int quicly_flexicast_decode_key_frame(const uint8_t *src, size_t len, quicly_flexicast_key_frame_t *frame, size_t *consumed)
+{
+    const uint8_t *start = src, *end;
+    uint64_t key_len;
+    int ret;
+
+    if (src == NULL || frame == NULL || consumed == NULL)
+        return QUICLY_FLEXICAST_ERROR_INVALID;
+    end = src + len;
+    memset(frame, 0, sizeof(*frame));
+    if ((ret = decode_frame_prefix(&src, end, QUICLY_FRAME_TYPE_FC_KEY, &frame->flow_id, &frame->sequence)) != 0)
+        return ret;
+    if ((frame->first_packet_number = quicly_decodev(&src, end)) == UINT64_MAX ||
+        (key_len = quicly_decodev(&src, end)) == UINT64_MAX || (size_t)(end - src) < 8 || key_len > (uint64_t)((end - src) - 8))
+        return QUICLY_FLEXICAST_ERROR_FRAME_ENCODING;
+    frame->key = ptls_iovec_init(src, (size_t)key_len);
+    src += key_len;
+    frame->algorithm = quicly_decode64(&src);
+    *consumed = src - start;
+    return QUICLY_FLEXICAST_OK;
+}

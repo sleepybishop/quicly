@@ -21,53 +21,11 @@ extern "C" {
 #define QUICLY_FLEXICAST_DEFAULT_ACK_FREQUENCY 8
 #define QUICLY_FLEXICAST_MAX_ACK_ENCODED_SIZE 2048
 
-/* provisional frame types for draft-navarre-quic-flexicast-03 */
-#define QUICLY_FRAME_TYPE_FC_ANNOUNCE 0x173e00
-#define QUICLY_FRAME_TYPE_FC_STATE 0x173e01
-#define QUICLY_FRAME_TYPE_FC_KEY 0x173e02
-
-#define QUICLY_FLEXICAST_STATE_JOIN 1
-#define QUICLY_FLEXICAST_STATE_LEAVE 2
-#define QUICLY_FLEXICAST_STATE_LISTEN 3
 /* source compatibility with draft -02 */
 #define QUICLY_FLEXICAST_STATE_READY QUICLY_FLEXICAST_STATE_LISTEN
 
 /* experimental DATAGRAM-only shared-path primitive */
 typedef struct st_quicly_flexicast_flow_t quicly_flexicast_flow_t;
-
-typedef enum en_quicly_flexicast_result_t {
-    QUICLY_FLEXICAST_OK = 0,
-    QUICLY_FLEXICAST_ERROR_INVALID = -1,
-    QUICLY_FLEXICAST_ERROR_NO_MEMORY = -2,
-    QUICLY_FLEXICAST_ERROR_CRYPTO = -3,
-    QUICLY_FLEXICAST_ERROR_WRONG_FLOW = -4,
-    QUICLY_FLEXICAST_ERROR_REPLAY = -5,
-    QUICLY_FLEXICAST_ERROR_NO_MEMBERS = -6,
-    QUICLY_FLEXICAST_ERROR_MEMBER_LIMIT = -7,
-    QUICLY_FLEXICAST_ERROR_SEND_WINDOW = -8,
-    QUICLY_FLEXICAST_ERROR_NOT_FOUND = -9,
-    QUICLY_FLEXICAST_ERROR_BUFFER_TOO_SMALL = -10,
-    QUICLY_FLEXICAST_ERROR_FRAME_ENCODING = -11,
-    QUICLY_FLEXICAST_ERROR_PROTOCOL_VIOLATION = -12,
-    QUICLY_FLEXICAST_ERROR_AEAD_LIMIT_REACHED = -13,
-    QUICLY_FLEXICAST_ERROR_KEY_UPDATE_REQUIRED = -14
-} quicly_flexicast_result_t;
-
-size_t quicly_flexicast_announce_frame_capacity(const quicly_flexicast_announce_frame_t *frame);
-int quicly_flexicast_encode_announce_frame(uint8_t *dst, size_t capacity, const quicly_flexicast_announce_frame_t *frame,
-                                           size_t *encoded_size);
-int quicly_flexicast_decode_announce_frame(const uint8_t *src, size_t len, quicly_flexicast_announce_frame_t *frame,
-                                           size_t *consumed);
-
-size_t quicly_flexicast_state_frame_capacity(const quicly_flexicast_state_frame_t *frame);
-int quicly_flexicast_encode_state_frame(uint8_t *dst, size_t capacity, const quicly_flexicast_state_frame_t *frame,
-                                        size_t *encoded_size);
-int quicly_flexicast_decode_state_frame(const uint8_t *src, size_t len, quicly_flexicast_state_frame_t *frame, size_t *consumed);
-
-size_t quicly_flexicast_key_frame_capacity(const quicly_flexicast_key_frame_t *frame);
-int quicly_flexicast_encode_key_frame(uint8_t *dst, size_t capacity, const quicly_flexicast_key_frame_t *frame,
-                                      size_t *encoded_size);
-int quicly_flexicast_decode_key_frame(const uint8_t *src, size_t len, quicly_flexicast_key_frame_t *frame, size_t *consumed);
 
 /* true only after both flexicast and MPQUIC have been negotiated */
 int quicly_flexicast_is_negotiated(quicly_conn_t *conn);
