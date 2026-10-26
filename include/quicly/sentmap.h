@@ -31,6 +31,7 @@ extern "C" {
 #include "quicly/constants.h"
 #include "quicly/maxsender.h"
 #include "quicly/sendstate.h"
+#include "quicly/cc-bbr-sampler.h"
 
 typedef struct st_quicly_sent_t quicly_sent_t;
 typedef struct st_quicly_sentmap_t quicly_sentmap_t;
@@ -114,6 +115,8 @@ struct st_quicly_sent_t {
     quicly_sent_acked_cb acked;
     union {
         quicly_sent_packet_t packet;
+        quicly_bbr_packet_times_t bbr_times;
+        quicly_bbr_packet_meta_t bbr_meta;
         /**
          * ACK frame. Represents up to 8 ack ranges. If not full, `additional` list is terminated by .gap = 0.
          */
@@ -375,6 +378,9 @@ inline const quicly_sent_packet_t *quicly_sentmap_get(quicly_sentmap_iter_t *ite
     assert(iter->p->acked == quicly_sentmap__type_packet);
     return &iter->p->data.packet;
 }
+
+/* Internal frame lookup; the returned entry is valid until the map changes. */
+quicly_sent_t *quicly_sentmap_find_frame(const quicly_sentmap_iter_t *packet, quicly_sent_acked_cb callback);
 
 #ifdef __cplusplus
 }

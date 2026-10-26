@@ -51,6 +51,9 @@ SET(QUICLY_LIBRARY_FILES
     lib/frame.c
     lib/cc-cubic.c
     lib/cc-pico.c
+    lib/cc-bbr.c
+    lib/cc-bbr-engine.c
+    lib/cc-bbr-sampler.c
     lib/defaults.c
     lib/local_cid.c
     lib/loss.c
@@ -67,6 +70,7 @@ SET(QUICLY_LIBRARY_FILES
 SET(UNITTEST_SOURCE_FILES
     deps/picotest/picotest.c
     t/bplus_ranges.c
+    t/bbr-sampler.c
     t/cc.c
     t/frame.c
     t/jumpstart.c

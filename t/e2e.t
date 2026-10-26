@@ -104,6 +104,14 @@ subtest "hello" => sub {
     };
 };
 
+subtest "bbr-transfer" => sub {
+    my $guard = spawn_server("-C", "bbr:10:p");
+    my $resp = `$cli -C bbr:10:p -p /120000 127.0.0.1 $port 2> /dev/null`;
+    is $?, 0, "BBR client completed";
+    is length($resp), 120000, "BBR transferred the complete response";
+    is md5_hex($resp), md5_hex("hello world\n" x 10000), "BBR response contents match";
+};
+
 subtest "datagram" => sub {
     my $guard = spawn_server("-D");
     my $resp = `$cli -D 127.0.0.1 $port 2> /dev/null`;

@@ -414,3 +414,66 @@ static void test_multipath_health_rtt_matrix(void)
         }
     }
 }
+
+static void test_requested_probe_before_application_keys(void)
+{
+    quicly_conn_t *client;
+    ok(quicly_connect(&client, &quic_ctx, "example.com", &fake_address.sa, NULL, new_master_id(), ptls_iovec_init(NULL, 0), NULL,
+                        NULL, NULL) == 0);
+    quicly_address_t dest, src;
+    struct iovec datagrams[8];
+    uint8_t buf[PTLS_ELEMENTSOF(datagrams) * quic_ctx.transport_params.max_udp_payload_size];
+    size_t count = PTLS_ELEMENTSOF(datagrams);
+    ok(quicly_send(client, &dest, &src, datagrams, &count, buf, sizeof(buf)) == 0);
+    ok(count != 0);
+    int64_t deadline = quicly_get_first_timeout(client);
+    ok(deadline > quic_now);
+
+    /* Path zero exists before application keys. Accepting a probe here would
+     * leave an immediately due control frame that the send path cannot emit. */
+    ok(quicly_request_path_probe(client, 0) == -1);
+    ok(!client->path_spaces[0]->health.confirmation_pending);
+    ok(quicly_get_first_timeout(client) == deadline);
+    count = PTLS_ELEMENTSOF(datagrams);
+    ok(quicly_send(client, &dest, &src, datagrams, &count, buf, sizeof(buf)) == 0);
+    ok(count == 0);
+    ok(quicly_get_first_timeout(client) == deadline);
+
+    /* Allocating the application space alone does not make it writable. */
+    ok(setup_application_space(client) == 0);
+    ok(quicly_request_path_probe(client, 0) == -1);
+    ok(!client->path_spaces[0]->health.confirmation_pending);
+    ok(quicly_get_first_timeout(client) == deadline);
+    quicly_free(client);
+}
+
+static void test_multipath_requested_probe(void)
+{
+    quicly_context_t saved = quic_ctx;
+    int64_t saved_now = quic_now;
+    quicly_conn_t *client, *server;
+    health_setup(&client, &server);
+    quicly_path_space_t *alternative = client->path_spaces[1];
+    uint64_t frames_before = client->super.stats.num_frames_sent.ping + client->super.stats.num_frames_sent.immediate_ack;
+    int64_t old_ack = alternative->health.last_ack_at;
+    ok(quicly_request_path_probe(NULL, 0) == -1);
+    ok(quicly_request_path_probe(client, QUICLY_MAX_PATH_INDICES) == -1);
+    alternative->health.state = QUICLY_PATH_SUSPECT;
+    ok(quicly_request_path_probe(client, 1) == -1);
+    alternative->health.state = QUICLY_PATH_USABLE;
+    for (size_t i = 0; i < 100; ++i)
+        ok(quicly_request_path_probe(client, 1) == 0);
+    for (size_t i = 0; i < 100; ++i) {
+        ++quic_now;
+        transmit_multipath(client, server);
+        transmit_multipath(server, client);
+    }
+    ok(alternative->health.last_ack_at > old_ack);
+    ok(client->super.stats.num_frames_sent.ping + client->super.stats.num_frames_sent.immediate_ack == frames_before + 1);
+    ok(alternative->health.state == QUICLY_PATH_USABLE);
+    quicly_free(client);
+    quicly_free(server);
+    quicly_free_default_cid_encryptor(quic_ctx.cid_encryptor);
+    quic_ctx = saved;
+    quic_now = saved_now;
+}

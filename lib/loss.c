@@ -84,7 +84,10 @@ quicly_error_t quicly_loss_detect_loss(quicly_loss_t *loss, int64_t now, uint32_
         int64_t largest_acked_signed = loss->largest_acked_packet_plus1.per_epoch[sent->ack_epoch] - 1;
         if ((int64_t)sent->packet_number < largest_acked_signed && (CHECK_TIME_THRESHOLD(sent) || CHECK_PACKET_THRESHOLD(sent))) {
             if (sent->cc_bytes_in_flight != 0) {
+                const quicly_sentmap_iter_t *previous_iter = loss->on_loss_iter;
+                loss->on_loss_iter = &iter;
                 on_loss_detected(loss, sent, !CHECK_PACKET_THRESHOLD(sent));
+                loss->on_loss_iter = previous_iter;
                 if ((ret = quicly_sentmap_update(&loss->sentmap, &iter, QUICLY_SENTMAP_EVENT_LOST)) != 0)
                     return ret;
             } else {

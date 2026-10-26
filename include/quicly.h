@@ -1503,6 +1503,14 @@ quicly_error_t quicly_send_stream(quicly_stream_t *stream, quicly_send_context_t
  */
 int quicly_is_path_available(quicly_conn_t *conn, size_t path_index);
 /**
+ * Requests one ACK-eliciting liveness probe on a validated, usable path with
+ * 0-RTT or 1-RTT sending keys available.
+ * Repeated requests coalesce until sent. Normal congestion, pacing, physical
+ * eligibility and amplification limits apply. Does not probe suspect paths
+ * faster than their native PTO recovery. Returns zero on success, -1 if invalid.
+ */
+int quicly_request_path_probe(quicly_conn_t *conn, size_t path_index);
+/**
  * returns whether the stream scheduler has data sendable under connection flow control and current application keys.
  * does not check per-path affinity, physical eligibility, congestion credit, pacing, or queued DATAGRAM frames.
  */

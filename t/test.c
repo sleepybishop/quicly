@@ -4373,6 +4373,7 @@ static void test_multipath_path_loss(void)
 #include "multipath-pacing.h"
 #include "multipath-scheduling.h"
 #include "multipath-health.h"
+#include "bbr-native.h"
 
 #include "datagram-queue.h"
 #include "custom-scheduler-recovery.h"
@@ -4751,6 +4752,15 @@ int main(int argc, char **argv)
     subtest("multipath-automatic-failover", test_multipath_automatic_failover);
     subtest("multipath-failover-disabled", test_multipath_failover_disabled);
     subtest("multipath-health-progress", test_multipath_health_progress);
+    subtest("multipath-requested-probe", test_multipath_requested_probe);
+    subtest("requested-probe-before-application-keys", test_requested_probe_before_application_keys);
+    subtest("bbr-native-accounting", test_bbr_native);
+    subtest("bbr-switch-clock", test_bbr_switch_clock);
+    subtest("bbr-sampler", test_bbr_sampler);
+    subtest("bbr-congestion-and-undo", test_bbr_congestion_and_undo);
+    subtest("bbr-idle-restart", test_bbr_idle_restart);
+    subtest("bbr-blackout", test_bbr_blackout);
+    subtest("bbr-configuration", test_bbr_configuration);
     subtest("multipath-idle-health-recovery", test_multipath_idle_health_recovery);
     subtest("multipath-suspect-affinity", test_multipath_suspect_affinity);
     subtest("multipath-health-rtt-matrix", test_multipath_health_rtt_matrix);
