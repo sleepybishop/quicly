@@ -882,26 +882,20 @@ int quicly_flexicast_send_path_ack(quicly_conn_t *conn, uint64_t flow_id, uint64
     return enqueue_flexicast_control(conn, control, QUICLY_FLEXICAST_OK);
 }
 
-int quicly_flexicast_send_pending_ack(quicly_flexicast_flow_t *flow, quicly_conn_t *conn, int64_t now, int force)
+int quicly_flexicast_send_path_ack_encoded(quicly_conn_t *conn, uint64_t flow_id, const uint8_t *encoded, size_t encoded_size,
+                                           int64_t now)
 {
-    uint8_t encoded[QUICLY_FLEXICAST_MAX_ACK_ENCODED_SIZE];
-    size_t encoded_size;
     quicly_flexicast_control_t *control;
     int ret;
 
-    if (flow == NULL || conn == NULL || !quicly_is_client(conn) ||
-        quicly_flexicast_get_flow_id(flow) <= conn->super.remote.max_path_id)
+    if (conn == NULL || !quicly_is_client(conn) || flow_id <= conn->super.remote.max_path_id)
         return QUICLY_FLEXICAST_ERROR_PROTOCOL_VIOLATION;
-    if (quicly_flexicast_get_ack_deadline(flow) == INT64_MAX || (!force && !quicly_flexicast_ack_is_due(flow, now)))
-        return QUICLY_FLEXICAST_OK;
-    if ((ret = quicly_flexicast_encode_pending_ack(flow, encoded, sizeof(encoded), now, &encoded_size)) != QUICLY_FLEXICAST_OK)
-        return ret;
     if ((ret = alloc_flexicast_control(conn, QUICLY_FRAME_TYPE_PATH_ACK, encoded_size, &control)) != 0)
         return ret;
     memcpy(control->encoded, encoded, encoded_size);
     enqueue_flexicast_control(conn, control, QUICLY_FLEXICAST_OK);
-    control->ack.queued_at = now;
-    quicly_flexicast_ack_sent(flow);
+    if (now != 0)
+        control->ack.queued_at = now;
     return QUICLY_FLEXICAST_OK;
 }
 
@@ -7866,7 +7860,7 @@ size_t quicly_get_datagram_payload_limit(quicly_conn_t *conn, size_t path_index)
         return 0;
     struct st_quicly_conn_path_t *path = get_path(conn, path_index);
     if (path == NULL || path->abandoned || path->dcid == UINT64_MAX ||
-        path->datagram_frame_payloads.count == PTLS_ELEMENTSOF(path->datagram_frame_payloads.payloads))
+        path->datagram_frame_payloads.count >= quicly_get_max_datagram_frames_path(conn, path_index))
         return 0;
     const quicly_cid_t *dcid = get_dcid(conn, path_index);
     size_t overhead = 1 + dcid->len + QUICLY_SEND_PN_SIZE + conn->application->cipher.egress.key.aead->algo->tag_size;
@@ -7894,9 +7888,7 @@ void quicly_discard_datagram_frames(quicly_conn_t *conn, size_t path_index)
     if (path_index >= QUICLY_MAX_PATH_INDICES || get_path(conn, path_index) == NULL)
         return;
     struct st_quicly_conn_path_t *path = get_path(conn, path_index);
-    for (size_t i = 0; i < path->datagram_frame_payloads.count; ++i)
-        free(path->datagram_frame_payloads.payloads[i].base);
-    path->datagram_frame_payloads.count = 0;
+    clear_path_datagram_frame_payloads(path);
     /* dropping the queued tail ends the CC-limited period before newly queued data is sent */
     if (path->path_space->cc_limited_end_pn == UINT64_MAX &&
         path->path_space->loss.sentmap.bytes_in_flight < path->path_space->cc.cwnd)

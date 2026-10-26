@@ -2301,6 +2301,7 @@ static void test_flexicast_control_send_timing(void)
         goto Exit;
     ok(client->egress.flexicast_control.count == 0);
 
+#if QUICLY_HAVE_FLEXICAST
     /* the timestamp used to encode a pending ACK can precede the enqueue callback's clock */
     uint8_t secret[32] = {0}, multicast_packet[256];
     quicly_flexicast_config_t config = {.flow_id = 12345,
@@ -2328,6 +2329,7 @@ static void test_flexicast_control_send_timing(void)
     ok(client->egress.flexicast_control.count == 0);
     quicly_flexicast_flow_free(receiver);
     quicly_flexicast_flow_free(source);
+#endif
 
 Exit:
     quicly_free(client);
@@ -5217,6 +5219,7 @@ int main(int argc, char **argv)
 
     quicly_amend_ptls_context(quic_ctx.tls);
 
+#if QUICLY_HAVE_FLEXICAST
     if (argc == 2 && strcmp(argv[1], "--flexicast") == 0) {
         subtest("transport-parameters", test_transport_parameters);
         subtest("flexicast", test_flexicast);
@@ -5228,6 +5231,7 @@ int main(int argc, char **argv)
         subtest("flexicast-receive-error", test_flexicast_receive_error);
         goto Exit;
     }
+#endif
 
     if (argc == 2 && strcmp(argv[1], "--multipath-lifecycle") == 0) {
         subtest("multipath-tuple-lifecycle", test_multipath_tuple_lifecycle);
@@ -5290,7 +5294,9 @@ int main(int argc, char **argv)
     subtest("fractional-close-timeout", test_fractional_close_timeout);
     subtest("time-threshold-loss-episode", test_time_threshold_loss_episode);
     subtest("time-threshold-loss-in-recovery", test_time_threshold_loss_in_recovery);
+#if QUICLY_HAVE_FLEXICAST
     subtest("flexicast", test_flexicast);
+#endif
     subtest("flexicast-control-queue", test_flexicast_control_queue);
     subtest("flexicast-control-receive", test_flexicast_control_receive);
     subtest("flexicast-announce-order", test_flexicast_announce_order);

@@ -96,45 +96,8 @@ typedef union st_quicly_address_t {
     struct sockaddr_in6 sin6;
 } quicly_address_t;
 
-#define QUICLY_FLEXICAST_MAX_FLOW_ID_SIZE 20
-
-typedef struct st_quicly_flexicast_flow_id_t {
-    uint8_t len;
-    uint8_t bytes[QUICLY_FLEXICAST_MAX_FLOW_ID_SIZE];
-} quicly_flexicast_flow_id_t;
-
-typedef struct st_quicly_flexicast_announce_frame_t {
-    quicly_flexicast_flow_id_t flow_id;
-    uint64_t sequence;
-    uint8_t ip_version;
-    uint8_t source_ip[16];
-    uint8_t group_ip[16];
-    uint16_t udp_port;
-    uint64_t ack_delay_msec;
-} quicly_flexicast_announce_frame_t;
-
-typedef struct st_quicly_flexicast_state_frame_t {
-    quicly_flexicast_flow_id_t flow_id;
-    uint64_t sequence;
-    uint64_t action;
-} quicly_flexicast_state_frame_t;
-
-typedef struct st_quicly_flexicast_key_frame_t {
-    quicly_flexicast_flow_id_t flow_id;
-    uint64_t sequence;
-    uint64_t first_packet_number;
-    ptls_iovec_t key;
-    uint64_t algorithm;
-} quicly_flexicast_key_frame_t;
-
-typedef struct st_quicly_flexicast_frame_t {
-    uint64_t type;
-    union {
-        quicly_flexicast_announce_frame_t announce;
-        quicly_flexicast_state_frame_t state;
-        quicly_flexicast_key_frame_t key;
-    } data;
-} quicly_flexicast_frame_t;
+int quicly_flexicast_send_path_ack_encoded(quicly_conn_t *conn, uint64_t flow_id, const uint8_t *encoded, size_t encoded_size,
+                                           int64_t now);
 
 typedef struct st_quicly_context_t quicly_context_t;
 typedef struct st_quicly_stream_t quicly_stream_t;
