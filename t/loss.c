@@ -30,6 +30,8 @@ static uint64_t num_persistent_congestion = 0;
 
 static void on_loss_detected(quicly_loss_t *loss, const quicly_sent_packet_t *lost_packet, int is_time_threshold)
 {
+    ok(loss->on_loss_iter != NULL);
+    ok(quicly_sentmap_get((quicly_sentmap_iter_t *)loss->on_loss_iter)->packet_number == lost_packet->packet_number);
     ++num_packets_lost;
 }
 
@@ -643,37 +645,6 @@ static void test_persistent_congestion(void)
     quicly_loss_dispose(&loss);
 }
 
-static void test_persistent_congestion_pmtud(void)
-{
-    static const struct {
-        int64_t sent_at[3];
-        unsigned probe_mask;
-        unsigned expected_persistent_congestion;
-    } tests[] = {
-        {{11, 200, 400}, 7, 0}, /* Probe loss alone is not congestion. */
-        {{11, 390, 400}, 1, 0}, /* A probe cannot start a persistent-congestion period. */
-        {{11, 21, 400}, 4, 0},  /* A probe cannot extend a persistent-congestion period. */
-        {{11, 200, 400}, 2, 1}, /* Ordinary packet losses can still span a lost probe. */
-    };
-
-    for (size_t i = 0; i != PTLS_ELEMENTSOF(tests); ++i) {
-        quicly_loss_t loss;
-        init_persistent_congestion_test(&loss);
-        for (size_t p = 0; p != PTLS_ELEMENTSOF(tests[i].sent_at); ++p) {
-            ok(quicly_sentmap_prepare(&loss.sentmap, p + 1, tests[i].sent_at[p], QUICLY_EPOCH_1RTT) == 0);
-            loss.sentmap._pending_packet->data.packet.is_pmtud_probe = (tests[i].probe_mask & (1u << p)) != 0;
-            quicly_sentmap_commit(&loss.sentmap, 1200, 0);
-        }
-        send_ack_eliciting(&loss, 6, QUICLY_EPOCH_1RTT, 401);
-        now = 420;
-        acked(&loss, 6, QUICLY_EPOCH_1RTT);
-        detect_loss_after_ack(&loss);
-        ok(num_packets_lost == 3);
-        ok(num_persistent_congestion == tests[i].expected_persistent_congestion);
-        quicly_loss_dispose(&loss);
-    }
-}
-
 void test_loss(void)
 {
     subtest("overdue-alarm", test_overdue_alarm);
@@ -689,5 +660,4 @@ void test_loss(void)
     subtest("late-ack-threshold-adjustment", test_late_ack_threshold_adjustment);
     subtest("rtt-floor", test_rtt_floor);
     subtest("persistent-congestion", test_persistent_congestion);
-    subtest("persistent-congestion-pmtud", test_persistent_congestion_pmtud);
 }

@@ -36,6 +36,7 @@ extern "C" {
 #include "quicly/constants.h"
 #include "quicly/pacer.h"
 #include "quicly/loss.h"
+#include "quicly/cc-bbr.h"
 
 #define QUICLY_MIN_CWND 2
 /**
@@ -302,6 +303,7 @@ typedef struct st_quicly_cc_t {
      * State information specific to the congestion controller implementation.
      */
     union {
+        quicly_cc_bbr_t bbr;
         /**
          * State information shared by Reno, Pico, Cubic, and Cuback.
          */
@@ -514,12 +516,12 @@ struct st_quicly_cc_type_t {
  * The type objects for each CC. These can be used for testing the type of each `quicly_cc_t`.
  */
 extern quicly_cc_type_t quicly_cc_type_reno, quicly_cc_type_cubic, quicly_cc_type_cubic_legacy, quicly_cc_type_pico,
-    quicly_cc_type_cuback;
+    quicly_cc_type_cuback, quicly_cc_type_bbr;
 /**
  * The factory methods for each CC.
  */
 extern struct st_quicly_init_cc_t quicly_cc_reno_init, quicly_cc_cubic_init, quicly_cc_cubic_legacy_init, quicly_cc_pico_init,
-    quicly_cc_cuback_init;
+    quicly_cc_cuback_init, quicly_cc_bbr_init;
 
 /**
  * A null-terminated list of all CC types.

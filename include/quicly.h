@@ -96,45 +96,8 @@ typedef union st_quicly_address_t {
     struct sockaddr_in6 sin6;
 } quicly_address_t;
 
-#define QUICLY_FLEXICAST_MAX_FLOW_ID_SIZE 20
-
-typedef struct st_quicly_flexicast_flow_id_t {
-    uint8_t len;
-    uint8_t bytes[QUICLY_FLEXICAST_MAX_FLOW_ID_SIZE];
-} quicly_flexicast_flow_id_t;
-
-typedef struct st_quicly_flexicast_announce_frame_t {
-    quicly_flexicast_flow_id_t flow_id;
-    uint64_t sequence;
-    uint8_t ip_version;
-    uint8_t source_ip[16];
-    uint8_t group_ip[16];
-    uint16_t udp_port;
-    uint64_t ack_delay_msec;
-} quicly_flexicast_announce_frame_t;
-
-typedef struct st_quicly_flexicast_state_frame_t {
-    quicly_flexicast_flow_id_t flow_id;
-    uint64_t sequence;
-    uint64_t action;
-} quicly_flexicast_state_frame_t;
-
-typedef struct st_quicly_flexicast_key_frame_t {
-    quicly_flexicast_flow_id_t flow_id;
-    uint64_t sequence;
-    uint64_t first_packet_number;
-    ptls_iovec_t key;
-    uint64_t algorithm;
-} quicly_flexicast_key_frame_t;
-
-typedef struct st_quicly_flexicast_frame_t {
-    uint64_t type;
-    union {
-        quicly_flexicast_announce_frame_t announce;
-        quicly_flexicast_state_frame_t state;
-        quicly_flexicast_key_frame_t key;
-    } data;
-} quicly_flexicast_frame_t;
+int quicly_flexicast_send_path_ack_encoded(quicly_conn_t *conn, uint64_t flow_id, const uint8_t *encoded, size_t encoded_size,
+                                           int64_t now);
 
 typedef struct st_quicly_context_t quicly_context_t;
 typedef struct st_quicly_stream_t quicly_stream_t;
@@ -351,6 +314,10 @@ typedef struct st_quicly_transport_parameters_t {
     /**
      *
      */
+    uint8_t reset_stream_at : 1;
+    /**
+     *
+     */
     uint64_t active_connection_id_limit;
     /**
      *
@@ -360,15 +327,15 @@ typedef struct st_quicly_transport_parameters_t {
     uint8_t enable_multipath : 1;
     /** multipath extension maximum path ID */
     uint64_t initial_max_path_id;
-    /* grease_quic_bit (RFC 9287) */
-    uint8_t grease_quic_bit : 1;
-    /* version information (RFC 9368) */
-    quicly_version_information_t version_information;
     /** address families supported by draft-navarre-quic-flexicast-03 */
     struct {
         uint8_t ipv4 : 1;
         uint8_t ipv6 : 1;
     } flexicast_support;
+    /* grease_quic_bit (RFC 9287) */
+    uint8_t grease_quic_bit : 1;
+    /* version information (RFC 9368) */
+    quicly_version_information_t version_information;
 } quicly_transport_parameters_t;
 
 typedef struct st_quicly_salt_t {
@@ -580,6 +547,10 @@ struct st_quicly_context_t {
      * recovery requires ACKs of two separately sent, fresh ack-eliciting packets. set before creating connections.
      */
     unsigned multipath_failover_pto_threshold;
+    /**
+     * maximum number of DATAGRAM frame payloads that can be queued per path (0 uses default)
+     */
+    size_t max_datagram_frame_payloads;
 };
 
 /**
@@ -744,7 +715,7 @@ struct st_quicly_conn_streamgroup_state_t {
         uint64_t padding, ping, ack, reset_stream, stop_sending, crypto, new_token, stream, max_data, max_stream_data,             \
             max_streams_bidi, max_streams_uni, data_blocked, stream_data_blocked, streams_blocked, new_connection_id,              \
             retire_connection_id, path_challenge, path_response, transport_close, application_close, handshake_done, datagram,     \
-            ack_frequency, immediate_ack, path_ack, path_abandon, path_status, path_new_connection_id, path_retire_connection_id,  \
+            ack_frequency, immediate_ack, reset_stream_at, path_ack, path_abandon, path_status, path_new_connection_id, path_retire_connection_id,  \
             max_path_id, paths_blocked, path_cids_blocked, fc_announce, fc_state, fc_key;                                          \
     } num_frames_received, num_frames_sent;                                                                                        \
     struct {                                                                                                                       \
@@ -982,6 +953,7 @@ typedef struct st_quicly_path_health_t {
     QUICLY_STATS__DO_FOREACH_NUM_FRAMES(datagram, dir, apply)                                                                      \
     QUICLY_STATS__DO_FOREACH_NUM_FRAMES(ack_frequency, dir, apply)                                                                 \
     QUICLY_STATS__DO_FOREACH_NUM_FRAMES(immediate_ack, dir, apply)                                                                 \
+    QUICLY_STATS__DO_FOREACH_NUM_FRAMES(reset_stream_at, dir, apply) \
     QUICLY_STATS__DO_FOREACH_NUM_FRAMES(path_ack, dir, apply)                                                                      \
     QUICLY_STATS__DO_FOREACH_NUM_FRAMES(path_abandon, dir, apply)                                                                  \
     QUICLY_STATS__DO_FOREACH_NUM_FRAMES(path_status, dir, apply)                                                                   \
@@ -1180,11 +1152,15 @@ typedef struct st_quicly_stream_callbacks_t {
     /**
      * called when data is newly received.  `off` is the offset within the buffer (the beginning position changes as the application
      * calls `quicly_stream_sync_recvbuf`.  Applications should consult `quicly_stream_t::recvstate` to see if it has contiguous
-     * input.
+     * input.  Once `quicly_recvstate_transfer_complete` returns true, the stream has ended.  When the reliable stream reset
+     * extension (draft-ietf-quic-reliable-stream-reset) is used, the closing error code is available as
+     * `quicly_stream_t::recvstate.app_error_code`; it being UINT64_MAX indicates that the stream was closed by a FIN.
      */
     void (*on_receive)(quicly_stream_t *stream, size_t off, const void *src, size_t len);
     /**
-     * called when a RESET_STREAM frame is received
+     * called when the stream is reset with a Reliable Size of zero; i.e., by a RESET_STREAM frame or by a RESET_STREAM_AT frame
+     * carrying zero. If set to NULL, reset are notified as a zero-byte delivery to `on_receive` as if it was a reliable reset; see
+     * `on_receive`.
      */
     void (*on_receive_reset)(quicly_stream_t *stream, quicly_error_t err);
 } quicly_stream_callbacks_t;
@@ -1233,16 +1209,6 @@ struct st_quicly_stream_t {
             quicly_sender_state_t sender_state;
             uint64_t error_code;
         } stop_sending;
-        /**
-         * reset_stream
-         */
-        struct {
-            /**
-             * STATE_NONE until RST is generated
-             */
-            quicly_sender_state_t sender_state;
-            uint64_t error_code;
-        } reset_stream;
         /**
          * sends receive window updates to remote peer
          */
@@ -1588,6 +1554,14 @@ quicly_error_t quicly_send_stream(quicly_stream_t *stream, quicly_send_context_t
  */
 int quicly_is_path_available(quicly_conn_t *conn, size_t path_index);
 /**
+ * Requests one ACK-eliciting liveness probe on a validated, usable path with
+ * 0-RTT or 1-RTT sending keys available.
+ * Repeated requests coalesce until sent. Normal congestion, pacing, physical
+ * eligibility and amplification limits apply. Does not probe suspect paths
+ * faster than their native PTO recovery. Returns zero on success, -1 if invalid.
+ */
+int quicly_request_path_probe(quicly_conn_t *conn, size_t path_index);
+/**
  * returns whether the stream scheduler has data sendable under connection flow control and current application keys.
  * does not check per-path affinity, physical eligibility, congestion credit, pacing, or queued DATAGRAM frames.
  */
@@ -1805,6 +1779,15 @@ uint32_t quicly_get_current_send_path_id(quicly_conn_t *conn, quicly_send_contex
 int quicly_stream_can_send_on_path(quicly_stream_t *stream, quicly_send_context_t *s);
 
 /**
+ * Marks the stream for a reliable reset, committing to the delivery of the first `reliable_size` bytes; see
+ * draft-ietf-quic-reliable-stream-reset. Similarly to a shutdown, bytes remain to be emitted, hence the stream is to be scheduled
+ * by the application calling `quicly_stream_sync_sendbuf`, rather than by this function. `reliable_size` must be non-zero; use
+ * `quicly_reset_stream` to reset a stream immediately. This function can be called up to once per stream, including after the
+ * stream has been shut down, as long as the transfer is incomplete; the application must check
+ * `quicly_sendstate_transfer_complete` beforehand, as it does before calling `quicly_reset_stream`.
+ */
+quicly_error_t quicly_set_reset_stream_at(quicly_stream_t *stream, quicly_error_t err, uint64_t reliable_size);
+/**
  *
  */
 void quicly_request_stop(quicly_stream_t *stream, quicly_error_t err);
@@ -1859,6 +1842,8 @@ static int quicly_stream_is_self_initiated(quicly_stream_t *stream);
 void quicly_send_datagram_frames(quicly_conn_t *conn, ptls_iovec_t *datagrams, size_t num_datagrams);
 /** Returns the number of locally queued DATAGRAM frames, not delivery or ACK status. */
 size_t quicly_get_num_datagram_frames_path(quicly_conn_t *conn, size_t path_index);
+/** Returns the maximum number of DATAGRAM frames that can be queued on the path. */
+size_t quicly_get_max_datagram_frames_path(quicly_conn_t *conn, size_t path_index);
 /**
  * queues DATAGRAM frames on the specified path. built-in schedulers honor this placement even on a backup or a path with repeated
  * PTOs; physical eligibility, validation, congestion, pacing, and SUSPECT health still gate transmission.

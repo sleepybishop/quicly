@@ -196,6 +196,10 @@ static void cubic_reset(quicly_cc_t *cc, uint32_t initcwnd, const quicly_cc_conf
 
 static int cubic_on_switch(quicly_cc_t *cc)
 {
+    if (cc->type == &quicly_cc_type_bbr) {
+        cubic_reset(cc, cc->cwnd_initial, cc->conf);
+        return 1;
+    }
     if (cc->type == &quicly_cc_type_cubic_legacy)
         return 1;
 

@@ -69,10 +69,18 @@ subtest "hello" => sub {
 
     # check if the client receives extra connection IDs
     subtest "initial-ncid" => sub {
+        open my $limit_fh, "-|", "$ENV{BINARY_DIR}/test.t", "--active-connection-id-limit"
+            or die "failed to query compiled connection ID limit:$!";
+        my $active_connection_id_limit = do { local $/; <$limit_fh> } // "";
+        close $limit_fh
+            or die "failed to query compiled connection ID limit:$?";
+        chomp $active_connection_id_limit;
+        die "invalid compiled connection ID limit:$active_connection_id_limit"
+            unless $active_connection_id_limit =~ /\A[1-9][0-9]*\z/ && $active_connection_id_limit >= 2;
         my $events = slurp_file("$tempdir/events");
         complex $events, sub {
             my @seen;
-            my @expected = (0, 1, 1, 1); # expecting to see sequence=1,2,3 as we set active_connection_id_limit to 4
+            my @expected = (0, (1) x ($active_connection_id_limit - 1)); # sequence 0 is delivered during the handshake
             foreach (split(/\n/)) {
                 if ( /"type":"new_connection_id_receive",.*"sequence":([0-9]+),/ ) {
                     # $1 contains sequence number
@@ -95,6 +103,14 @@ subtest "hello" => sub {
         };
     };
 
+};
+
+subtest "bbr-transfer" => sub {
+    my $guard = spawn_server("-C", "bbr:10:p");
+    my $resp = `$cli -C bbr:10:p -p /120000 127.0.0.1 $port 2> /dev/null`;
+    is $?, 0, "BBR client completed";
+    is length($resp), 120000, "BBR transferred the complete response";
+    is md5_hex($resp), md5_hex("hello world\n" x 10000), "BBR response contents match";
 };
 
 subtest "datagram" => sub {
@@ -626,6 +642,23 @@ subtest "reset-stream-overflow-connection" => sub {
     my $received = $conn->receive_until(qr/^\x1c\x03\x04/, 2);
     ok !$server->is_dead(), "server process must be alive";
     like $received, qr/^\x1c\x03\x04/, "responds with CONNECTION_CLOSE(FLOW_CONTROL_ERROR) for RESET_STREAM";
+};
+
+subtest "reliable-reset" => sub {
+    my $guard = spawn_server("--reliable-reset");
+
+    # the server ends each response with a RESET_STREAM_AT covering the whole body; the body must still arrive intact
+    my $resp = `$cli --reliable-reset -e $tempdir/events -p /12 127.0.0.1 $port 2> /dev/null`;
+    is $resp, "hello world\n", "response is delivered in full";
+    my $events = slurp_file("$tempdir/events");
+    like $events, qr/"type":"reset_stream_at_receive",.*"app_error_code":123,"final_size":12,"reliable_size":12/,
+        "RESET_STREAM_AT is received";
+
+    # the extension cannot be used against a peer that does not advertise it
+    $resp = `$cli -e $tempdir/events -p /12 127.0.0.1 $port 2> /dev/null`;
+    is $resp, "hello world\n", "response is delivered to a client that does not advertise the extension";
+    $events = slurp_file("$tempdir/events");
+    unlike $events, qr/"type":"reset_stream_at_receive"/, "RESET_STREAM_AT is withheld from such a client";
 };
 
 subtest "stream-open-after-connection-close" => sub {

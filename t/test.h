@@ -31,6 +31,10 @@ typedef struct st_test_streambuf_t {
     struct {
         quicly_error_t stop_sending;
         quicly_error_t reset_stream;
+        /**
+         * reset surfaced through `on_receive` as the end of the stream
+         */
+        quicly_error_t reset_on_receive;
     } error_received;
     int is_detached;
 } test_streambuf_t;
@@ -57,16 +61,18 @@ void test_pacer(void);
 void test_sentmap(void);
 void test_loss(void);
 void test_simple(void);
-void test_prime_grease_quic_bit_cache(ptls_context_t *tlsctx);
 void test_lossy(void);
 void test_stream_concurrency(void);
 void test_received_cid(void);
 void test_local_cid(void);
 void test_jumpstart(void);
 void test_cc(void);
+void test_bbr_sampler(void);
+#if QUICLY_HAVE_FLEXICAST
 void test_flexicast(void);
 void test_flexicast_cc_regressions(void);
 void test_flexicast_crypto(void);
 void test_flexicast_packets(void);
+#endif
 
 #endif

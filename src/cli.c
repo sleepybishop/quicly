@@ -135,6 +135,7 @@ static void on_stop_sending(quicly_stream_t *stream, quicly_error_t err);
 static void on_receive_reset(quicly_stream_t *stream, quicly_error_t err);
 static void server_on_receive(quicly_stream_t *stream, size_t off, const void *src, size_t len);
 static void client_on_receive(quicly_stream_t *stream, size_t off, const void *src, size_t len);
+static void client_on_receive_reset(quicly_stream_t *stream, quicly_error_t err);
 
 static const quicly_stream_callbacks_t server_stream_callbacks = {quicly_streambuf_destroy,
                                                                   quicly_streambuf_egress_shift,
@@ -147,7 +148,7 @@ static const quicly_stream_callbacks_t server_stream_callbacks = {quicly_streamb
                                                                   quicly_streambuf_egress_emit,
                                                                   on_stop_sending,
                                                                   client_on_receive,
-                                                                  on_receive_reset};
+                                                                  client_on_receive_reset};
 
 static void dump_stats(FILE *fp, quicly_conn_t *conn)
 {
@@ -371,8 +372,28 @@ static void server_on_receive(quicly_stream_t *stream, size_t off, const void *s
     send_header(stream, is_http1, 404, "text/plain; charset=utf-8");
     send_str(stream, "not found\n");
 Sent:
-    quicly_streambuf_egress_shutdown(stream);
+    if (ctx.transport_params.reset_stream_at && quicly_get_remote_transport_parameters(stream->conn)->reset_stream_at) {
+        quicly_streambuf_t *sbuf = stream->data;
+        quicly_streambuf_egress_reset(stream, QUICLY_ERROR_FROM_APPLICATION_ERROR_CODE(123), sbuf->egress.bytes_written);
+    } else {
+        quicly_streambuf_egress_shutdown(stream);
+    }
     quicly_streambuf_ingress_shift(stream, len);
+}
+
+static void client_on_receive_complete(quicly_stream_t *stream)
+{
+    struct st_stream_data_t *stream_data = stream->data;
+
+    if (stream_data->outfp != NULL)
+        fclose(stream_data->outfp);
+}
+
+static void client_on_receive_reset(quicly_stream_t *stream, quicly_error_t err)
+{
+    on_receive_reset(stream, err);
+    if (quicly_recvstate_transfer_complete(&stream->recvstate))
+        client_on_receive_complete(stream);
 }
 
 static uint64_t delivery_now(void)
@@ -421,10 +442,8 @@ static void client_on_receive(quicly_stream_t *stream, size_t off, const void *s
         quicly_streambuf_ingress_shift(stream, input.len);
     }
 
-    if (quicly_recvstate_transfer_complete(&stream->recvstate)) {
-        if (stream_data->outfp != NULL)
-            fclose(stream_data->outfp);
-    }
+    if (quicly_recvstate_transfer_complete(&stream->recvstate))
+        client_on_receive_complete(stream);
 }
 
 static quicly_error_t on_stream_open(quicly_stream_open_t *self, quicly_stream_t *stream)
@@ -1299,8 +1318,9 @@ static void usage(const char *cmd)
            "                            server. If omitted, the command runs as a client.\n"
            "  -C <algo>[:<iw>[:<p>]]    specifies the congestion control algorithm (\"reno\"\n"
            "                            (default), \"cubic\", \"cubic-legacy\", \"pico\", or\n"
-           "                            \"cuback\"), as well as initial congestion window size\n"
+           "                            \"cuback\", \"bbr\"), as well as initial congestion window size\n"
            "                            (in packets, default: 10) and use of pacing.\n"
+           "                            BBR requires pacing (e.g., -C bbr:10:p).\n"
            "  -d draft-number           specifies the draft version number to be used (e.g.,\n"
            "                            29)\n"
            "  --disable-ecn             turns off ECN support (default is on)\n"
@@ -1321,7 +1341,7 @@ static void usage(const char *cmd)
            "  -i interval               interval to reissue requests (in milliseconds)\n"
            "  --jumpstart-default <wnd> jumpstart CWND size for new connections, in packets\n"
            "  --jumpstart-max <wnd>     maximum jumpstart CWND size for resuming connections\n"
-           "  -I timeout                idle timeout (in milliseconds; default: 600,000)\n"
+           "  -I timeout                idle timeout (in milliseconds; default: 30,000)\n"
            "  -K num-packets            perform key update every num-packets packets\n"
            "  -l log-file               file to log traffic secrets\n"
            "  -M <bytes>                max stream data (in bytes; default: 1MB)\n"
@@ -1348,6 +1368,9 @@ static void usage(const char *cmd)
            "  --abba                    enables ABBA bandwidth adaptation\n"
            "  --l4s                     enables L4S; CUBACK must be used\n"
            "  --rapid-start             turns on rapid start\n"
+           "  --reliable-reset          advertise the reset_stream_at transport parameter;\n"
+           "                            when acting as a server, responses are then ended\n"
+           "                            by a reliable reset covering the whole body, not FIN\n"
            "  -S [num-speculative-ptos] number of speculative PTOs\n"
            "  -s session-file           file to load / store the session ticket\n"
            "  --sockfd fd               specifies the UDP socket to be used\n"
@@ -1683,6 +1706,7 @@ int main(int argc, char **argv)
                                              {"disregard-app-limited", no_argument, NULL, 0},
                                              {"jumpstart-default", required_argument, NULL, 0},
                                              {"jumpstart-max", required_argument, NULL, 0},
+                                             {"reliable-reset", no_argument, NULL, 0},
                                              {"max-crypto-bytes", required_argument, NULL, 0},
                                              {"no-normalize-cc-mtu", no_argument, NULL, 0},
                                              {"rapid-start", no_argument, NULL, 0},
@@ -1723,6 +1747,8 @@ int main(int argc, char **argv)
                     fprintf(stderr, "failed to parse max jumpstart size: %s\n", optarg);
                     exit(1);
                 }
+            } else if (strcmp(longopts[opt_index].name, "reliable-reset") == 0) {
+                ctx.transport_params.reset_stream_at = 1;
             } else if (strcmp(longopts[opt_index].name, "max-crypto-bytes") == 0) {
                 if (sscanf(optarg, "%" SCNu32, &ctx.max_crypto_bytes) != 1) {
                     fprintf(stderr, "failed to parse max-crypto-bytes: %s\n", optarg);
@@ -1861,6 +1887,7 @@ int main(int argc, char **argv)
                 fprintf(stderr, "failed to parse idle timeout: %s\n", optarg);
                 exit(1);
             }
+            break;
         case 'K':
             if (sscanf(optarg, "%" SCNu64, &ctx.max_packets_per_key) != 1) {
                 fprintf(stderr, "failed to parse key update interval: %s\n", optarg);
@@ -1990,6 +2017,11 @@ int main(int argc, char **argv)
     }
     argc -= optind;
     argv += optind;
+
+    if (ctx.egress[0].cc.init_cc == &quicly_cc_bbr_init && (!ctx.egress[0].pacing || ctx.egress[0].ecn == QUICLY_ECN_MODE_L4S)) {
+        fprintf(stderr, "BBR requires pacing and does not support L4S (use -C bbr:10:p)\n");
+        return 1;
+    }
 
     if (exit_after_handshake) {
         if (reqs[0].path != NULL) {

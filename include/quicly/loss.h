@@ -192,6 +192,8 @@ typedef struct quicly_loss_t {
      * sentmap
      */
     quicly_sentmap_t sentmap;
+    /* Read-only packet view, valid only during the loss notification callback. */
+    const quicly_sentmap_iter_t *on_loss_iter;
 } quicly_loss_t;
 
 typedef void (*quicly_loss_on_detect_cb)(quicly_loss_t *loss, const quicly_sent_packet_t *lost_packet, int is_time_threshold);

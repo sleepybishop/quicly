@@ -26,6 +26,7 @@
 extern "C" {
 #endif
 
+#include <assert.h>
 #include <stddef.h>
 #include <stdint.h>
 #include <string.h>
@@ -37,7 +38,7 @@ extern "C" {
 #define QUICLY_FRAME_TYPE_PING 1
 #define QUICLY_FRAME_TYPE_ACK 2
 #define QUICLY_FRAME_TYPE_ACK_ECN 3
-#define QUICLY_FRAME_TYPE_RESET_STREAM 4 /* RESET_STREAM */
+#define QUICLY_FRAME_TYPE_RESET_STREAM 4
 #define QUICLY_FRAME_TYPE_STOP_SENDING 5
 #define QUICLY_FRAME_TYPE_CRYPTO 6
 #define QUICLY_FRAME_TYPE_NEW_TOKEN 7
@@ -58,6 +59,7 @@ extern "C" {
 #define QUICLY_FRAME_TYPE_APPLICATION_CLOSE 29
 #define QUICLY_FRAME_TYPE_HANDSHAKE_DONE 30
 #define QUICLY_FRAME_TYPE_IMMEDIATE_ACK 31
+#define QUICLY_FRAME_TYPE_RESET_STREAM_AT 36
 #define QUICLY_FRAME_TYPE_DATAGRAM_NOLEN 48
 #define QUICLY_FRAME_TYPE_DATAGRAM_WITHLEN 49
 #define QUICLY_FRAME_TYPE_ACK_FREQUENCY 0xaf
@@ -72,6 +74,9 @@ extern "C" {
 #define QUICLY_FRAME_TYPE_MAX_PATH_ID 0x3e7a
 #define QUICLY_FRAME_TYPE_PATHS_BLOCKED 0x3e7b
 #define QUICLY_FRAME_TYPE_PATH_CIDS_BLOCKED 0x3e7c
+#define QUICLY_FRAME_TYPE_FC_ANNOUNCE 0x173e00
+#define QUICLY_FRAME_TYPE_FC_STATE 0x173e01
+#define QUICLY_FRAME_TYPE_FC_KEY 0x173e02
 
 #define QUICLY_FRAME_TYPE_STREAM_BITS 0x7
 #define QUICLY_FRAME_TYPE_STREAM_BIT_OFF 0x4
@@ -82,7 +87,7 @@ extern "C" {
 #define QUICLY_MAX_STREAM_DATA_FRAME_CAPACITY (1 + 8 + 8)
 #define QUICLY_MAX_STREAMS_FRAME_CAPACITY (1 + 8)
 #define QUICLY_PING_FRAME_CAPACITY 1
-#define QUICLY_RST_FRAME_CAPACITY (1 + 8 + 8 + 8)
+#define QUICLY_RST_FRAME_CAPACITY (1 + 8 + 8 + 8 + 8) /* sized for RESET_STREAM_AT (extra Reliable Size) */
 #define QUICLY_DATA_BLOCKED_FRAME_CAPACITY (1 + 8)
 #define QUICLY_STREAM_DATA_BLOCKED_FRAME_CAPACITY (1 + 8 + 8)
 #define QUICLY_STREAMS_BLOCKED_FRAME_CAPACITY (1 + 8)
@@ -124,15 +129,18 @@ static quicly_error_t quicly_decode_stream_frame(uint8_t type_flags, const uint8
 static uint8_t *quicly_encode_crypto_frame_header(uint8_t *dst, uint8_t *dst_end, uint64_t offset, size_t *data_len);
 static quicly_error_t quicly_decode_crypto_frame(const uint8_t **src, const uint8_t *end, quicly_stream_frame_t *frame);
 
-static uint8_t *quicly_encode_reset_stream_frame(uint8_t *dst, uint64_t stream_id, uint64_t app_error_code, uint64_t final_size);
+static uint8_t *quicly_encode_reset_stream_frame(uint8_t *dst, uint64_t stream_id, uint64_t app_error_code, uint64_t final_size,
+                                                 uint64_t reliable_size);
 
 typedef struct st_quicly_reset_stream_frame_t {
     uint64_t stream_id;
     uint64_t app_error_code;
     uint64_t final_size;
+    uint64_t reliable_size;
 } quicly_reset_stream_frame_t;
 
-static quicly_error_t quicly_decode_reset_stream_frame(const uint8_t **src, const uint8_t *end, quicly_reset_stream_frame_t *frame);
+static quicly_error_t quicly_decode_reset_stream_frame(uint64_t frame_type, const uint8_t **src, const uint8_t *end,
+                                                       quicly_reset_stream_frame_t *frame);
 
 typedef struct st_quicly_transport_close_frame_t {
     uint64_t error_code;
@@ -307,6 +315,84 @@ static uint8_t *quicly_encode_ack_frequency_frame(uint8_t *dst, uint64_t sequenc
 static quicly_error_t quicly_decode_ack_frequency_frame(const uint8_t **src, const uint8_t *end,
                                                         quicly_ack_frequency_frame_t *frame);
 
+#define QUICLY_FLEXICAST_MAX_FLOW_ID_SIZE 20
+
+typedef struct st_quicly_flexicast_flow_id_t {
+    uint8_t len;
+    uint8_t bytes[QUICLY_FLEXICAST_MAX_FLOW_ID_SIZE];
+} quicly_flexicast_flow_id_t;
+
+typedef struct st_quicly_flexicast_announce_frame_t {
+    quicly_flexicast_flow_id_t flow_id;
+    uint64_t sequence;
+    uint8_t ip_version;
+    uint8_t source_ip[16];
+    uint8_t group_ip[16];
+    uint16_t udp_port;
+    uint64_t ack_delay_msec;
+} quicly_flexicast_announce_frame_t;
+
+typedef struct st_quicly_flexicast_state_frame_t {
+    quicly_flexicast_flow_id_t flow_id;
+    uint64_t sequence;
+    uint64_t action;
+} quicly_flexicast_state_frame_t;
+
+typedef struct st_quicly_flexicast_key_frame_t {
+    quicly_flexicast_flow_id_t flow_id;
+    uint64_t sequence;
+    uint64_t first_packet_number;
+    ptls_iovec_t key;
+    uint64_t algorithm;
+} quicly_flexicast_key_frame_t;
+
+typedef struct st_quicly_flexicast_frame_t {
+    uint64_t type;
+    union {
+        quicly_flexicast_announce_frame_t announce;
+        quicly_flexicast_state_frame_t state;
+        quicly_flexicast_key_frame_t key;
+    } data;
+} quicly_flexicast_frame_t;
+
+#define QUICLY_FLEXICAST_STATE_JOIN 1
+#define QUICLY_FLEXICAST_STATE_LEAVE 2
+#define QUICLY_FLEXICAST_STATE_LISTEN 3
+
+typedef enum en_quicly_flexicast_result_t {
+    QUICLY_FLEXICAST_OK = 0,
+    QUICLY_FLEXICAST_ERROR_INVALID = -1,
+    QUICLY_FLEXICAST_ERROR_NO_MEMORY = -2,
+    QUICLY_FLEXICAST_ERROR_CRYPTO = -3,
+    QUICLY_FLEXICAST_ERROR_WRONG_FLOW = -4,
+    QUICLY_FLEXICAST_ERROR_REPLAY = -5,
+    QUICLY_FLEXICAST_ERROR_NO_MEMBERS = -6,
+    QUICLY_FLEXICAST_ERROR_MEMBER_LIMIT = -7,
+    QUICLY_FLEXICAST_ERROR_SEND_WINDOW = -8,
+    QUICLY_FLEXICAST_ERROR_NOT_FOUND = -9,
+    QUICLY_FLEXICAST_ERROR_BUFFER_TOO_SMALL = -10,
+    QUICLY_FLEXICAST_ERROR_FRAME_ENCODING = -11,
+    QUICLY_FLEXICAST_ERROR_PROTOCOL_VIOLATION = -12,
+    QUICLY_FLEXICAST_ERROR_AEAD_LIMIT_REACHED = -13,
+    QUICLY_FLEXICAST_ERROR_KEY_UPDATE_REQUIRED = -14
+} quicly_flexicast_result_t;
+
+size_t quicly_flexicast_announce_frame_capacity(const quicly_flexicast_announce_frame_t *frame);
+int quicly_flexicast_encode_announce_frame(uint8_t *dst, size_t capacity, const quicly_flexicast_announce_frame_t *frame,
+                                           size_t *encoded_size);
+int quicly_flexicast_decode_announce_frame(const uint8_t *src, size_t len, quicly_flexicast_announce_frame_t *frame,
+                                           size_t *consumed);
+
+size_t quicly_flexicast_state_frame_capacity(const quicly_flexicast_state_frame_t *frame);
+int quicly_flexicast_encode_state_frame(uint8_t *dst, size_t capacity, const quicly_flexicast_state_frame_t *frame,
+                                        size_t *encoded_size);
+int quicly_flexicast_decode_state_frame(const uint8_t *src, size_t len, quicly_flexicast_state_frame_t *frame, size_t *consumed);
+
+size_t quicly_flexicast_key_frame_capacity(const quicly_flexicast_key_frame_t *frame);
+int quicly_flexicast_encode_key_frame(uint8_t *dst, size_t capacity, const quicly_flexicast_key_frame_t *frame,
+                                      size_t *encoded_size);
+int quicly_flexicast_decode_key_frame(const uint8_t *src, size_t len, quicly_flexicast_key_frame_t *frame, size_t *consumed);
+
 /* inline definitions */
 
 inline uint16_t quicly_decode16(const uint8_t **src)
@@ -474,16 +560,20 @@ Error:
     return QUICLY_TRANSPORT_ERROR_FRAME_ENCODING;
 }
 
-inline uint8_t *quicly_encode_reset_stream_frame(uint8_t *dst, uint64_t stream_id, uint64_t app_error_code, uint64_t final_size)
+inline uint8_t *quicly_encode_reset_stream_frame(uint8_t *dst, uint64_t stream_id, uint64_t app_error_code, uint64_t final_size,
+                                                 uint64_t reliable_size)
 {
-    *dst++ = QUICLY_FRAME_TYPE_RESET_STREAM;
+    *dst++ = reliable_size == 0 ? QUICLY_FRAME_TYPE_RESET_STREAM : QUICLY_FRAME_TYPE_RESET_STREAM_AT;
     dst = quicly_encodev(dst, stream_id);
     dst = quicly_encodev(dst, app_error_code);
     dst = quicly_encodev(dst, final_size);
+    if (reliable_size != 0)
+        dst = quicly_encodev(dst, reliable_size);
     return dst;
 }
 
-inline quicly_error_t quicly_decode_reset_stream_frame(const uint8_t **src, const uint8_t *end, quicly_reset_stream_frame_t *frame)
+inline quicly_error_t quicly_decode_reset_stream_frame(uint64_t frame_type, const uint8_t **src, const uint8_t *end,
+                                                       quicly_reset_stream_frame_t *frame)
 {
     if ((frame->stream_id = quicly_decodev(src, end)) == UINT64_MAX)
         goto Error;
@@ -491,6 +581,16 @@ inline quicly_error_t quicly_decode_reset_stream_frame(const uint8_t **src, cons
         goto Error;
     if ((frame->final_size = quicly_decodev(src, end)) == UINT64_MAX)
         goto Error;
+    if (frame_type != QUICLY_FRAME_TYPE_RESET_STREAM) {
+        assert(frame_type == QUICLY_FRAME_TYPE_RESET_STREAM_AT);
+        if ((frame->reliable_size = quicly_decodev(src, end)) == UINT64_MAX)
+            goto Error;
+        if (frame->reliable_size > frame->final_size)
+            goto Error;
+    } else {
+        frame->reliable_size = 0;
+    }
+
     return 0;
 Error:
     return QUICLY_TRANSPORT_ERROR_FRAME_ENCODING;

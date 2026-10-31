@@ -177,3 +177,12 @@ quicly_error_t quicly_sentmap__type_packet(quicly_sentmap_t *map, const quicly_s
     assert(!"quicly_sentmap__type_packet cannot be called");
     return QUICLY_TRANSPORT_ERROR_INTERNAL;
 }
+
+quicly_sent_t *quicly_sentmap_find_frame(const quicly_sentmap_iter_t *packet, quicly_sent_acked_cb callback)
+{
+    quicly_sentmap_iter_t iter = *packet;
+    for (next_entry(&iter); iter.p->acked != quicly_sentmap__type_packet; next_entry(&iter))
+        if (iter.p->acked == callback)
+            return iter.p;
+    return NULL;
+}
