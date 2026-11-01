@@ -4659,10 +4659,116 @@ static void test_multipath_pmtud(void)
         quicly_sentmap_commit(&loss.sentmap, 1300, 0);
         ok(!has_plpmtu_sized_inflight_packets(&loss, 1376));
         ok(quicly_sentmap_prepare(&loss.sentmap, 3, quic_now, QUICLY_EPOCH_1RTT) == 0);
+        loss.sentmap._pending_packet->data.packet.pmtud_datagram_size = 1460;
+        quicly_sentmap_commit(&loss.sentmap, 1460, 0);
+        ok(!has_plpmtu_sized_inflight_packets(&loss, 1376));
+        ok(quicly_sentmap_prepare(&loss.sentmap, 4, quic_now, QUICLY_EPOCH_1RTT) == 0);
         loss.sentmap._pending_packet->data.packet.pmtud_datagram_size = 1376;
         quicly_sentmap_commit(&loss.sentmap, 1000, 0); /* one packet of a coalesced datagram */
         ok(has_plpmtu_sized_inflight_packets(&loss, 1376));
         quicly_sentmap_dispose(&loss.sentmap);
+    }
+
+    { /* standalone PATH_RESPONSE on a validated path is padded to 1200 bytes */
+        reset_pmtud_search(client, ps, 1376, quic_now + 10000);
+        ok(get_path(client, 0)->path_challenge.send_at == INT64_MAX);
+        memcpy(get_path(client, 0)->path_response.data, "01234567", QUICLY_PATH_CHALLENGE_DATA_LEN);
+        get_path(client, 0)->path_response.send_ = 1;
+        client->egress.send_probe_at = 0;
+        quicly_address_t destaddr, srcaddr;
+        struct iovec datagrams[4];
+        uint8_t datagramsbuf[8000];
+        size_t num_datagrams = PTLS_ELEMENTSOF(datagrams);
+        ok(quicly_send(client, &destaddr, &srcaddr, datagrams, &num_datagrams, datagramsbuf, sizeof(datagramsbuf)) == 0);
+        ok(num_datagrams == 1);
+        ok(datagrams[0].iov_len == QUICLY_MIN_CLIENT_INITIAL_SIZE);
+        quicly_decoded_packet_t decoded[2];
+        size_t num_packets = decode_packets(decoded, datagrams, num_datagrams);
+        for (size_t i = 0; i != num_packets; ++i)
+            ok(quicly_receive(server, &destaddr.sa, &srcaddr.sa, decoded + i) == 0);
+        exchange_until_idle(server, client);
+    }
+
+    { /* due PMTUD probe does not hijack PTO retransmission */
+        reset_pmtud_search(client, ps, 1376, quic_now + 10000);
+        quicly_stream_t *pto_stream;
+        ok(quicly_open_stream(client, &pto_stream, 0) == 0);
+        quicly_streambuf_egress_write(pto_stream, "pto-data", 8);
+        quicly_address_t destaddr, srcaddr;
+        struct iovec datagrams[4];
+        uint8_t datagramsbuf[8000];
+        size_t num_datagrams = PTLS_ELEMENTSOF(datagrams);
+        ok(quicly_send(client, &destaddr, &srcaddr, datagrams, &num_datagrams, datagramsbuf, sizeof(datagramsbuf)) == 0);
+        ok(num_datagrams == 1);
+        ok(ps->loss.alarm_at != INT64_MAX);
+        quic_now = ps->loss.alarm_at;
+        ps->pmtud.next_search_at = quic_now;
+        num_datagrams = PTLS_ELEMENTSOF(datagrams);
+        ok(quicly_send(client, &destaddr, &srcaddr, datagrams, &num_datagrams, datagramsbuf, sizeof(datagramsbuf)) == 0);
+        ok(num_datagrams >= 1);
+        ok(ps->pmtud.probe_pn == UINT64_MAX);
+        quicly_decoded_packet_t decoded[4];
+        size_t num_packets = decode_packets(decoded, datagrams, num_datagrams);
+        for (size_t i = 0; i != num_packets; ++i)
+            ok(quicly_receive(server, &destaddr.sa, &srcaddr.sa, decoded + i) == 0);
+        exchange_until_idle(client, server);
+    }
+
+    { /* late ACK of a reordered PMTUD probe confirms the MTU without restoring cwnd */
+        reset_pmtud_search(client, ps, 1376, quic_now);
+        quicly_address_t destaddr, srcaddr;
+        struct iovec probe_dgram[1], data_dgrams[8];
+        uint8_t probe_buf[2000], data_buf[16000];
+        size_t num_probe = 1;
+        ok(quicly_send(client, &destaddr, &srcaddr, probe_dgram, &num_probe, probe_buf, sizeof(probe_buf)) == 0);
+        ok(num_probe == 1);
+        uint16_t expected_probe_size = ps->pmtud.probe_size;
+        ok(ps->pmtud.probe_pn != UINT64_MAX);
+
+        /* send 4 stream packets; drop the first so cwnd is reduced, deliver the rest so both probe and first data packet are lost
+         */
+        for (size_t i = 0; i != 4; ++i) {
+            quicly_stream_t *s;
+            ok(quicly_open_stream(client, &s, 0) == 0);
+            quicly_streambuf_egress_write(s, "reorder", 7);
+            size_t cnt = 1;
+            ok(quicly_send(client, &destaddr, &srcaddr, data_dgrams + i, &cnt, data_buf + i * 2000, 2000) == 0);
+            ok(cnt == 1);
+            if (i != 0) {
+                quicly_decoded_packet_t decoded[2];
+                size_t num_packets = decode_packets(decoded, data_dgrams + i, 1);
+                for (size_t j = 0; j != num_packets; ++j)
+                    ok(quicly_receive(server, &destaddr.sa, &srcaddr.sa, decoded + j) == 0);
+            }
+        }
+        quic_now += 50;
+        transmit(server, client);
+        ok(ps->pmtud.lost_probes == 1);
+        uint32_t reduced_cwnd = ps->cc.cwnd;
+
+        /* now deliver the delayed probe and transmit the server's ACK */
+        {
+            quicly_decoded_packet_t decoded[2];
+            size_t num_packets = decode_packets(decoded, probe_dgram, 1);
+            for (size_t j = 0; j != num_packets; ++j)
+                ok(quicly_receive(server, &destaddr.sa, &srcaddr.sa, decoded + j) == 0);
+        }
+        quic_now += 10;
+        transmit(server, client);
+        ok(ps->pmtud.current_mtu == expected_probe_size);
+        ok(ps->max_udp_payload_size == expected_probe_size);
+        ok(ps->pmtud.lost_probes == 0);
+        ok(ps->cc.cwnd == reduced_cwnd);
+
+        /* deliver the dropped stream packet and settle */
+        {
+            quicly_decoded_packet_t decoded[2];
+            size_t num_packets = decode_packets(decoded, data_dgrams, 1);
+            for (size_t j = 0; j != num_packets; ++j)
+                ok(quicly_receive(server, &destaddr.sa, &srcaddr.sa, decoded + j) == 0);
+        }
+        exchange_until_idle(client, server);
+        reset_pmtud_search(client, ps, 1376, quic_now);
     }
 
     /* Loop to advance time and drive search to completion */
@@ -4751,6 +4857,42 @@ static void test_multipath_pmtud(void)
         ok(secondary_ps->pmtud.current_mtu == 1200);
         ok(quicly_set_max_udp_payload_size(client, 0) == 0);
         ok(secondary_ps->pmtud.upper_bound == pmtud_max_allowed(client));
+
+        /* a deferred PMTUD probe on a secondary path must not bypass path_scheduler to send stream data */
+        ps->pmtud.next_search_at = secondary_ps->pmtud.next_search_at = quic_now + 10000;
+        while (transmit_multipath(client, server) || transmit_multipath(server, client))
+            ;
+        ps->loss.rtt.latest = 10;
+        ps->loss.rtt.smoothed = 10.f;
+        secondary_ps->loss.rtt.latest = 500;
+        secondary_ps->loss.rtt.smoothed = 500.f;
+        ps->pmtud.next_search_at = quic_now + 10000;
+        reset_pmtud_search(client, secondary_ps, 1200, quic_now);
+        uint32_t saved_cwnd = secondary_ps->cc.cwnd;
+        secondary_ps->cc.cwnd = 1200; /* enough for 1200-byte stream packet, smaller than PMTUD candidate */
+        quicly_streambuf_egress_write(stream, "prefer-path-0", 13);
+        num_datagrams = PTLS_ELEMENTSOF(datagrams);
+        ok(quicly_send(client, &destaddr, &srcaddr, datagrams, &num_datagrams, datagramsbuf, sizeof(datagramsbuf)) == 0);
+        ok(num_datagrams == 1);
+        ok(destaddr.sin.sin_port == fake_address.sin.sin_port);
+        ok(secondary_ps->pmtud.probe_pn == UINT64_MAX);
+        secondary_ps->cc.cwnd = saved_cwnd;
+
+        /* quicly_send_path_maintenance must not emit a PMTUD probe when a due probe coincides with maintenance */
+        quicly_send_context_t maint_s;
+        struct iovec maint_dgram;
+        uint8_t maint_buf[1500];
+        size_t packets_sent = 0;
+        reset_pmtud_search(client, secondary_ps, 1200, quic_now);
+        secondary_ps->pn_space->unacked_count = 1;
+        secondary_ps->pn_space->send_ack_at = quic_now;
+        quicly_ranges_add(&secondary_ps->pn_space->ack_queue, 0, 1);
+        test_setup_send_context(client, &maint_s, &maint_dgram, maint_buf, sizeof(maint_buf));
+        ok(quicly_send_path_maintenance(client, &maint_s, &packets_sent) == 0);
+        ok(packets_sent == 1);
+        ok(maint_dgram.iov_len < 1200);
+        ok(secondary_ps->pmtud.probe_pn == UINT64_MAX);
+        unlock_now(client);
     }
 
     quicly_free_default_cid_encryptor(quic_ctx.cid_encryptor);
