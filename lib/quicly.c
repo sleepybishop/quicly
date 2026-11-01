@@ -2065,7 +2065,7 @@ static quicly_error_t apply_remote_transport_params(quicly_conn_t *conn)
     /* quicly advertises only the client's Chosen Version until compatible first-flight conversion is implemented. Therefore the
      * equality check above also proves that the server selected a version offered by the client. */
     if (conn->version_negotiation.received) {
-        if (vi->num_available_versions == 0 ||
+        if (vi->num_available_versions == 0 || version_information_contains(vi, conn->version_negotiation.original) ||
             select_version_from_server_information(conn, vi, conn->super.version) != conn->super.version)
             return QUICLY_TRANSPORT_ERROR_VERSION_NEGOTIATION_ERROR;
     }

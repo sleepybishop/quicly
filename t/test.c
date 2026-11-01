@@ -3607,6 +3607,58 @@ Exit:
     quic_now = saved_now;
 }
 
+static void test_version_negotiation_original_version_downgrade(void)
+{
+    static const uint32_t pref[] = {QUICLY_PROTOCOL_VERSION_DRAFT29, QUICLY_PROTOCOL_VERSION_1, 0};
+    static const uint32_t vn_versions[] = {QUICLY_PROTOCOL_VERSION_DRAFT29, 0};
+    quicly_context_t ctx = quic_ctx;
+    quicly_conn_t *client, *server = NULL;
+    quicly_address_t dest, src;
+    struct iovec datagrams[8];
+    uint8_t buf[PTLS_ELEMENTSOF(datagrams) * ctx.transport_params.max_udp_payload_size];
+    quicly_decoded_packet_t decoded[PTLS_ELEMENTSOF(datagrams) * 2];
+    size_t count;
+
+    ctx.initial_version = QUICLY_PROTOCOL_VERSION_1;
+    ctx.client_version_preference = pref;
+    ok(quicly_connect(&client, &ctx, "example.com", &fake_address.sa, NULL, new_master_id(), ptls_iovec_init(NULL, 0), NULL, NULL,
+                      NULL) == 0);
+
+    count = PTLS_ELEMENTSOF(datagrams);
+    ok(quicly_send(client, &dest, &src, datagrams, &count, buf, sizeof(buf)) == 0);
+    ok(count == 1);
+
+    /* inject spoofed VN offering only draft-29 while original version is v1 */
+    size_t len = quicly_send_version_negotiation(
+        &ctx, ptls_iovec_init(client->super.local.long_header_src_cid.cid, client->super.local.long_header_src_cid.len),
+        ptls_iovec_init(client->super.remote.cid_set.cids[0].cid.cid, client->super.remote.cid_set.cids[0].cid.len), vn_versions,
+        buf);
+    size_t off = 0;
+    ok(quicly_decode_packet(&ctx, decoded, buf, len, &off) == len);
+    ok(quicly_receive(client, NULL, &fake_address.sa, decoded) == 0);
+    ok(client->version_negotiation.original == QUICLY_PROTOCOL_VERSION_1);
+    ok(client->super.version == QUICLY_PROTOCOL_VERSION_DRAFT29);
+
+    count = PTLS_ELEMENTSOF(datagrams);
+    ok(quicly_send(client, &dest, &src, datagrams, &count, buf, sizeof(buf)) == 0);
+    ok(count == 1);
+    ok(decode_packets(decoded, datagrams, count) == 1);
+    ok(quicly_accept(&server, &ctx, NULL, &fake_address.sa, decoded, NULL, new_master_id(), NULL, NULL) == 0);
+
+    /* server's authenticated available versions include original version v1, so client must reject the handshake */
+    transmit(server, client);
+    ok(version_information_contains(&client->super.remote.transport_params.version_information, QUICLY_PROTOCOL_VERSION_1));
+    ok(!ptls_handshake_is_complete(quicly_get_tls(client)));
+    ok(quicly_get_state(client) == QUICLY_STATE_CLOSING);
+    ok(client->connection_close.err == QUICLY_TRANSPORT_ERROR_VERSION_NEGOTIATION_ERROR);
+    transmit(client, server);
+    ok(quicly_get_state(server) == QUICLY_STATE_DRAINING);
+    ok(server->connection_close.err == QUICLY_TRANSPORT_ERROR_VERSION_NEGOTIATION_ERROR);
+
+    quicly_free(client);
+    quicly_free(server);
+}
+
 static void test_version_negotiation(void)
 {
     quicly_conn_t *conn, *server, *vn_conn;
@@ -3803,6 +3855,15 @@ static void test_version_negotiation(void)
     ret = apply_remote_transport_params(conn);
     ok(ret == QUICLY_TRANSPORT_ERROR_VERSION_NEGOTIATION_ERROR);
 
+    /* authenticated available versions containing original version must be rejected even if negotiated version is preferred */
+    static const uint32_t draft29_then_v1[] = {QUICLY_PROTOCOL_VERSION_DRAFT29, QUICLY_PROTOCOL_VERSION_1, 0};
+    quic_ctx.client_version_preference = draft29_then_v1;
+    conn->version_negotiation.original = QUICLY_PROTOCOL_VERSION_1;
+    ret = apply_remote_transport_params(conn);
+    ok(ret == QUICLY_TRANSPORT_ERROR_VERSION_NEGOTIATION_ERROR);
+    conn->version_negotiation.original = 0x0a0a0a0a;
+    quic_ctx.client_version_preference = quicly_supported_versions;
+
     /* An explicitly empty server Available Versions list is invalid after VN. */
     conn->super.version = QUICLY_PROTOCOL_VERSION_1;
     conn->super.remote.transport_params.version_information.chosen_version = QUICLY_PROTOCOL_VERSION_1;
@@ -3848,6 +3909,7 @@ static void test_version_negotiation(void)
     quic_ctx.client_version_preference = original_client_version_preference;
     subtest("restart-idle-timeout", test_version_negotiation_restart, 0);
     subtest("restart-reset-streams", test_version_negotiation_restart, 1);
+    subtest("original-version-downgrade", test_version_negotiation_original_version_downgrade);
 }
 
 int main(int argc, char **argv)
