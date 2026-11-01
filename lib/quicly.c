@@ -2021,6 +2021,20 @@ static quicly_error_t apply_remote_transport_params(quicly_conn_t *conn)
         return ret;
     if ((ret = update_max_streams(&conn->egress.max_streams.bidi, conn->super.remote.transport_params.max_streams_bidi)) != 0)
         return ret;
+    if (quicly_is_client(conn) && !conn->super.remote.transport_params.reset_stream_at) {
+        const struct {
+            quicly_stream_id_t first;
+            uint64_t end;
+        } local_stream_groups[] = {{0, conn->super.local.bidi.next_stream_id}, {2, conn->super.local.uni.next_stream_id}};
+        for (size_t group_index = 0; group_index != PTLS_ELEMENTSOF(local_stream_groups); ++group_index) {
+            for (quicly_stream_id_t stream_id = local_stream_groups[group_index].first;
+                 stream_id < local_stream_groups[group_index].end; stream_id += 4) {
+                quicly_stream_t *stream = quicly_get_stream(conn, stream_id);
+                if (stream != NULL && quicly_sendstate_eos_type(&stream->sendstate) == QUICLY_SENDSTATE_EOS_TYPE_RESET_AT)
+                    return QUICLY_TRANSPORT_ERROR_TRANSPORT_PARAMETER;
+            }
+        }
+    }
 
     quicly_version_information_t *vi = &conn->super.remote.transport_params.version_information;
 
@@ -7166,25 +7180,66 @@ static quicly_error_t restart_client_handshake(quicly_conn_t *conn, uint32_t ver
 {
     const quicly_salt_t *salt;
     ptls_t *new_tls = NULL;
-    ptls_buffer_t tlsbuf;
+    struct st_quicly_handshake_space_t *new_initial = NULL;
+    ptls_buffer_t new_tp_buf, tlsbuf;
+    ptls_raw_extension_t new_ext[2];
+    ptls_handshake_properties_t new_hs_props;
     size_t epoch_offsets[5] = {0};
     quicly_error_t ret;
 
     assert(quicly_is_client(conn));
     assert(!conn->crypto.async_in_progress);
 
-    if ((salt = quicly_get_salt(version)) == NULL)
-        return PTLS_ERROR_LIBRARY;
+    ptls_buffer_init(&new_tp_buf, "", 0);
+    ptls_buffer_init(&tlsbuf, "", 0);
 
-    if ((new_tls = ptls_new(conn->super.ctx->tls, 0)) == NULL)
-        return PTLS_ERROR_NO_MEMORY;
+    if ((salt = quicly_get_salt(version)) == NULL) {
+        ret = PTLS_ERROR_LIBRARY;
+        goto Exit;
+    }
+
+    if ((new_tls = ptls_new(conn->super.ctx->tls, 0)) == NULL) {
+        ret = PTLS_ERROR_NO_MEMORY;
+        goto Exit;
+    }
     const char *server_name = ptls_get_server_name(conn->crypto.tls);
     if (server_name != NULL && (ret = ptls_set_server_name(new_tls, server_name, 0)) != 0)
         goto Exit;
     *ptls_get_data_ptr(new_tls) = conn;
 
-    /* Incompatible negotiation creates a new connection. Discard the old TLS transcript, Initial packet space, and any 0-RTT
-     * state before constructing the new first flight. Session tickets are intentionally not reused across versions. */
+    quicly_transport_parameters_t local_transport_params = conn->super.ctx->transport_params;
+    if ((ret = set_version_information(&local_transport_params, version, 0, NULL)) != 0)
+        goto Exit;
+    if ((ret = quicly_encode_transport_parameter_list(
+             &new_tp_buf, &local_transport_params, NULL, &conn->super.local.cid_set.cids[0].cid, NULL, NULL,
+             conn->super.ctx->expand_client_hello ? conn->super.ctx->initial_egress_max_udp_payload_size : 0)) != 0)
+        goto Exit;
+    new_ext[0] = (ptls_raw_extension_t){get_transport_parameters_extension_id(version), {new_tp_buf.base, new_tp_buf.off}};
+    new_ext[1] = (ptls_raw_extension_t){UINT16_MAX};
+
+    new_hs_props = conn->crypto.initial_handshake_properties;
+    new_hs_props.client.session_ticket = ptls_iovec_init(NULL, 0);
+    new_hs_props.client.max_early_data_size = NULL;
+    new_hs_props.client.early_data_acceptance = PTLS_EARLY_DATA_ACCEPTANCE_UNKNOWN;
+    new_hs_props.additional_extensions = new_ext;
+    new_hs_props.collect_extension = collect_transport_parameters;
+    new_hs_props.collected_extensions = client_collected_extensions;
+
+    ret = expand_handshake_result(ptls_handle_message(new_tls, &tlsbuf, epoch_offsets, 0, NULL, 0, &new_hs_props));
+    if (ret != PTLS_ERROR_IN_PROGRESS)
+        goto Exit;
+
+    if ((new_initial = (void *)alloc_pn_space(sizeof(struct st_quicly_handshake_space_t), 1)) == NULL) {
+        ret = PTLS_ERROR_NO_MEMORY;
+        goto Exit;
+    }
+    if ((ret = setup_initial_encryption(
+             get_aes128gcmsha256(conn->super.ctx), &new_initial->cipher.ingress, &new_initial->cipher.egress,
+             ptls_iovec_init(conn->super.remote.cid_set.cids[0].cid.cid, conn->super.remote.cid_set.cids[0].cid.len), 1,
+             ptls_iovec_init(salt->initial, sizeof(salt->initial)), conn)) != 0)
+        goto Exit;
+
+    /* discard old TLS, packet spaces, and 0-RTT state before installing the replacement first flight */
     if ((ret = discard_sentmap_by_epoch(conn, ~0u)) != 0)
         goto Exit;
     if (conn->initial != NULL) {
@@ -7227,6 +7282,7 @@ static quicly_error_t restart_client_handshake(quicly_conn_t *conn, uint32_t ver
     conn->egress.ack_frequency.sequence = 0;
     conn->egress.send_ack_at = INT64_MAX;
     conn->egress.send_probe_at = INT64_MAX;
+    conn->egress.max_udp_payload_size = conn->super.ctx->initial_egress_max_udp_payload_size;
 
     conn->super.version = version;
     conn->super.remote.transport_params = default_transport_params;
@@ -7236,23 +7292,27 @@ static quicly_error_t restart_client_handshake(quicly_conn_t *conn, uint32_t ver
                      get_egress_context(conn)->loss.default_initial_rtt,
                      &conn->super.remote.transport_params.max_ack_delay, &conn->super.remote.transport_params.ack_delay_exponent);
     get_egress_context(conn)->cc.init_cc->cb(get_egress_context(conn)->cc.init_cc, &conn->egress.cc,
-                                             &get_egress_context(conn)->cc, conn->egress.max_udp_payload_size, conn->stash.now);
+                                             &get_egress_context(conn)->cc,
+                                             conn->super.ctx->transport_params.max_udp_payload_size, conn->stash.now);
     if (conn->egress.pacer != NULL)
         quicly_pacer_reset(conn->egress.pacer);
     memset(conn->egress.ecn.counts, 0, sizeof(conn->egress.ecn.counts));
-    conn->egress.ecn.state = get_egress_context(conn)->ecn ? QUICLY_ECN_PROBING : QUICLY_ECN_OFF;
+    conn->egress.ecn.state = get_egress_context(conn)->ecn != QUICLY_ECN_MODE_OFF ? QUICLY_ECN_PROBING : QUICLY_ECN_OFF;
     quicly_ratemeter_init(&conn->egress.ratemeter);
     conn->egress.try_jumpstart = 1;
 
+    conn->initial = new_initial;
+    new_initial = NULL;
     ptls_free(conn->crypto.tls);
     conn->crypto.tls = new_tls;
     new_tls = NULL;
-    conn->crypto.handshake_properties = conn->crypto.initial_handshake_properties;
-    conn->crypto.handshake_properties.client.session_ticket = ptls_iovec_init(NULL, 0);
-    conn->crypto.handshake_properties.client.max_early_data_size = NULL;
-    conn->crypto.handshake_properties.client.early_data_acceptance = PTLS_EARLY_DATA_ACCEPTANCE_UNKNOWN;
-    conn->crypto.handshake_properties.collect_extension = collect_transport_parameters;
-    conn->crypto.handshake_properties.collected_extensions = client_collected_extensions;
+    ptls_buffer_dispose(&conn->crypto.transport_params.buf);
+    conn->crypto.transport_params.buf = new_tp_buf;
+    ptls_buffer_init(&new_tp_buf, "", 0);
+    conn->crypto.transport_params.ext[0] = new_ext[0];
+    conn->crypto.transport_params.ext[1] = new_ext[1];
+    conn->crypto.handshake_properties = new_hs_props;
+    conn->crypto.handshake_properties.additional_extensions = conn->crypto.transport_params.ext;
 
     conn->egress.max_data.permitted = 0;
     conn->egress.max_data.sent = 0;
@@ -7274,19 +7334,31 @@ static quicly_error_t restart_client_handshake(quicly_conn_t *conn, uint32_t ver
             quicly_stream_t *stream = quicly_get_stream(conn, stream_id);
             if (stream == NULL)
                 continue;
-            if (quicly_sendstate_eos_type(&stream->sendstate) == QUICLY_SENDSTATE_EOS_TYPE_RESET) {
-                /* A local reset marks the send range complete without receiving an ACK. Retain the reset, but with no data sent
-                 * on the replacement connection, its final size is zero. */
+            switch (quicly_sendstate_eos_type(&stream->sendstate)) {
+            case QUICLY_SENDSTATE_EOS_TYPE_RESET: {
+                /* retain the local reset, with final_size reset to zero as no data has been sent on the replacement connection */
                 uint64_t app_error_code = stream->sendstate.app_error_code;
                 quicly_sendstate_dispose(&stream->sendstate);
                 quicly_sendstate_init_closed(&stream->sendstate);
                 stream->sendstate.app_error_code = app_error_code;
                 stream->sendstate.eos_state = QUICLY_SENDSTATE_EOS_STATE_UNSENT;
                 stream->sendstate.final_size = 0;
-            } else {
+            } break;
+            case QUICLY_SENDSTATE_EOS_TYPE_RESET_AT:
+                /* a reliable reset adds [reliable_size, final_size) to acked; with no data sent on the replacement connection,
+                 * final_size collapses to reliable_size */
+                assert(stream->sendstate.acked.ranges[0].start == 0 && stream->sendstate.acked.ranges[0].end == 0);
+                stream->sendstate.acked.num_ranges = 1;
+                stream->sendstate.final_size = stream->sendstate.reliable_size;
+                stream->sendstate.size_inflight = 0;
+                stream->sendstate.eos_state = QUICLY_SENDSTATE_EOS_STATE_UNSENT;
+                break;
+            default:
                 assert(stream->sendstate.acked.num_ranges == 1 && stream->sendstate.acked.ranges[0].start == 0 &&
                        stream->sendstate.acked.ranges[0].end == 0);
                 stream->sendstate.size_inflight = 0;
+                stream->sendstate.eos_state = QUICLY_SENDSTATE_EOS_STATE_UNSENT;
+                break;
             }
             stream->_send_aux.max_stream_data = 0;
             stream->_send_aux.blocked = QUICLY_SENDER_STATE_NONE;
@@ -7296,42 +7368,17 @@ static quicly_error_t restart_client_handshake(quicly_conn_t *conn, uint32_t ver
             conn->super.ctx->stream_scheduler->update_state(conn->super.ctx->stream_scheduler, stream);
         }
     }
-    if ((ret = setup_handshake_space_and_flow(conn, QUICLY_EPOCH_INITIAL)) != 0)
+    if ((ret = create_handshake_flow(conn, QUICLY_EPOCH_INITIAL)) != 0)
         goto Exit;
-    if ((ret = setup_initial_encryption(
-             get_aes128gcmsha256(conn->super.ctx), &conn->initial->cipher.ingress, &conn->initial->cipher.egress,
-             ptls_iovec_init(conn->super.remote.cid_set.cids[0].cid.cid, conn->super.remote.cid_set.cids[0].cid.len), 1,
-             ptls_iovec_init(salt->initial, sizeof(salt->initial)), conn)) != 0)
-        goto Exit;
-
-    ptls_buffer_dispose(&conn->crypto.transport_params.buf);
-    ptls_buffer_init(&conn->crypto.transport_params.buf, "", 0);
-    quicly_transport_parameters_t local_transport_params = conn->super.ctx->transport_params;
-    if ((ret = set_version_information(&local_transport_params, version, 0, NULL)) != 0)
-        goto Exit;
-    if ((ret = quicly_encode_transport_parameter_list(
-             &conn->crypto.transport_params.buf, &local_transport_params, NULL, &conn->super.local.cid_set.cids[0].cid, NULL, NULL,
-             conn->super.ctx->expand_client_hello ? conn->super.ctx->initial_egress_max_udp_payload_size : 0)) != 0)
-        goto Exit;
-    conn->crypto.transport_params.ext[0] =
-        (ptls_raw_extension_t){get_transport_parameters_extension_id(version),
-                               {conn->crypto.transport_params.buf.base, conn->crypto.transport_params.buf.off}};
-    conn->crypto.transport_params.ext[1] = (ptls_raw_extension_t){UINT16_MAX};
-    conn->crypto.handshake_properties.additional_extensions = conn->crypto.transport_params.ext;
-
-    ptls_buffer_init(&tlsbuf, "", 0);
-    ret = expand_handshake_result(
-        ptls_handle_message(conn->crypto.tls, &tlsbuf, epoch_offsets, 0, NULL, 0, &conn->crypto.handshake_properties));
-    if (ret != PTLS_ERROR_IN_PROGRESS)
-        goto ExitTLSBuf;
     if ((ret = write_crypto_data(conn, &tlsbuf, epoch_offsets)) != 0)
-        goto ExitTLSBuf;
+        goto Exit;
     setup_next_send(conn);
     ret = 0;
 
-ExitTLSBuf:
-    ptls_buffer_dispose(&tlsbuf);
 Exit:
+    ptls_buffer_dispose(&tlsbuf);
+    ptls_buffer_dispose(&new_tp_buf);
+    free_handshake_space(&new_initial);
     if (new_tls != NULL)
         ptls_free(new_tls);
     return ret;
@@ -7357,6 +7404,7 @@ static quicly_error_t handle_version_negotiation_packet(quicly_conn_t *conn, qui
 {
     const uint8_t *src = packet->octets.base + packet->encrypted_off, *end = packet->octets.base + packet->octets.len;
     uint32_t selected_version = 0;
+    quicly_error_t ret;
 
     /* Retry is another successfully processed server packet, after which RFC 9000 requires the client to ignore VN. */
     if (!quicly_is_client(conn) || conn->version_negotiation.received || is_retry(conn))
@@ -7386,8 +7434,10 @@ static quicly_error_t handle_version_negotiation_packet(quicly_conn_t *conn, qui
     if (selected_version == 0)
         return handle_close(conn, QUICLY_ERROR_NO_COMPATIBLE_VERSION, QUICLY_FRAME_TYPE_PADDING, ptls_iovec_init("", 0));
 
+    if ((ret = negotiate_using_version(conn, selected_version)) != 0)
+        return ret;
     conn->version_negotiation.received = 1;
-    return negotiate_using_version(conn, selected_version);
+    return 0;
 }
 
 static int compare_socket_address(struct sockaddr *x, struct sockaddr *y)

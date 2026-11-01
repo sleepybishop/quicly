@@ -1490,6 +1490,8 @@ quicly_error_t quicly_decode_transport_parameter_list(quicly_transport_parameter
 /**
  * Initiates a new connection.
  * @param new_cid the CID to be used for the connection. path_id is ignored.
+ * @param handshake_properties optional TLS handshake properties; referenced data must remain valid until the handshake completes or
+ *                             the connection closes
  * @param appdata initial value to be set to `*quicly_get_data(conn)`
  */
 quicly_error_t quicly_connect(quicly_conn_t **conn, quicly_context_t *ctx, const char *server_name, struct sockaddr *dest_addr,
