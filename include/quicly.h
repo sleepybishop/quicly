@@ -519,6 +519,11 @@ struct st_quicly_context_t {
          */
         uint16_t pacing_multiplier_l4s;
         /**
+         * local UDP payload ceiling, including path MTU probes; zero uses only the peer's limit; set before creating connections;
+         * nonzero values must be at least QUICLY_MIN_CLIENT_INITIAL_SIZE
+         */
+        uint16_t max_udp_payload_size;
+        /**
          * prepares jumpstart but disengages before any action; provided for A/B testing between connections eligible for jumpstart
          */
         uint8_t disengage_jumpstart : 1;
@@ -1855,6 +1860,11 @@ int quicly_has_datagram_frames(quicly_conn_t *conn);
 size_t quicly_get_datagram_payload_limit(quicly_conn_t *conn, size_t path_index);
 /* discard locally queued DATAGRAMs on this path before send */
 void quicly_discard_datagram_frames(quicly_conn_t *conn, size_t path_index);
+/**
+ * additional per-connection UDP ceiling for packets and probes; zero clears it; nonzero sizes must be at least
+ * QUICLY_MIN_CLIENT_INITIAL_SIZE; context and peer limits continue to apply; returns 0 on success, -1 on invalid argument
+ */
+int quicly_set_max_udp_payload_size(quicly_conn_t *conn, uint16_t max_size);
 /**
  * Sets CC to the specified type. Returns a boolean indicating if the operation was successful.
  */
