@@ -3669,6 +3669,7 @@ static void test_version_negotiation(void)
     vn_conn->super.remote.transport_params.max_stream_data.uni = 1024;
     vn_conn->super.remote.transport_params.max_streams_bidi = 4;
     vn_conn->super.remote.transport_params.max_streams_uni = 4;
+    vn_conn->super.remote.transport_params.reset_stream_at = 1;
     ok(apply_remote_transport_params(vn_conn) == 0);
     ok(quicly_open_stream(vn_conn, &early_bidi_stream, 0) == 0);
     ok(quicly_open_stream(vn_conn, &early_uni_stream, 1) == 0);
@@ -3676,9 +3677,13 @@ static void test_version_negotiation(void)
     ok(!early_uni_stream->streams_blocked);
     ok(early_bidi_stream->_send_aux.max_stream_data == 1024);
     ok(early_uni_stream->_send_aux.max_stream_data == 1024);
-    early_bidi_stream->sendstate.size_inflight = 1;
+    ok(quicly_streambuf_egress_write(early_bidi_stream, "helloworld", 10) == 0);
+    early_bidi_stream->sendstate.size_inflight = 10;
+    ok(quicly_set_reset_stream_at(early_bidi_stream, QUICLY_ERROR_FROM_APPLICATION_ERROR_CODE(123), 5) == 0);
+    ok(early_bidi_stream->sendstate.final_size == 10);
+    ok(early_bidi_stream->sendstate.acked.num_ranges == 2);
     early_uni_stream->sendstate.size_inflight = 1;
-    vn_conn->egress.max_data.sent = 2;
+    vn_conn->egress.max_data.sent = 11;
 
     vn_packet.octets = ptls_iovec_init(vn_versions + 4, 4);
     vn_conn->created_at = vn_conn->stash.now - 1000;
@@ -3692,7 +3697,8 @@ static void test_version_negotiation(void)
     ok(vn_conn->created_at == vn_conn->stash.now);
     ok(vn_conn->version_negotiation.handshake_packets_sent_at_start == quic_ctx.max_initial_handshake_packets);
     ok(vn_conn->egress.loss.rtt.smoothed == get_egress_context(vn_conn)->loss.default_initial_rtt);
-    ok(vn_conn->egress.cc.cwnd == quicly_cc_calc_initial_cwnd(get_egress_context(vn_conn)->cc.initcwnd_packets, vn_conn->egress.max_udp_payload_size));
+    ok(vn_conn->egress.cc.cwnd == quicly_cc_calc_initial_cwnd(get_egress_context(vn_conn)->cc.initcwnd_packets,
+                                                              vn_conn->super.ctx->transport_params.max_udp_payload_size));
     ok(vn_conn->egress.loss.alarm_at != INT64_MAX);
     ok(vn_conn->egress.packet_number == 0);
     ok(vn_conn->egress.max_data.permitted == 0);
@@ -3704,6 +3710,9 @@ static void test_version_negotiation(void)
     ok(early_bidi_stream->_send_aux.max_stream_data == 0);
     ok(early_uni_stream->_send_aux.max_stream_data == 0);
     ok(early_bidi_stream->sendstate.size_inflight == 0);
+    ok(early_bidi_stream->sendstate.final_size == 5);
+    ok(early_bidi_stream->sendstate.reliable_size == 5);
+    ok(early_bidi_stream->sendstate.acked.num_ranges == 1);
     ok(early_uni_stream->sendstate.size_inflight == 0);
 
     /* The old attempt exhausted its packet budget above; the replacement connection must still be able to send its first flight. */
@@ -3727,6 +3736,8 @@ static void test_version_negotiation(void)
     vn_conn->super.remote.transport_params.version_information.available_versions[0] = QUICLY_PROTOCOL_VERSION_DRAFT29;
     vn_conn->super.remote.transport_params.version_information.available_versions[1] = 0;
     vn_conn->super.remote.transport_params.version_information.num_available_versions = 1;
+    ok(apply_remote_transport_params(vn_conn) == QUICLY_TRANSPORT_ERROR_TRANSPORT_PARAMETER);
+    vn_conn->super.remote.transport_params.reset_stream_at = 1;
     ok(apply_remote_transport_params(vn_conn) == 0);
     open_blocked_streams(vn_conn, 0);
     open_blocked_streams(vn_conn, 1);

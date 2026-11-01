@@ -1041,8 +1041,11 @@ static int run_server(int fd, struct sockaddr *sa, socklen_t salen)
                             break;
                         } else if (!quicly_is_supported_version(packet.version)) {
                             uint8_t payload[ctx.transport_params.max_udp_payload_size];
-                            size_t payload_len = quicly_send_version_negotiation(&ctx, packet.cid.src, packet.cid.dest.encrypted,
-                                                                                 quicly_supported_versions, payload);
+                            const uint32_t *versions = ctx.server_fully_deployed_versions != NULL
+                                                           ? ctx.server_fully_deployed_versions
+                                                           : quicly_supported_versions;
+                            size_t payload_len =
+                                quicly_send_version_negotiation(&ctx, packet.cid.src, packet.cid.dest.encrypted, versions, payload);
                             assert(payload_len != SIZE_MAX);
                             send_one_packet(fd, &remote, &local, payload, payload_len);
                             break;
@@ -1836,12 +1839,17 @@ int main(int argc, char **argv)
             load_private_key(ctx.tls, optarg);
             break;
         case 'd': {
+            static uint32_t draft_version_preference[2];
             uint8_t draft_ver;
             if (sscanf(optarg, "%" SCNu8, &draft_ver) != 1) {
                 fprintf(stderr, "failed to parse draft number: %s\n", optarg);
                 exit(1);
             }
-            ctx.initial_version = 0xff000000 | draft_ver;
+            draft_version_preference[0] = 0xff000000 | draft_ver;
+            if (ctx.initial_version != 0xabababa)
+                ctx.initial_version = draft_version_preference[0];
+            ctx.client_version_preference = draft_version_preference;
+            ctx.server_fully_deployed_versions = draft_version_preference;
         } break;
         case 'D':
             send_datagram_frame = 1;
