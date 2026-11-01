@@ -6373,11 +6373,11 @@ static void handle_lost_packet(quicly_conn_t *conn, quicly_path_space_t *ps, con
             ps->pmtud.next_search_at = conn->stash.now + 1000;
         }
     }
-    /* Small packets can keep being acknowledged while full-sized datagrams are black-holed. Their ACKs reset the PTO count,
-     * so also track size-dependent loss, excluding upward probes and packets predating the last confirmation or reset. */
+    /* small packets can keep being acknowledged while larger datagrams above the base MTU are black-holed; their ACKs reset the
+     * PTO count, so also track size-dependent loss, excluding upward probes and packets predating the last confirmation or reset */
     if (get_egress_context(conn)->enable_pmtud && !is_pmtud_probe && ps->pmtud.current_mtu > 1200 &&
-        lost_packet->packet_number >= ps->pmtud.blackhole_start_pn && lost_packet->pmtud_datagram_size == ps->pmtud.current_mtu &&
-        ++ps->pmtud.lost_datagrams >= 3) {
+        lost_packet->packet_number >= ps->pmtud.blackhole_start_pn && lost_packet->pmtud_datagram_size > 1200 &&
+        lost_packet->pmtud_datagram_size <= ps->pmtud.current_mtu && ++ps->pmtud.lost_datagrams >= 3) {
         reset_pmtud_search(conn, ps, 1200, conn->stash.now + 5000);
     }
 
@@ -7511,7 +7511,8 @@ static int has_plpmtu_sized_inflight_packets(quicly_loss_t *loss, uint16_t plpmt
 
     quicly_sentmap_init_iter(&loss->sentmap, &iter);
     while ((sent = quicly_sentmap_get(&iter))->packet_number != UINT64_MAX) {
-        if (!sent->is_pmtud_probe && sent->cc_bytes_in_flight != 0 && sent->pmtud_datagram_size == plpmtu)
+        if (!sent->is_pmtud_probe && sent->cc_bytes_in_flight != 0 && sent->pmtud_datagram_size > 1200 &&
+            sent->pmtud_datagram_size <= plpmtu)
             return 1;
         quicly_sentmap_skip(&iter);
     }
