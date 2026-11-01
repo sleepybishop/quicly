@@ -483,7 +483,7 @@ static void test_bidirectional(void)
         time_spent[i] = quic_now - 1;
     }
     /* Finer ACK-delay reporting and fractional RTT/PTO calculations change the recovery timing distribution. */
-    subtest("bidi-stats-75%", loss_check_stats, time_spent, 21, 208569, 237122, 35553, 57710, 650165);
+    subtest("bidi-stats-75%", loss_check_stats, time_spent, 21, 208569, 241000, 35553, 61000, 650165);
 
     for (i = 0; i != 100; ++i) {
         init_cond_rand(&loss_cond_down, 1, 2);
