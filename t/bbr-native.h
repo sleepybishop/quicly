@@ -1,4 +1,4 @@
-/* Native per-path accounting and controller transition regressions. */
+/* native per-path accounting and controller transition regressions */
 static void test_bbr_native(void)
 {
     quicly_context_t saved = quic_ctx;
@@ -40,16 +40,23 @@ static void test_bbr_native(void)
     ok(primary->cc.state.bbr.sampler.rst.delivered == primary->bytes_acked);
     ok(primary->cc.state.bbr.stats.pacing_interval_m != 0);
 
-    /* Classic ECN must reduce the model once per recovery flight. */
+    /* classic ECN must reduce the model once per recovery flight and exit Startup/ProbeBW_UP */
     primary->cc.cwnd = primary->cc.state.bbr.stats.cwnd = 20000;
+    primary->cc.state.bbr.engine.state = QUICLY_BBR_BBR_STATE_STARTUP;
+    primary->cc.state.bbr.engine.full_bw_reached = 0;
     uint64_t next = primary->packet_number + 1;
     primary->cc.type->cc_on_lost(&primary->cc, &primary->loss, 0, next - 1, next, quic_now, primary->max_udp_payload_size);
-    ok(primary->cc.cwnd == 14000);
+    ok(primary->cc.cwnd == 14000 && primary->cc.state.bbr.engine.prior_cwnd == 14000);
+    ok(primary->cc.state.bbr.engine.state == QUICLY_BBR_BBR_STATE_DRAIN && primary->cc.state.bbr.engine.full_bw_reached);
     primary->cc.type->cc_on_lost(&primary->cc, &primary->loss, 0, next - 1, next, quic_now, primary->max_udp_payload_size);
     ok(primary->cc.cwnd == 14000);
     ok(primary->cc.num_ecn_loss_episodes == 1);
+    primary->cc.state.bbr.engine.state = QUICLY_BBR_BBR_STATE_PROBE_BW_UP;
+    primary->cc.type->cc_on_lost(&primary->cc, &primary->loss, 0, next, next + 1, quic_now, primary->max_udp_payload_size);
+    ok(primary->cc.state.bbr.engine.state == QUICLY_BBR_BBR_STATE_PROBE_BW_DOWN);
+    ok(primary->cc.state.bbr.engine.prev_probe_too_high);
 
-    /* Retain old BBR metadata while switching through an unrelated union. */
+    /* retain old BBR metadata while switching through an unrelated union */
     ok(quicly_request_path_probe(client, 1) == 0);
     client->next_send_path_index = 1;
     transmit_multipath_with_loss(client, server, 20000);
@@ -76,6 +83,13 @@ static void test_bbr_native(void)
         ok(quicly_sentmap_update(&alternative->loss.sentmap, &old, QUICLY_SENTMAP_EVENT_ACKED) == 0);
         ok(alternative->cc.state.bbr.sampler.rst.delivered == 0);
     }
+    /* switching from BBR to pico or cubic-legacy must preserve cc.conn */
+    ok(quicly_set_cc(client, &quicly_cc_type_pico) == 1);
+    ok(primary->cc.conn == client && alternative->cc.conn == client);
+    ok(quicly_set_cc(client, &quicly_cc_type_bbr) == 1);
+    ok(quicly_set_cc(client, &quicly_cc_type_cubic_legacy) == 1);
+    ok(primary->cc.conn == client && alternative->cc.conn == client);
+    ok(quicly_set_cc(client, &quicly_cc_type_bbr) == 1);
     uint32_t unchanged = alternative->bbr_generation;
     ok(quicly_set_cc(client, &quicly_cc_type_bbr) == 1);
     ok(alternative->bbr_generation == unchanged);
@@ -92,8 +106,7 @@ static void test_bbr_native(void)
     ok(quicly_set_cc(client, &quicly_cc_type_bbr) == 0);
     quic_ctx.egress[0].ecn = saved.egress[0].ecn;
     ok(quicly_set_cc(client, &quicly_cc_type_cubic) == 1);
-    /* A rejected later path rolls back earlier changes without retaining
-     * engine pointers into the temporary backup array. */
+    /* a rejected later path rolls back earlier changes without retaining engine pointers into the backup array */
     struct st_quicly_cc_type_t custom = quicly_cc_type_cubic;
     custom.name = "custom";
     alternative->cc.type = &custom;
@@ -106,6 +119,69 @@ static void test_bbr_native(void)
     primary->pacer = NULL;
     ok(quicly_set_cc(client, &quicly_cc_type_bbr) == 0);
     primary->pacer = pacer;
+
+    /* application-limited stream and datagram sends must mark the final flight's sentmap snapshots */
+    ok(quicly_set_cc(client, &quicly_cc_type_bbr) == 1);
+    primary->cc.state.bbr.sampler.rst.app_limited = 0;
+    uint8_t small_dg[64] = {0x42};
+    ptls_iovec_t dg_vec = ptls_iovec_init(small_dg, sizeof(small_dg));
+    quicly_send_datagram_frames_path(client, 0, &dg_vec, 1);
+    client->next_send_path_index = 0;
+    ++quic_now;
+    transmit_multipath_with_loss(client, server, 20000);
+    ok(primary->cc.state.bbr.sampler.rst.app_limited != 0);
+    quicly_sentmap_iter_t dg_iter;
+    quicly_sent_t *dg_meta = NULL;
+    quicly_sentmap_init_iter(&primary->loss.sentmap, &dg_iter);
+    while (quicly_sentmap_get(&dg_iter)->packet_number != UINT64_MAX) {
+        if (quicly_sentmap_get(&dg_iter)->frames_in_flight)
+            dg_meta = quicly_sentmap_find_frame(&dg_iter, on_ack_bbr_meta);
+        quicly_sentmap_skip(&dg_iter);
+    }
+    ok(dg_meta != NULL && dg_meta->data.bbr_meta.app_limited == 1);
+
+    /* RTT follows the largest newly ACKed packet even when that packet has no BBR delivery snapshot */
+    ++quic_now;
+    lock_now(client, 0);
+    double data_sent_at = client->stash.now_double;
+    uint64_t data_pn = primary->packet_number++;
+    quicly_bbr_packet_t sample;
+    ok(quicly_bbr_packet_sent(&primary->cc, &sample, 1200, (uint32_t)primary->loss.sentmap.bytes_in_flight + 1200,
+                              data_pn, data_sent_at));
+    ok(quicly_sentmap_prepare(&primary->loss.sentmap, data_pn, data_sent_at, QUICLY_EPOCH_1RTT) == 0);
+    primary->loss.sentmap._pending_packet->data.packet.path_id = primary->path_id;
+    quicly_sent_t *times = quicly_sentmap_allocate(&primary->loss.sentmap, on_ack_bbr_times);
+    quicly_sent_t *meta = quicly_sentmap_allocate(&primary->loss.sentmap, on_ack_bbr_meta);
+    ok(times != NULL && meta != NULL);
+    times->data.bbr_times = sample.times;
+    meta->data.bbr_meta = sample.meta;
+    quicly_sentmap_commit(&primary->loss.sentmap, 1200, 0);
+    primary->last_retransmittable_sent_at[QUICLY_EPOCH_1RTT] = data_sent_at;
+    unlock_now(client);
+
+    quic_now += 10;
+    lock_now(client, 0);
+    uint64_t ack_only_pn = primary->packet_number++;
+    ok(quicly_sentmap_prepare(&primary->loss.sentmap, ack_only_pn, client->stash.now_double, QUICLY_EPOCH_1RTT) == 0);
+    primary->loss.sentmap._pending_packet->data.packet.path_id = primary->path_id;
+    quicly_sentmap_commit(&primary->loss.sentmap, 0, 0);
+    unlock_now(client);
+
+    quic_now += 10;
+    lock_now(client, 0);
+    primary->loss.rtt.latest = primary->loss.rtt.minimum = primary->loss.rtt.smoothed = 10;
+    quicly_cc_bbr_t *b = &primary->cc.state.bbr;
+    b->engine.min_rtt = b->engine.probe_rtt_min_delay = UINT64_MAX;
+    uint64_t delivered_before = b->sampler.rst.delivered;
+    quicly_ack_frame_t ack = {.largest_acknowledged = ack_only_pn, .smallest_acknowledged = data_pn, .ack_block_lengths = {2}};
+    struct st_quicly_handle_payload_state_t ack_state = {.epoch = QUICLY_EPOCH_1RTT, .frame_type = QUICLY_FRAME_TYPE_ACK};
+    ok(process_ack_frame_core(client, &ack_state, primary->path_id, &ack) == 0);
+    ok(b->sampler.rst.delivered == delivered_before + 1200);
+    ok(b->ack_largest_sent_at == quicly_bbr_time(data_sent_at));
+    ok(b->ack_rtt == 10 * QUICLY_BBR_MILLISECONDS);
+    ok(b->stats.latest_rtt == 10 * QUICLY_BBR_MILLISECONDS && b->engine.min_rtt == 10 * QUICLY_BBR_MILLISECONDS);
+    unlock_now(client);
+
     quicly_free(client);
     quicly_free(server);
     quicly_free_default_cid_encryptor(quic_ctx.cid_encryptor);
@@ -124,8 +200,7 @@ static void test_bbr_switch_clock(void)
     health_setup(&client, &server);
     quicly_path_space_t *primary = client->path_spaces[0];
 
-    /* An application call has no cached clock. Starting the model at zero would
-     * immediately expire ProbeRTT on its first ACK at this clock value. */
+    /* an application call has no cached clock; starting at zero would expire ProbeRTT on the first ACK */
     ok(client->stash.lock_count == 0 && isnan(client->stash.now_double));
     ok(quicly_set_cc(client, &quicly_cc_type_bbr) == 1);
     uint64_t switched_at = quicly_bbr_time(quic_now + quic_now_submillisec);
@@ -148,7 +223,7 @@ static void test_bbr_switch_clock(void)
     ok(primary->cc.state.bbr.engine.state == QUICLY_BBR_BBR_STATE_STARTUP);
     ok(!primary->cc.state.bbr.engine.probe_rtt_expired);
 
-    /* A switch from a protocol callback must retain its caller's clock lock. */
+    /* a switch from a protocol callback must retain its caller's clock lock */
     ok(quicly_set_cc(client, &quicly_cc_type_cubic) == 1);
     lock_now(client, 0);
     double callback_time = client->stash.now_double;
@@ -159,8 +234,7 @@ static void test_bbr_switch_clock(void)
     unlock_now(client);
     ok(client->stash.lock_count == 0 && isnan(client->stash.now_double));
 
-    /* A later path rejecting the switch must leave both the model and the
-     * caller's clock intact; no path has been configured at that point. */
+    /* a later path rejecting the switch must leave both the model and the caller's clock intact */
     ok(quicly_set_cc(client, &quicly_cc_type_cubic) == 1);
     quicly_path_space_t *alternative = client->path_spaces[1];
     quicly_cc_type_t custom = quicly_cc_type_cubic;
@@ -238,8 +312,7 @@ static void test_bbr_idle_restart(void)
     quicly_bbr_set_app_limited(&cc, 0);
     quicly_bbr_packet_t packet;
     ok(quicly_bbr_packet_sent(&cc, &packet, 1200, 1200, 0, 1000.5));
-    /* Quicly calls cc_on_sent after committing the new packet. BBR's
-     * on_pkt_sent must still see the pre-send empty flight to restart idle. */
+    /* quicly calls cc_on_sent after committing the new packet; on_pkt_sent must still see the pre-send empty flight */
     loss.sentmap.bytes_in_flight = 1200;
     cc.type->cc_on_sent(&cc, &loss, 1200, 1000);
     ok(b->engine.idle_restart);
@@ -247,7 +320,7 @@ static void test_bbr_idle_restart(void)
     ok(quicly_bbr_pacing_rate(&cc) >= 9800 && quicly_bbr_pacing_rate(&cc) <= 10000);
     ok(b->stats.bytes_in_flight == 1200);
 
-    /* An additional packet in the same flight is not another idle restart. */
+    /* an additional packet in the same flight is not another idle restart */
     b->engine.idle_restart = 0;
     uint64_t restarted_at = b->engine.extra_acked_interval_start;
     ok(quicly_bbr_packet_sent(&cc, &packet, 1200, 2400, 1, 1001.5));
@@ -257,15 +330,14 @@ static void test_bbr_idle_restart(void)
     ok(b->engine.extra_acked_interval_start == restarted_at);
     ok(b->stats.bytes_in_flight == 2400);
 
-    /* An empty flight alone does not establish application idleness. */
+    /* an empty flight alone does not establish application idleness */
     b->sampler.rst.app_limited = 0;
     ok(quicly_bbr_packet_sent(&cc, &packet, 1200, 1200, 2, 2000.5));
     loss.sentmap.bytes_in_flight = 1200;
     cc.type->cc_on_sent(&cc, &loss, 1200, 2000);
     ok(!b->engine.idle_restart);
 
-    /* If an idle completes ProbeRTT, the restored window must be visible
-     * immediately to Quicly, rather than waiting for another ACK. */
+    /* if an idle completes ProbeRTT, the restored window must be visible immediately */
     b->engine.state = QUICLY_BBR_BBR_STATE_PROBE_RTT;
     b->engine.probe_rtt_done_stamp = quicly_bbr_time(2500);
     b->engine.prior_cwnd = 50000;

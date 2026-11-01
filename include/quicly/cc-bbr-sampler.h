@@ -1,12 +1,11 @@
-/* Packet delivery sampling for the optional BBR controller. */
+/* packet delivery sampling for the optional BBR controller */
 #ifndef quicly_cc_bbr_sampler_h
 #define quicly_cc_bbr_sampler_h
 #include "quicly/cc-bbr-engine.h"
 #define QUICLY_BBR_PACKET_ACKED 1U
 #define QUICLY_BBR_PACKET_LOST 2U
 
-/* Each half fits one 24-byte sentmap payload. Keep snapshots until ACK or
- * expiry, including after a loss declaration, to support late acknowledgments. */
+/* each half fits one 24-byte sentmap payload; keep snapshots until ACK or expiry */
 typedef struct st_quicly_bbr_packet_times_t {
     uint64_t delivered, delivered_at, first_sent_at;
 } quicly_bbr_packet_times_t;

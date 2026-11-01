@@ -591,8 +591,15 @@ static void test_persistent_congestion(void)
     ok(num_packets_lost == 2);
     ok(num_persistent_congestion == 1);
 
-    /* The callback is emitted once for a continuous congestion period. */
+    /* The callback is emitted once for a continuous congestion period, even if a later packet in that period is lost. */
     detect_loss_after_ack(&loss);
+    ok(num_persistent_congestion == 1);
+    send_ack_eliciting(&loss, 6, QUICLY_EPOCH_INITIAL, 403);
+    send_ack_eliciting(&loss, 9, QUICLY_EPOCH_INITIAL, 404);
+    now = 430;
+    acked(&loss, 9, QUICLY_EPOCH_INITIAL);
+    detect_loss_after_ack(&loss);
+    ok(num_packets_lost == 3);
     ok(num_persistent_congestion == 1);
     quicly_loss_dispose(&loss);
 
@@ -642,6 +649,32 @@ static void test_persistent_congestion(void)
     detect_loss_after_ack(&loss);
     ok(num_packets_lost == 2);
     ok(num_persistent_congestion == 1);
+    quicly_loss_dispose(&loss);
+
+    /* a late ACK at the head of the sentmap must not erase newer ACK history that separates later losses */
+    init_persistent_congestion_test(&loss);
+    send_ack_eliciting(&loss, 1, QUICLY_EPOCH_1RTT, 11);
+    send_ack_eliciting(&loss, 2, QUICLY_EPOCH_1RTT, 12);
+    send_ack_eliciting(&loss, 3, QUICLY_EPOCH_1RTT, 100);
+    now = 120;
+    acked(&loss, 3, QUICLY_EPOCH_1RTT);
+    detect_loss_after_ack(&loss);
+    ok(num_packets_lost == 2);
+    ok(num_persistent_congestion == 0);
+    now = 121;
+    acked(&loss, 1, QUICLY_EPOCH_1RTT);
+    send_ack_eliciting(&loss, 4, QUICLY_EPOCH_1RTT, 400);
+    send_ack_eliciting(&loss, 5, QUICLY_EPOCH_1RTT, 401);
+    now = 425;
+    acked(&loss, 5, QUICLY_EPOCH_1RTT);
+    detect_loss_after_ack(&loss);
+    /* The late ACK can raise the RTT estimate; wait for the remaining packet's loss deadline. */
+    if (loss.loss_time != INT64_MAX) {
+        now = loss.loss_time;
+        detect_loss_after_ack(&loss);
+    }
+    ok(num_packets_lost == 3);
+    ok(num_persistent_congestion == 0);
     quicly_loss_dispose(&loss);
 }
 

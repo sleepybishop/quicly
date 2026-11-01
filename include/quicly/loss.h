@@ -169,7 +169,6 @@ typedef struct quicly_loss_t {
     /** State used to recognize persistent congestion across packet number spaces. */
     struct {
         uint64_t first_rtt_sample_pn;
-        uint64_t last_detected_pn;
         quicly_ranges_t acked_packets;
     } persistent_congestion;
     /**
@@ -339,7 +338,7 @@ inline void quicly_loss_init(quicly_loss_t *r, const quicly_loss_conf_t *conf, f
                          .pto_count = 0,
                          .time_of_last_packet_sent = 0,
                          .largest_acked_packet_plus1 = {.per_epoch = {0}, .all_ = 0},
-                         .persistent_congestion = {.first_rtt_sample_pn = UINT64_MAX, .last_detected_pn = UINT64_MAX},
+                         .persistent_congestion = {.first_rtt_sample_pn = UINT64_MAX},
                          .total_bytes_sent = 0,
                          .loss_time = INT64_MAX,
                          .alarm_at = INT64_MAX};
@@ -479,6 +478,16 @@ inline void quicly_loss_on_ack_received(quicly_loss_t *r, uint64_t largest_newly
 
 inline quicly_error_t quicly_loss_on_packet_acked(quicly_loss_t *r, uint64_t packet_number)
 {
+    if (packet_number < r->persistent_congestion.first_rtt_sample_pn)
+        return 0;
+    quicly_sentmap_iter_t iter;
+    quicly_sentmap_init_iter(&r->sentmap, &iter);
+    if (quicly_sentmap_get(&iter)->packet_number == packet_number) {
+        /* in-order ack at the head of sentmap; no older sentmap entry remains */
+        if (r->persistent_congestion.acked_packets.num_ranges != 0)
+            return quicly_ranges_subtract(&r->persistent_congestion.acked_packets, 0, packet_number + 1);
+        return 0;
+    }
     return quicly_ranges_add(&r->persistent_congestion.acked_packets, packet_number, packet_number + 1);
 }
 

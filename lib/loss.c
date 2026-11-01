@@ -50,11 +50,13 @@ quicly_error_t quicly_loss_init_sentmap_iter(quicly_loss_t *loss, quicly_sentmap
     quicly_sentmap_init_iter(&loss->sentmap, iter);
 
     /* ACK history older than the sentmap can no longer be between two packets considered by persistent-congestion detection. */
-    sent = quicly_sentmap_get(iter);
-    if (sent->packet_number == UINT64_MAX) {
-        quicly_ranges_clear(&loss->persistent_congestion.acked_packets);
-    } else if ((ret = quicly_ranges_subtract(&loss->persistent_congestion.acked_packets, 0, sent->packet_number)) != 0) {
-        return ret;
+    if (loss->persistent_congestion.acked_packets.num_ranges != 0) {
+        sent = quicly_sentmap_get(iter);
+        if (sent->packet_number == UINT64_MAX) {
+            quicly_ranges_clear(&loss->persistent_congestion.acked_packets);
+        } else if ((ret = quicly_ranges_subtract(&loss->persistent_congestion.acked_packets, 0, sent->packet_number)) != 0) {
+            return ret;
+        }
     }
 
     return 0;
@@ -69,18 +71,19 @@ static int has_ack_between(const quicly_loss_t *loss, size_t *range_index, uint6
            loss->persistent_congestion.acked_packets.ranges[*range_index].start < end_pn;
 }
 
-static void detect_persistent_congestion(quicly_loss_t *loss, uint32_t max_ack_delay,
+static void detect_persistent_congestion(quicly_loss_t *loss, uint64_t max_lost_pn, uint32_t max_ack_delay,
                                          quicly_loss_on_persistent_congestion_cb on_persistent_congestion)
 {
     double start_at = INFINITY;
-    uint64_t previous_lost_pn = UINT64_MAX, detected_pn = UINT64_MAX;
+    uint64_t previous_lost_pn = UINT64_MAX;
+    int detected = 0;
     size_t ack_range_index = 0;
     quicly_sentmap_iter_t iter;
     const quicly_sent_packet_t *sent;
     double congestion_period = 3 * quicly_rtt_get_pto(&loss->rtt, max_ack_delay, loss->conf->min_pto);
 
     quicly_sentmap_init_iter(&loss->sentmap, &iter);
-    while ((sent = quicly_sentmap_get(&iter))->packet_number != UINT64_MAX) {
+    while ((sent = quicly_sentmap_get(&iter))->packet_number <= max_lost_pn) {
         if (sent->packet_number >= loss->persistent_congestion.first_rtt_sample_pn && sent->ack_eliciting &&
             sent->cc_bytes_in_flight == 0) {
             /* ACKed entries have already left the sentmap, so consult the retained ACK history for gaps. An outstanding packet
@@ -88,15 +91,15 @@ static void detect_persistent_congestion(quicly_loss_t *loss, uint32_t max_ack_d
             if (start_at == INFINITY || has_ack_between(loss, &ack_range_index, previous_lost_pn, sent->packet_number))
                 start_at = sent->sent_at;
             previous_lost_pn = sent->packet_number;
-            if (start_at < sent->sent_at && sent->sent_at - start_at > congestion_period)
-                detected_pn = sent->packet_number;
+            if (start_at < sent->sent_at && sent->sent_at - start_at >= congestion_period)
+                detected = 1;
         }
         quicly_sentmap_skip(&iter);
     }
 
-    if (detected_pn != UINT64_MAX && (loss->persistent_congestion.last_detected_pn == UINT64_MAX ||
-                                      loss->persistent_congestion.last_detected_pn < detected_pn)) {
-        loss->persistent_congestion.last_detected_pn = detected_pn;
+    if (detected) {
+        /* advance past all lost packets so far so this congestion period is not reported again */
+        loss->persistent_congestion.first_rtt_sample_pn = previous_lost_pn + 1;
         if (on_persistent_congestion != NULL)
             on_persistent_congestion(loss);
     }
@@ -116,6 +119,7 @@ quicly_error_t quicly_loss_detect_loss_after_ack(quicly_loss_t *loss, int64_t no
     quicly_sentmap_iter_t iter;
     const quicly_sent_packet_t *sent;
     quicly_error_t ret;
+    uint64_t max_lost_pn = UINT64_MAX;
     int newly_lost_ack_eliciting = 0;
 
     /* Share the deadline calculation between loss detection and timer scheduling to keep floating-point rounding consistent. */
@@ -135,6 +139,8 @@ quicly_error_t quicly_loss_detect_loss_after_ack(quicly_loss_t *loss, int64_t no
     while ((sent = quicly_sentmap_get(&iter))->packet_number != UINT64_MAX) {
         int64_t largest_acked_signed = loss->largest_acked_packet_plus1.per_epoch[sent->ack_epoch] - 1;
         if ((int64_t)sent->packet_number < largest_acked_signed && (CHECK_TIME_THRESHOLD(sent) || CHECK_PACKET_THRESHOLD(sent))) {
+            if (sent->ack_eliciting)
+                max_lost_pn = sent->packet_number;
             if (sent->cc_bytes_in_flight != 0) {
                 const quicly_sentmap_iter_t *previous_iter = loss->on_loss_iter;
                 loss->on_loss_iter = &iter;
@@ -152,6 +158,8 @@ quicly_error_t quicly_loss_detect_loss_after_ack(quicly_loss_t *loss, int64_t no
              * continue on to calculating the loss time. Otherwise, iterate through the entire sentmap. */
             if (is_1rtt_only)
                 break;
+            if (sent->ack_eliciting && sent->cc_bytes_in_flight == 0)
+                max_lost_pn = sent->packet_number;
             quicly_sentmap_skip(&iter);
         }
     }
@@ -160,8 +168,7 @@ quicly_error_t quicly_loss_detect_loss_after_ack(quicly_loss_t *loss, int64_t no
 #undef CHECK_PACKET_THRESHOLD
 
     if (!is_1rtt_only) {
-        if ((ret = quicly_loss_init_sentmap_iter(loss, &iter, now, max_ack_delay, 0)) != 0)
-            return ret;
+        quicly_sentmap_init_iter(&loss->sentmap, &iter);
         sent = quicly_sentmap_get(&iter);
     }
 
@@ -179,7 +186,7 @@ quicly_error_t quicly_loss_detect_loss_after_ack(quicly_loss_t *loss, int64_t no
 #undef LOSS_DEADLINE
 
     if (newly_lost_ack_eliciting)
-        detect_persistent_congestion(loss, max_ack_delay, on_persistent_congestion);
+        detect_persistent_congestion(loss, max_lost_pn, max_ack_delay, on_persistent_congestion);
 
     return 0;
 }

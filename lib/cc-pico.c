@@ -355,7 +355,8 @@ static void cubic_on_acked(struct st_quicly_cc_cubic_t *state, uint32_t *cwnd, u
 
     if (w_cubic < w_est) {
         /* RFC 9438, Section 4.3; Reno-Friendly Region. */
-        *cwnd = w_est;
+        if (*cwnd < w_est)
+            *cwnd = w_est;
     } else {
         /* RFC 9438, Sections 4.4 and 4.5; Concave and Convex Regions, but the amount added to CWND is  `(target - cwnd) / cwnd`
          * per MTU acked rather than per ACK (see https://mailarchive.ietf.org/arch/msg/ccwg/ZTYECT1NQijwwxq2sDLE0scbQAg/).
@@ -699,6 +700,7 @@ static void pico_on_acked(quicly_cc_t *cc, const quicly_loss_t *loss, uint32_t b
 
     /* Cubic: unlike other policies, congestion avoidance cannot be driven by bytes_to_mtu_increase. */
     if (cc->type == &quicly_cc_type_cubic && cc->cwnd >= cc->ssthresh) {
+    CubicCA:;
         struct st_quicly_cc_cubic_t *state = &cc->state.pico.cubic;
         if (state->w_est == 0) {
             if (quicly_cc_rapid_start_is_active(&cc->rapid_start)) {
@@ -759,6 +761,11 @@ static void pico_on_acked(quicly_cc_t *cc, const quicly_loss_t *loss, uint32_t b
     while (bytes_available >= cc->state.pico.bytes_to_mtu_increase) {
         bytes_available -= cc->state.pico.bytes_to_mtu_increase;
         quicly_cc_add_cwnd(&cc->cwnd, max_udp_payload_size);
+        if (cc->type == &quicly_cc_type_cubic && cc->cwnd >= cc->ssthresh) {
+            cc->state.pico.bytes_to_mtu_increase = 0;
+            bytes = bytes_available;
+            goto CubicCA;
+        }
         cc->state.pico.bytes_to_mtu_increase = calc_bytes_per_mtu_increase(cc, loss, max_udp_payload_size);
     }
     cc->state.pico.bytes_to_mtu_increase -= bytes_available;
@@ -1017,6 +1024,16 @@ static void pico_on_late_ack(quicly_cc_t *cc, uint64_t pn, int64_t now)
 
 static void pico_on_persistent_congestion(quicly_cc_t *cc, const quicly_loss_t *loss, int64_t now, uint32_t max_udp_payload_size)
 {
+    if (quicly_cc_rapid_start_is_in_first_recovery(&cc->rapid_start)) {
+        if (cc->type == &quicly_cc_type_cubic) {
+            cc->state.pico.cubic.cwnd_prior = cubic_post_rapid_start_wmax(cc->cwnd, cc->rapid_start.by_ecn);
+            cc->state.pico.cubic.fast_convergence = 0;
+        }
+        pico_on_acked(cc, loss, 0, cc->recovery_end, (uint32_t)loss->sentmap.bytes_in_flight, 0, 0, now, max_udp_payload_size,
+                      prague_is_running(&cc->state.pico.prague) ? &(quicly_cc_ecn_counts_t){0} : NULL);
+    }
+    if (cc->type == &quicly_cc_type_cubic)
+        cc->state.pico.cubic.w_est = 0;
     cc->cwnd = QUICLY_MIN_CWND * max_udp_payload_size;
     cc->recovery_end = 0;
     cc->state.pico.bytes_to_mtu_increase = 0;
@@ -1047,11 +1064,12 @@ static void pico_init_pico_state(quicly_cc_t *cc)
     }
 }
 
-static void pico_reset(quicly_cc_t *cc, quicly_cc_type_t *type, uint32_t initcwnd, const quicly_cc_conf_t *conf)
+static void pico_reset(quicly_cc_t *cc, quicly_cc_type_t *type, uint32_t initcwnd, const quicly_cc_conf_t *conf, quicly_conn_t *conn)
 {
     *cc = (quicly_cc_t){
         .type = type,
         .conf = conf,
+        .conn = conn,
         .cwnd = initcwnd,
         .cwnd_initial = initcwnd,
         .cwnd_maximum = initcwnd,
@@ -1072,7 +1090,7 @@ static int switch_to(quicly_cc_t *cc, quicly_cc_type_t *type)
     if (cc->type == type) {
         return 1; /* nothing to do */
     } else if (cc->type == &quicly_cc_type_bbr) {
-        pico_reset(cc, type, cc->cwnd_initial, cc->conf);
+        pico_reset(cc, type, cc->cwnd_initial, cc->conf, cc->conn);
         return 1;
     } else if (cc->type == &quicly_cc_type_reno && (type != &quicly_cc_type_cubic || cc->cwnd_exiting_slow_start == 0)) {
         cc->type = type;
@@ -1085,7 +1103,7 @@ static int switch_to(quicly_cc_t *cc, quicly_cc_type_t *type)
             cc->type = type;
             pico_init_pico_state(cc);
         } else {
-            pico_reset(cc, type, cc->cwnd_initial, cc->conf);
+            pico_reset(cc, type, cc->cwnd_initial, cc->conf, cc->conn);
         }
         return 1;
     }
@@ -1121,7 +1139,7 @@ static void cubic_update_cc_limited(quicly_cc_t *cc, int cc_limited, int64_t now
 static void init_with_type(quicly_cc_t *cc, quicly_cc_type_t *type, const quicly_cc_conf_t *conf, uint16_t max_udp_payload_size,
                            int64_t now)
 {
-    pico_reset(cc, type, quicly_cc_calc_initial_cwnd(conf->initcwnd_packets, max_udp_payload_size), conf);
+    pico_reset(cc, type, quicly_cc_calc_initial_cwnd(conf->initcwnd_packets, max_udp_payload_size), conf, NULL);
     if (conf->rapid_start)
         quicly_cc_init_rapid_start(&cc->rapid_start, now);
 }

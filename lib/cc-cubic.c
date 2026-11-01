@@ -89,6 +89,11 @@ static void cubic_on_acked(quicly_cc_t *cc, const quicly_loss_t *loss, uint32_t 
         quicly_cc_add_cwnd(&cc->cwnd, bytes);
         if (cc->cwnd_maximum < cc->cwnd)
             cc->cwnd_maximum = cc->cwnd;
+        if (cc->cwnd >= cc->ssthresh) {
+            cc->state.cubic.avoidance_start = now;
+            cc->state.cubic.w_est = cc->cwnd;
+            update_cubic_k(cc, cc->cwnd, max_udp_payload_size);
+        }
         return;
     }
 
@@ -182,11 +187,12 @@ static void cubic_on_sent(quicly_cc_t *cc, const quicly_loss_t *loss, uint32_t b
     cc->state.cubic.last_sent_time = now;
 }
 
-static void cubic_reset(quicly_cc_t *cc, uint32_t initcwnd, const quicly_cc_conf_t *conf)
+static void cubic_reset(quicly_cc_t *cc, uint32_t initcwnd, const quicly_cc_conf_t *conf, quicly_conn_t *conn)
 {
     memset(cc, 0, sizeof(quicly_cc_t));
     cc->type = &quicly_cc_type_cubic_legacy;
     cc->conf = conf;
+    cc->conn = conn;
     cc->cwnd = cc->cwnd_initial = cc->cwnd_maximum = initcwnd;
     cc->ssthresh = cc->cwnd_minimum = UINT32_MAX;
     cc->exit_slow_start_at = INT64_MAX;
@@ -197,7 +203,7 @@ static void cubic_reset(quicly_cc_t *cc, uint32_t initcwnd, const quicly_cc_conf
 static int cubic_on_switch(quicly_cc_t *cc)
 {
     if (cc->type == &quicly_cc_type_bbr) {
-        cubic_reset(cc, cc->cwnd_initial, cc->conf);
+        cubic_reset(cc, cc->cwnd_initial, cc->conf, cc->conn);
         return 1;
     }
     if (cc->type == &quicly_cc_type_cubic_legacy)
@@ -209,7 +215,7 @@ static int cubic_on_switch(quicly_cc_t *cc)
         if (cc->cwnd_exiting_slow_start == 0) {
             cc->type = &quicly_cc_type_cubic_legacy;
         } else {
-            cubic_reset(cc, cc->cwnd_initial, cc->conf);
+            cubic_reset(cc, cc->cwnd_initial, cc->conf, cc->conn);
         }
         return 1;
     }
@@ -220,7 +226,7 @@ static int cubic_on_switch(quicly_cc_t *cc)
 static void cubic_init(quicly_init_cc_t *self, quicly_cc_t *cc, const quicly_cc_conf_t *conf, uint16_t max_udp_payload_size,
                        int64_t now)
 {
-    cubic_reset(cc, quicly_cc_calc_initial_cwnd(conf->initcwnd_packets, max_udp_payload_size), conf);
+    cubic_reset(cc, quicly_cc_calc_initial_cwnd(conf->initcwnd_packets, max_udp_payload_size), conf, NULL);
 }
 
 quicly_cc_type_t quicly_cc_type_cubic_legacy = {

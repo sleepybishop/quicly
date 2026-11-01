@@ -1,5 +1,5 @@
-/* Packet delivery sampling following the BBR delivery-rate estimator.
- * Times and durations are monotonic nanoseconds, rates are bytes per second. */
+/* packet delivery sampling following the BBR delivery-rate estimator;
+ * times and durations are monotonic nanoseconds, rates are bytes per second */
 #include <limits.h>
 #include <string.h>
 #include "quicly/cc-bbr-sampler.h"
@@ -27,8 +27,7 @@ int quicly_bbr_sampler_on_sent(quicly_bbr_sampler_t *sampler, quicly_bbr_packet_
         return 0;
     if (now < rst->first_sent_ts || now < rst->delivered_ts)
         return 0;
-    /* A controller switch can leave an older generation in flight. Start the
-     * first sample at this send even when that unrelated flight is nonempty. */
+    /* start the first sample at this send even when a prior generation flight is nonempty */
     if (rst->pkt_id == -1 || inflight == bytes)
         rst->first_sent_ts = rst->delivered_ts = now;
     *packet = (quicly_bbr_packet_t){.times = {rst->delivered, rst->delivered_ts, rst->first_sent_ts},

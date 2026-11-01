@@ -102,7 +102,6 @@ subtest "hello" => sub {
             return 1;
         };
     };
-
 };
 
 subtest "bbr-transfer" => sub {
@@ -132,7 +131,6 @@ subtest "version-negotiation" => sub {
         diag $events;
     }
 };
-
 
 subtest "retry" => sub {
     my $guard = spawn_server("-R");
