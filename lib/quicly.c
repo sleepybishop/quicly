@@ -476,7 +476,8 @@ struct st_quicly_conn_t {
      *
      */
     struct {
-
+        /* additional ceiling negotiated after handshake */
+        uint16_t max_udp_payload_size;
         /**
          *
          */
@@ -2681,6 +2682,11 @@ static uint16_t max_udp_payload_size_allowed_by_peer(quicly_conn_t *conn)
     uint64_t max_allowed = conn->super.remote.transport_params.max_udp_payload_size;
     if (max_allowed == 0 || max_allowed > UINT16_MAX)
         max_allowed = UINT16_MAX;
+    uint16_t local_max = get_egress_context(conn)->max_udp_payload_size;
+    if (local_max != 0 && max_allowed > local_max)
+        max_allowed = local_max;
+    if (conn->egress.max_udp_payload_size != 0 && max_allowed > conn->egress.max_udp_payload_size)
+        max_allowed = conn->egress.max_udp_payload_size;
     return (uint16_t)max_allowed;
 }
 
@@ -2788,6 +2794,9 @@ static quicly_error_t activate_path_recovery(quicly_conn_t *conn, quicly_path_sp
 
 static quicly_error_t alloc_path_space(quicly_conn_t *conn, size_t path_index, uint32_t path_id)
 {
+    if (get_egress_context(conn)->max_udp_payload_size != 0 &&
+        get_egress_context(conn)->max_udp_payload_size < QUICLY_MIN_CLIENT_INITIAL_SIZE)
+        return QUICLY_TRANSPORT_ERROR_INTERNAL;
     if (path_id >= sizeof(conn->abandoned_paths_mask) * 8)
         return QUICLY_TRANSPORT_ERROR_PROTOCOL_VIOLATION;
 
@@ -4468,8 +4477,9 @@ static int server_collected_extensions(ptls_t *tls, ptls_handshake_properties_t 
             size = conn->super.ctx->transport_params.max_udp_payload_size;
         ps->recovery->max_udp_payload_size = size;
     }
-    if (ps->recovery->max_udp_payload_size > conn->super.remote.transport_params.max_udp_payload_size)
-        ps->recovery->max_udp_payload_size = conn->super.remote.transport_params.max_udp_payload_size;
+    uint16_t max_allowed = max_udp_payload_size_allowed_by_peer(conn);
+    if (ps->recovery->max_udp_payload_size > max_allowed)
+        ps->recovery->max_udp_payload_size = max_allowed;
     if (get_egress_context(conn)->enable_pmtud)
         pmtud_raise_base_to_current_max(ps);
 
@@ -8360,6 +8370,39 @@ Exit:
             update_idle_timeout(conn, 0);
     }
     return ret;
+}
+
+int quicly_set_max_udp_payload_size(quicly_conn_t *conn, uint16_t max_size)
+{
+    if (conn == NULL || (max_size != 0 && max_size < QUICLY_MIN_CLIENT_INITIAL_SIZE))
+        return -1;
+    conn->egress.max_udp_payload_size = max_size;
+    uint16_t max_allowed =
+        get_egress_context(conn)->enable_pmtud ? pmtud_max_allowed(conn) : max_udp_payload_size_allowed_by_peer(conn);
+    for (size_t i = 0; i < PTLS_ELEMENTSOF(conn->path_spaces); ++i) {
+        quicly_path_space_t *ps = conn->path_spaces[i];
+        if (ps == NULL || ps->recovery == NULL)
+            continue;
+        if (ps->recovery->max_udp_payload_size > max_allowed)
+            ps->recovery->max_udp_payload_size = max_allowed;
+        if (ps->recovery->pmtud.current_mtu > max_allowed)
+            ps->recovery->pmtud.current_mtu = max_allowed;
+        if (ps->recovery->pmtud.lower_bound > max_allowed)
+            ps->recovery->pmtud.lower_bound = max_allowed;
+        if (ps->recovery->pmtud.upper_bound != max_allowed) {
+            ps->recovery->pmtud.upper_bound = max_allowed;
+            ps->recovery->pmtud.state = QUICLY_PMTUD_STATE_SEARCHING;
+            ps->recovery->pmtud.lost_probes = 0;
+            ps->recovery->pmtud.next_search_at = 0;
+        }
+        /* a late ACK of a previous larger probe must not raise the ceiling */
+        if (ps->recovery->pmtud.probe_pn != UINT64_MAX && ps->recovery->pmtud.probe_size > max_allowed) {
+            ps->recovery->pmtud.probe_pn = UINT64_MAX;
+            ps->recovery->pmtud.probe_size = 0;
+            ps->recovery->pmtud.lost_probes = 0;
+        }
+    }
+    return 0;
 }
 
 void quicly_send_datagram_frames_path(quicly_conn_t *conn, size_t path_index, ptls_iovec_t *datagrams, size_t num_datagrams)

@@ -4214,6 +4214,51 @@ static void test_path_sentmap(void)
     path_sentmap_error = 0;
 }
 
+static void test_egress_udp_ceiling(void)
+{
+    quicly_context_t saved_ctx = quic_ctx;
+    quic_ctx.initial_egress_max_udp_payload_size = 1400;
+    ok(quicly_set_max_udp_payload_size(NULL, 1200) == -1);
+    for (int enable_pmtud = 0; enable_pmtud != 2; ++enable_pmtud) {
+        quic_ctx.egress[0].enable_pmtud = enable_pmtud;
+        quic_ctx.egress[0].max_udp_payload_size = 1300;
+        quicly_conn_t *client, *server;
+        test_setup_connected_peers(&client, &server);
+        quicly_path_space_t *ps = client->path_spaces[0];
+        ok(ps->recovery->max_udp_payload_size == 1300);
+        ok(server->path_spaces[0]->recovery->max_udp_payload_size == 1300);
+        ok(ps->recovery->pmtud.upper_bound == 1300);
+        ok(quicly_set_max_udp_payload_size(client, 1199) == -1);
+        ok(ps->recovery->max_udp_payload_size == 1300);
+
+        ok(quicly_set_max_udp_payload_size(client, 1200) == 0);
+        ok(ps->recovery->max_udp_payload_size == 1200);
+        ok(ps->recovery->pmtud.current_mtu == 1200);
+        ok(ps->recovery->pmtud.lower_bound == 1200);
+        ok(ps->recovery->pmtud.upper_bound == 1200);
+        ok(quicly_set_max_udp_payload_size(client, 1400) == 0);
+        ok(ps->recovery->pmtud.upper_bound == 1300); /* the context ceiling still applies */
+        ok(ps->recovery->max_udp_payload_size == 1200); /* raising a ceiling does not validate a larger MTU */
+        ok(quicly_set_max_udp_payload_size(client, 0) == 0);
+        ok(ps->recovery->pmtud.upper_bound == 1300);
+
+        uint64_t saved_peer_limit = client->super.remote.transport_params.max_udp_payload_size;
+        client->super.remote.transport_params.max_udp_payload_size = 1250;
+        ok(quicly_set_max_udp_payload_size(client, 1400) == 0);
+        ok(ps->recovery->pmtud.upper_bound == 1250); /* the peer ceiling still applies */
+        client->super.remote.transport_params.max_udp_payload_size = saved_peer_limit;
+        quicly_free(client);
+        quicly_free(server);
+    }
+
+    quic_ctx.egress[0].max_udp_payload_size = 1199;
+    quicly_conn_t *client = NULL;
+    ok(quicly_connect(&client, &quic_ctx, "example.com", &fake_address.sa, NULL, new_master_id(), ptls_iovec_init(NULL, 0),
+                      NULL, NULL, NULL) != 0);
+    ok(client == NULL);
+    quic_ctx = saved_ctx;
+}
+
 static void test_multipath_pmtud(void)
 {
     uint64_t orig_initial_max_path_id = quic_ctx.transport_params.initial_max_path_id;
@@ -4487,6 +4532,26 @@ static void test_multipath_pmtud(void)
         quicly_streambuf_egress_write(stream, "secondary path PMTUD", 20);
         ok(transmit_multipath(client, server) == 1);
         ok(secondary_ps->recovery->pmtud.probe_pn != UINT64_MAX);
+
+        /* lowering a connection ceiling clamps every path and invalidates outstanding oversized probes */
+        ok(quicly_set_max_udp_payload_size(client, 1200) == 0);
+        for (size_t i = 0; i != PTLS_ELEMENTSOF(client->path_spaces); ++i) {
+            quicly_path_space_t *capped = client->path_spaces[i];
+            if (capped == NULL || capped->recovery == NULL)
+                continue;
+            ok(capped->recovery->max_udp_payload_size <= 1200);
+            ok(capped->recovery->pmtud.current_mtu <= 1200);
+            ok(capped->recovery->pmtud.lower_bound <= 1200);
+            ok(capped->recovery->pmtud.upper_bound == 1200);
+            ok(capped->recovery->pmtud.probe_pn == UINT64_MAX);
+        }
+        /* deliver the ACK for the larger probe sent above; it must not raise the MTU */
+        quic_now += 100;
+        transmit_multipath(server, client);
+        ok(secondary_ps->recovery->max_udp_payload_size == 1200);
+        ok(secondary_ps->recovery->pmtud.current_mtu == 1200);
+        ok(quicly_set_max_udp_payload_size(client, 0) == 0);
+        ok(secondary_ps->recovery->pmtud.upper_bound == pmtud_max_allowed(client));
     }
 
     quicly_free_default_cid_encryptor(quic_ctx.cid_encryptor);
@@ -6890,6 +6955,7 @@ int main(int argc, char **argv)
     subtest("amplification-blocked-handshake-timeout", test_amplification_blocked_handshake_timeout);
     subtest("migration-during-handshake", test_migration_during_handshake);
     subtest("pto-with-backup-path-probe", test_pto_with_backup_path_probe);
+    subtest("egress-udp-ceiling", test_egress_udp_ceiling);
     subtest("multipath-pmtud", test_multipath_pmtud);
     subtest("pmtud-handshake-blackhole", test_pmtud_handshake_blackhole);
     subtest("pmtud-mixed-size-blackhole", test_pmtud_mixed_size_blackhole);
