@@ -4447,7 +4447,7 @@ static void test_multipath_pmtud(void)
         reset_pmtud_search(client, ps, 1376, quic_now);
     }
 
-    { /* Only current-PLPMTU packets, excluding the upward probe, are black-hole evidence. */
+    { /* only in-flight non-probe packets above the 1200-byte base up to the current PLPMTU are black-hole evidence */
         quicly_loss_t loss = {0};
         quicly_sentmap_init(&loss.sentmap);
         ok(quicly_sentmap_prepare(&loss.sentmap, 1, quic_now, QUICLY_EPOCH_1RTT) == 0);
@@ -4456,16 +4456,16 @@ static void test_multipath_pmtud(void)
         quicly_sentmap_commit(&loss.sentmap, 1460, 0);
         ok(!has_plpmtu_sized_inflight_packets(&loss, 1376));
         ok(quicly_sentmap_prepare(&loss.sentmap, 2, quic_now, QUICLY_EPOCH_1RTT) == 0);
-        loss.sentmap._pending_packet->data.packet.pmtud_datagram_size = 1300;
-        quicly_sentmap_commit(&loss.sentmap, 1300, 0);
+        loss.sentmap._pending_packet->data.packet.pmtud_datagram_size = 1200;
+        quicly_sentmap_commit(&loss.sentmap, 1200, 0);
         ok(!has_plpmtu_sized_inflight_packets(&loss, 1376));
         ok(quicly_sentmap_prepare(&loss.sentmap, 3, quic_now, QUICLY_EPOCH_1RTT) == 0);
         loss.sentmap._pending_packet->data.packet.pmtud_datagram_size = 1460;
         quicly_sentmap_commit(&loss.sentmap, 1460, 0);
         ok(!has_plpmtu_sized_inflight_packets(&loss, 1376));
         ok(quicly_sentmap_prepare(&loss.sentmap, 4, quic_now, QUICLY_EPOCH_1RTT) == 0);
-        loss.sentmap._pending_packet->data.packet.pmtud_datagram_size = 1376;
-        quicly_sentmap_commit(&loss.sentmap, 1000, 0); /* one packet of a coalesced datagram */
+        loss.sentmap._pending_packet->data.packet.pmtud_datagram_size = 1300;
+        quicly_sentmap_commit(&loss.sentmap, 1300, 0);
         ok(has_plpmtu_sized_inflight_packets(&loss, 1376));
         quicly_sentmap_dispose(&loss.sentmap);
     }
@@ -4630,6 +4630,9 @@ static void test_multipath_pmtud(void)
         }
         ok(get_path(client, 1)->path_challenge.send_at == INT64_MAX);
 
+        /* settle RFC 10069 CID and path-credit maintenance before testing probe priority over application data */
+        for (size_t i = 0; i != 20; ++i)
+            multipath_round(client, server, -1, -1);
         quicly_path_space_t *secondary_ps = client->path_spaces[1];
         ps->recovery->pmtud.next_search_at = quic_now + 10000;
         reset_pmtud_search(client, secondary_ps, 1200, quic_now);
@@ -4831,13 +4834,99 @@ static void test_pmtud_mixed_size_blackhole(void)
     ok(ps->recovery->pmtud.current_mtu == 1200);
     ok(ps->recovery->max_udp_payload_size == 1200);
     ok(ps->recovery->pmtud.lost_datagrams == 0);
-    /* The reduced size works, and subsequent old losses must not count against the new search. */
+    /* the reduced size works, and subsequent old losses must not count against the new search */
     ptls_iovec_t smaller = ptls_iovec_init(data, 1100);
     quicly_send_datagram_frames(client, &smaller, 1);
     ok(transmit_with_mtu(client, server, 1200) == 0);
     quic_now += 30;
     transmit_with_mtu(server, client, UINT16_MAX);
     ok(ps->recovery->pmtud.lost_datagrams == 0);
+    quicly_free(client);
+    quicly_free(server);
+    quic_ctx = saved_ctx;
+}
+
+static void test_pmtud_below_max_blackhole(void)
+{
+    static quicly_receive_datagram_frame_t receiver = {pmtud_receive_datagram};
+    quicly_context_t saved_ctx = quic_ctx;
+    quic_ctx.egress[0].enable_pmtud = 1;
+    quic_ctx.initial_egress_max_udp_payload_size = 1376;
+    quic_ctx.transport_params.max_datagram_frame_size = UINT16_MAX;
+    quic_ctx.receive_datagram_frame = &receiver;
+    quicly_conn_t *client, *server;
+    test_setup_connected_peers(&client, &server);
+    quicly_path_space_t *ps = client->path_spaces[0];
+    /* simulate a completed search followed by a reduction in the path MTU */
+    reset_pmtud_search(client, ps, 1376, quic_now + 600 * 1000);
+    reset_pmtud_search(server, server->path_spaces[0], 1376, quic_now + 600 * 1000);
+    ps->recovery->pmtud.state = server->path_spaces[0]->recovery->pmtud.state = QUICLY_PMTUD_STATE_SEARCH_COMPLETE;
+    char data[1500] = {0};
+    size_t dropped = 0;
+    for (size_t i = 0; i != 30 && ps->recovery->pmtud.current_mtu > 1200; ++i) {
+        /* short header, DCID, packet number, tag, and DATAGRAM frame header */
+        ptls_iovec_t large =
+            ptls_iovec_init(data, 1300 - 1 - get_dcid(client, 0)->len - QUICLY_SEND_PN_SIZE - QUICLY_AEAD_TAG_SIZE - 3);
+        quicly_send_datagram_frames(client, &large, 1);
+        dropped += transmit_with_mtu(client, server, 1200);
+        quic_now += 10;
+        ptls_iovec_t small = ptls_iovec_init(data, 1);
+        quicly_send_datagram_frames(client, &small, 1);
+        transmit_with_mtu(client, server, 1200);
+        quic_now += 30;
+        transmit_with_mtu(server, client, UINT16_MAX);
+        transmit_with_mtu(client, server, 1200);
+    }
+    ok(dropped >= 3);
+    ok(ps->recovery->loss.pto_count == 0);
+    ok(ps->recovery->pmtud.current_mtu == 1200);
+    ok(ps->recovery->max_udp_payload_size == 1200);
+    ok(ps->recovery->pmtud.lost_datagrams == 0);
+    /* the reduced size works, and subsequent old losses must not count against the new search */
+    ptls_iovec_t smaller = ptls_iovec_init(data, 1100);
+    quicly_send_datagram_frames(client, &smaller, 1);
+    ok(transmit_with_mtu(client, server, 1200) == 0);
+    quic_now += 30;
+    transmit_with_mtu(server, client, UINT16_MAX);
+    ok(ps->recovery->pmtud.lost_datagrams == 0);
+    quicly_free(client);
+    quicly_free(server);
+    quic_ctx = saved_ctx;
+}
+
+static void test_pmtud_partial_stream_blackhole(void)
+{
+    static quicly_receive_datagram_frame_t receiver = {pmtud_receive_datagram};
+    quicly_context_t saved_ctx = quic_ctx;
+    quic_ctx.egress[0].enable_pmtud = 1;
+    quic_ctx.initial_egress_max_udp_payload_size = 1376;
+    quic_ctx.transport_params.max_datagram_frame_size = UINT16_MAX;
+    quic_ctx.receive_datagram_frame = &receiver;
+    quicly_conn_t *client, *server;
+    test_setup_connected_peers(&client, &server);
+    quicly_path_space_t *ps = client->path_spaces[0];
+    reset_pmtud_search(client, ps, 1376, quic_now + 600 * 1000);
+    reset_pmtud_search(server, server->path_spaces[0], 1376, quic_now + 600 * 1000);
+    ps->recovery->pmtud.state = server->path_spaces[0]->recovery->pmtud.state = QUICLY_PMTUD_STATE_SEARCH_COMPLETE;
+    char data[1250] = {0};
+    quicly_stream_t *stream;
+    ok(quicly_open_stream(client, &stream, 0) == 0);
+    ok(quicly_streambuf_egress_write(stream, data, sizeof(data)) == 0);
+    size_t dropped = transmit_with_mtu(client, server, 1200);
+    for (size_t i = 0; i < 30; ++i) {
+        quic_now += 10;
+        ptls_iovec_t small = ptls_iovec_init(data, 1);
+        quicly_send_datagram_frames(client, &small, 1);
+        dropped += transmit_with_mtu(client, server, 1200);
+        quic_now += 30;
+        transmit_with_mtu(server, client, UINT16_MAX);
+        dropped += transmit_with_mtu(client, server, 1200);
+    }
+    quicly_stream_t *received = quicly_get_stream(server, stream->stream_id);
+    size_t recv_len = received == NULL ? 0 : quicly_streambuf_ingress_get(received).len;
+    ok(dropped >= 3);
+    ok(ps->recovery->pmtud.current_mtu == 1200);
+    ok(recv_len == sizeof(data));
     quicly_free(client);
     quicly_free(server);
     quic_ctx = saved_ctx;
@@ -7100,6 +7189,8 @@ int main(int argc, char **argv)
     subtest("multipath-pmtud", test_multipath_pmtud);
     subtest("pmtud-handshake-blackhole", test_pmtud_handshake_blackhole);
     subtest("pmtud-mixed-size-blackhole", test_pmtud_mixed_size_blackhole);
+    subtest("pmtud-below-max-blackhole", test_pmtud_below_max_blackhole);
+    subtest("pmtud-partial-stream-blackhole", test_pmtud_partial_stream_blackhole);
 
     subtest("multipath-negotiation", test_multipath_negotiation);
     subtest("multipath-lazy-recovery", test_multipath_lazy_recovery);

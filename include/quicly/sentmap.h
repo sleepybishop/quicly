@@ -113,8 +113,7 @@ struct st_quicly_sent_ack_additional_t {
 
 /**
  * Describes what is inside a packet or frame being sent. Within the sentmap, each packet-level entry (identified by .acked ==
- * quicly_sentmap__type_packet) is followed by a number of frame-level entries. Size of `quicly_sent_t` is kept as 256 bits (64-bit
- * * 4).
+ * quicly_sentmap__type_packet) is followed by a number of frame-level entries. PMTUD metadata requires up to five 64-bit words per entry.
  */
 struct st_quicly_sent_t {
     quicly_sent_acked_cb acked;
@@ -320,7 +319,7 @@ quicly_error_t quicly_sentmap__type_packet(quicly_sentmap_t *map, const quicly_s
 
 inline void quicly_sentmap_init(quicly_sentmap_t *map)
 {
-    PTLS_BUILD_ASSERT(sizeof(struct st_quicly_sent_t) <= 32);
+    PTLS_BUILD_ASSERT(sizeof(struct st_quicly_sent_t) <= 40);
     *map = (quicly_sentmap_t){NULL};
 }
 
