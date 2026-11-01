@@ -584,18 +584,23 @@ static void test_grease_random_bits(void)
 static void test_grease_quic_bit(void)
 {
     static const uint8_t version_negotiation[] = {0x80, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1};
+    static const uint8_t version_negotiation_unused_bits[] = {0xa0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1};
     static const uint8_t unknown_version[] = {0x80, 0xab, 0xab, 0xab, 0x0a, 0, 0};
+    static const uint8_t unknown_version_type_bits[] = {0xb0, 0xab, 0xab, 0xab, 0x0a, 0, 0};
     static const uint8_t initial_bit_zero[] = {0x80, 0, 0, 0, 1, 0, 0, 0, 1, 0};
     static const uint8_t initial_bit_one[] = {0xc0, 0, 0, 0, 1, 0, 0, 0, 1, 0};
     static const uint8_t short_bit_zero[] = {0, 0};
     quicly_context_t ctx = quic_ctx;
 
-    /* Version Negotiation and unknown versions do not have the QUIC v1 fixed-bit semantics. */
+    /* version negotiation and unknown versions do not have the QUIC v1 fixed-bit or packet-type semantics */
     ctx.transport_params.grease_quic_bit = 0;
     ok(decode_packet_once(&ctx, version_negotiation, sizeof(version_negotiation)) == sizeof(version_negotiation));
+    ok(decode_packet_once(&ctx, version_negotiation_unused_bits, sizeof(version_negotiation_unused_bits)) ==
+       sizeof(version_negotiation_unused_bits));
     ok(decode_packet_once(&ctx, unknown_version, sizeof(unknown_version)) == sizeof(unknown_version));
+    ok(decode_packet_once(&ctx, unknown_version_type_bits, sizeof(unknown_version_type_bits)) == sizeof(unknown_version_type_bits));
 
-    /* For recognized versions and short headers, bit zero is accepted only when advertised locally. */
+    /* for recognized versions and short headers, bit zero is accepted only when advertised locally */
     ok(decode_packet_once(&ctx, initial_bit_zero, sizeof(initial_bit_zero)) == SIZE_MAX);
     ok(decode_packet_once(&ctx, initial_bit_one, sizeof(initial_bit_one)) == sizeof(initial_bit_one));
     ok(decode_packet_once(&ctx, short_bit_zero, sizeof(short_bit_zero)) == SIZE_MAX);

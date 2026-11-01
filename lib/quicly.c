@@ -859,28 +859,6 @@ size_t quicly_decode_packet(quicly_context_t *ctx, quicly_decoded_packet_t *pack
             goto Error;
         packet->cid.src.base = (uint8_t *)src;
         src += packet->cid.src.len;
-        switch ((packet->octets.base[0] | QUICLY_QUIC_BIT) & QUICLY_PACKET_TYPE_BITMASK) {
-        case QUICLY_PACKET_TYPE_INITIAL:
-        case QUICLY_PACKET_TYPE_0RTT:
-            if (ctx->cid_encryptor == NULL || packet->cid.dest.encrypted.len == 0 ||
-                ctx->cid_encryptor->decrypt_cid(ctx->cid_encryptor, &packet->cid.dest.plaintext, packet->cid.dest.encrypted.base,
-                                                packet->cid.dest.encrypted.len) == SIZE_MAX)
-                packet->cid.dest.plaintext = quicly_cid_plaintext_invalid;
-            packet->cid.dest.might_be_client_generated = 1;
-            break;
-        default:
-            if (ctx->cid_encryptor != NULL) {
-                if (packet->cid.dest.encrypted.len == 0)
-                    goto Error;
-                if (ctx->cid_encryptor->decrypt_cid(ctx->cid_encryptor, &packet->cid.dest.plaintext,
-                                                    packet->cid.dest.encrypted.base, packet->cid.dest.encrypted.len) == SIZE_MAX)
-                    goto Error;
-            } else {
-                packet->cid.dest.plaintext = quicly_cid_plaintext_invalid;
-            }
-            packet->cid.dest.might_be_client_generated = 0;
-            break;
-        }
         switch (packet->version) {
         case QUICLY_PROTOCOL_VERSION_1:
         case QUICLY_PROTOCOL_VERSION_DRAFT29:
@@ -918,10 +896,39 @@ size_t quicly_decode_packet(quicly_context_t *ctx, quicly_decoded_packet_t *pack
                 packet->encrypted_off = src - packet->octets.base;
                 packet->octets.len = packet->encrypted_off + rest_length;
             }
+            switch ((packet->octets.base[0] | QUICLY_QUIC_BIT) & QUICLY_PACKET_TYPE_BITMASK) {
+            case QUICLY_PACKET_TYPE_INITIAL:
+            case QUICLY_PACKET_TYPE_0RTT:
+                if (ctx->cid_encryptor == NULL || packet->cid.dest.encrypted.len == 0 ||
+                    ctx->cid_encryptor->decrypt_cid(ctx->cid_encryptor, &packet->cid.dest.plaintext,
+                                                    packet->cid.dest.encrypted.base, packet->cid.dest.encrypted.len) == SIZE_MAX)
+                    packet->cid.dest.plaintext = quicly_cid_plaintext_invalid;
+                packet->cid.dest.might_be_client_generated = 1;
+                break;
+            default:
+                if (ctx->cid_encryptor != NULL) {
+                    if (packet->cid.dest.encrypted.len == 0)
+                        goto Error;
+                    if (ctx->cid_encryptor->decrypt_cid(ctx->cid_encryptor, &packet->cid.dest.plaintext,
+                                                        packet->cid.dest.encrypted.base,
+                                                        packet->cid.dest.encrypted.len) == SIZE_MAX)
+                        goto Error;
+                } else {
+                    packet->cid.dest.plaintext = quicly_cid_plaintext_invalid;
+                }
+                packet->cid.dest.might_be_client_generated = 0;
+                break;
+            }
             break;
         default:
             /* VN packet or packets of unknown version cannot be parsed. `encrypted_off` is set to the first byte after SCID. */
+            if (ctx->cid_encryptor == NULL || packet->cid.dest.encrypted.len == 0 ||
+                ctx->cid_encryptor->decrypt_cid(ctx->cid_encryptor, &packet->cid.dest.plaintext, packet->cid.dest.encrypted.base,
+                                                packet->cid.dest.encrypted.len) == SIZE_MAX)
+                packet->cid.dest.plaintext = quicly_cid_plaintext_invalid;
+            packet->cid.dest.might_be_client_generated = 1;
             packet->encrypted_off = src - packet->octets.base;
+            break;
         }
         packet->_is_stateless_reset_cached = QUICLY__DECODED_PACKET_CACHED_NOT_STATELESS_RESET;
     } else {
