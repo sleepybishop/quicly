@@ -1670,6 +1670,7 @@ static void test_resume_sendrate(void)
     }
 }
 
+
 static void test_jumpstart_cwnd(void)
 {
     ok(derive_jumpstart_cwnd(UINT32_MAX, 1200, 250, 1000000, 250) == 250000);
@@ -4767,7 +4768,7 @@ static void rate_test_ack(quicly_conn_t *conn, size_t path_index, uint16_t bytes
     uint64_t pn = ps->packet_number++;
     ok(quicly_sentmap_prepare(&ps->loss.sentmap, pn, quic_now - 1, QUICLY_EPOCH_1RTT) == 0);
     quicly_sentmap_commit(&ps->loss.sentmap, bytes, 0);
-    ps->last_retransmittable_sent_at = quic_now - 1;
+    ps->last_retransmittable_sent_at[QUICLY_EPOCH_1RTT] = quic_now - 1;
     quicly_ack_frame_t ack = {.largest_acknowledged = pn, .smallest_acknowledged = pn, .ack_block_lengths = {1}};
     struct st_quicly_handle_payload_state_t state = {.epoch = QUICLY_EPOCH_1RTT};
     lock_now(conn, 0);
@@ -4840,7 +4841,7 @@ static void test_multipath_state_isolation(void)
     ok(quicly_sentmap_prepare(&other->loss.sentmap, 0, quic_now - 1000, QUICLY_EPOCH_1RTT) == 0);
     quicly_sentmap_commit(&other->loss.sentmap, 1200, 0);
     other->packet_number = 2;
-    other->last_retransmittable_sent_at = quic_now - 1000;
+    other->last_retransmittable_sent_at[QUICLY_EPOCH_1RTT] = quic_now - 1000;
     other->loss.largest_acked_packet_plus1.per_epoch[QUICLY_EPOCH_1RTT] = other->loss.largest_acked_packet_plus1.all_ = 2;
     other->loss.loss_time = other->loss.alarm_at = quic_now - 1;
     uint64_t losses_before = client->super.stats.num_packets.lost, pn0 = client->path_spaces[0]->packet_number++;
@@ -4854,7 +4855,7 @@ static void test_multipath_state_isolation(void)
     size_t min_pkts;
     int restrict_send;
     ok(quicly_loss_on_alarm(&other->loss, quic_now, client->super.remote.transport_params.max_ack_delay, 1, &min_pkts,
-                            &restrict_send, on_loss_detected) == 0);
+                            &restrict_send, on_loss_detected, on_persistent_congestion) == 0);
     ok(client->super.stats.num_packets.lost == losses_before + 1 && other->loss.sentmap.bytes_in_flight == 0);
     unlock_now(client);
     free_multipath_regression_peers(client, server, saved);
@@ -4929,7 +4930,7 @@ static void test_multipath_state_isolation(void)
     uint64_t pn1 = ps1->packet_number++;
     ok(quicly_sentmap_prepare(&ps1->loss.sentmap, pn1, client->stash.now_double, QUICLY_EPOCH_1RTT) == 0);
     quicly_sentmap_commit(&ps1->loss.sentmap, 1200, 0);
-    ps1->last_retransmittable_sent_at = client->stash.now_double;
+    ps1->last_retransmittable_sent_at[QUICLY_EPOCH_1RTT] = client->stash.now_double;
     unlock_now(client);
     quic_now_submillisec = 0.75;
     quicly_ack_frame_t fack = {.largest_acknowledged = pn1, .smallest_acknowledged = pn1, .ack_block_lengths = {1}};
