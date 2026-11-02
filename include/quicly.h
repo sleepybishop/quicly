@@ -507,6 +507,11 @@ struct st_quicly_context_t {
      * maximum number of DATAGRAM frame payloads that can be queued per path (0 uses default)
      */
     size_t max_datagram_frame_payloads;
+    /**
+     * when non-zero, allows `quicly_send` to emit multiple variable-sized UDP datagrams in a single call instead of padding
+     * non-terminal datagrams to full path MTU for GSO
+     */
+    uint8_t allow_variable_datagram_sizes : 1;
 };
 
 /**
