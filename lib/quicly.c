@@ -5076,7 +5076,7 @@ int64_t quicly_get_first_timeout(quicly_conn_t *conn)
             /* Recovery bookkeeping remains due even when the address cannot emit a probe. */
             if ((quicly_is_multipath(conn) || has_application_path_eligibility(conn) ||
                  (a == 0 && path_has_usable_dcid(path) && calc_amplification_limit_allowance(conn, path) != 0)) &&
-                !is_point5rtt_with_no_handshake_data_to_send(conn) && ps->loss.alarm_at < at)
+                ps->loss.alarm_at < at)
                 at = ps->loss.alarm_at;
             uint64_t allowance = path_send_allowance(conn, i);
             if (allowance == 0)
@@ -5358,7 +5358,8 @@ static quicly_error_t commit_send_packet(quicly_conn_t *conn, quicly_send_contex
         *s->dst++ = QUICLY_FRAME_TYPE_PADDING;
 
     if (!coalesced && s->target.full_size) {
-        assert(s->num_datagrams == 0 || s->datagrams[s->num_datagrams - 1].iov_len == ps->max_udp_payload_size);
+        assert(conn->super.ctx->allow_variable_datagram_sizes || s->num_datagrams == 0 ||
+               s->datagrams[s->num_datagrams - 1].iov_len == ps->max_udp_payload_size);
         const size_t max_size = s->datagram_capacity - QUICLY_AEAD_TAG_SIZE;
         assert(s->dst - s->payload_buf.datagram <= max_size);
         memset(s->dst, QUICLY_FRAME_TYPE_PADDING, s->payload_buf.datagram + max_size - s->dst);
@@ -5534,9 +5535,10 @@ static quicly_error_t do_allocate_frame(quicly_conn_t *conn, quicly_send_context
             if (overhead + packet_min_space > s->dst_end - s->dst)
                 coalescible = 0;
         }
-        /* Close the packet under construction. Datagrams being returned by `quicly_send` are padded to full-size (except for the
-         * last one datagram) so that they can be sent at once using GSO. */
-        if (!coalescible)
+        /* close the packet under construction; non-terminal datagrams are padded to full size for GSO unless variable datagram
+         * sizes are enabled (where only initial packets are padded to full size) */
+        if (!coalescible &&
+            (!conn->super.ctx->allow_variable_datagram_sizes || QUICLY_PACKET_IS_INITIAL(s->payload_buf.datagram[0])))
             s->target.full_size = 1;
         if ((ret = commit_send_packet(conn, s, coalescible)) != 0)
             return ret;
@@ -5553,7 +5555,8 @@ static quicly_error_t do_allocate_frame(quicly_conn_t *conn, quicly_send_context
             return QUICLY_ERROR_SENDBUF_FULL;
         s->datagram_capacity = ps->max_udp_payload_size;
         /* a short validation datagram must be last in a GSO batch; ordinary sends still reserve configured size */
-        if (s->num_datagrams != 0 && s->datagrams[s->num_datagrams - 1].iov_len != s->datagram_capacity)
+        if (!conn->super.ctx->allow_variable_datagram_sizes && s->num_datagrams != 0 &&
+            s->datagrams[s->num_datagrams - 1].iov_len != s->datagram_capacity)
             return QUICLY_ERROR_SENDBUF_FULL;
         if (quicly_is_multipath(conn) || has_application_path_eligibility(conn)) {
             uint64_t allowance = calc_amplification_limit_allowance(conn, path);
@@ -7826,7 +7829,7 @@ quicly_error_t quicly_send_path_maintenance(quicly_conn_t *conn, quicly_send_con
     }
 
     /* Probe paths even when the data scheduler avoids them, so an ACK can restore their eligibility. */
-    if (!is_point5rtt_with_no_handshake_data_to_send(conn)) {
+    {
         for (size_t p = 0; p < PTLS_ELEMENTSOF(conn->path_spaces); ++p) {
             quicly_path_space_t *ps = conn->path_spaces[p];
             if (ps == NULL || ps->loss.alarm_at > conn->stash.now)
