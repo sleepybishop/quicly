@@ -246,6 +246,10 @@ struct st_quicly_sentmap_t {
      */
     size_t bytes_in_flight;
     /**
+     * bytes in-flight by packet number space
+     */
+    size_t bytes_in_flight_by_epoch[QUICLY_NUM_EPOCHS];
+    /**
      * is non-NULL between prepare and commit, pointing to the packet header that is being written to
      */
     quicly_sent_t *_pending_packet;
@@ -326,6 +330,7 @@ inline void quicly_sentmap_commit(quicly_sentmap_t *map, uint16_t bytes_in_fligh
         map->_pending_packet->data.packet.ack_eliciting = 1;
         map->_pending_packet->data.packet.cc_bytes_in_flight = bytes_in_flight;
         map->bytes_in_flight += bytes_in_flight;
+        map->bytes_in_flight_by_epoch[map->_pending_packet->data.packet.ack_epoch] += bytes_in_flight;
     }
     map->_pending_packet->data.packet.frames_in_flight = 1;
     if (promoted_path)
