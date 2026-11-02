@@ -1592,6 +1592,7 @@ static void test_resume_sendrate(void)
     }
 }
 
+
 static void test_jumpstart_cwnd(void)
 {
     ok(derive_jumpstart_cwnd(UINT32_MAX, 1200, 250, 1000000, 250) == 250000);
@@ -3974,7 +3975,7 @@ static void test_multipath_state_isolation(void)
     ok(quicly_sentmap_prepare(&other->loss.sentmap, 0, quic_now - 1000, QUICLY_EPOCH_1RTT) == 0);
     quicly_sentmap_commit(&other->loss.sentmap, 1200, 0);
     other->packet_number = 2;
-    other->last_retransmittable_sent_at = quic_now - 1000;
+    other->last_retransmittable_sent_at[QUICLY_EPOCH_1RTT] = quic_now - 1000;
     other->loss.largest_acked_packet_plus1.per_epoch[QUICLY_EPOCH_1RTT] = 2;
     other->loss.largest_acked_packet_plus1.all_ = 2;
     other->loss.loss_time = quic_now - 1;
@@ -3992,7 +3993,7 @@ static void test_multipath_state_isolation(void)
     size_t min_packets;
     int restrict_sending;
     ok(quicly_loss_on_alarm(&other->loss, quic_now, client->super.remote.transport_params.max_ack_delay, 1, &min_packets,
-                            &restrict_sending, on_loss_detected) == 0);
+                            &restrict_sending, on_loss_detected, on_persistent_congestion) == 0);
     ok(client->super.stats.num_packets.lost == losses_before + 1);
     ok(other->loss.sentmap.bytes_in_flight == 0);
     unlock_now(client);

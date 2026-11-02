@@ -355,7 +355,8 @@ static void cubic_on_acked(struct st_quicly_cc_cubic_t *state, uint32_t *cwnd, u
 
     if (w_cubic < w_est) {
         /* RFC 9438, Section 4.3; Reno-Friendly Region. */
-        *cwnd = w_est;
+        if (*cwnd < w_est)
+            *cwnd = w_est;
     } else {
         /* RFC 9438, Sections 4.4 and 4.5; Concave and Convex Regions, but the amount added to CWND is  `(target - cwnd) / cwnd`
          * per MTU acked rather than per ACK (see https://mailarchive.ietf.org/arch/msg/ccwg/ZTYECT1NQijwwxq2sDLE0scbQAg/).
@@ -699,6 +700,7 @@ static void pico_on_acked(quicly_cc_t *cc, const quicly_loss_t *loss, uint32_t b
 
     /* Cubic: unlike other policies, congestion avoidance cannot be driven by bytes_to_mtu_increase. */
     if (cc->type == &quicly_cc_type_cubic && cc->cwnd >= cc->ssthresh) {
+    CubicCA:;
         struct st_quicly_cc_cubic_t *state = &cc->state.pico.cubic;
         if (state->w_est == 0) {
             if (quicly_cc_rapid_start_is_active(&cc->rapid_start)) {
@@ -759,6 +761,11 @@ static void pico_on_acked(quicly_cc_t *cc, const quicly_loss_t *loss, uint32_t b
     while (bytes_available >= cc->state.pico.bytes_to_mtu_increase) {
         bytes_available -= cc->state.pico.bytes_to_mtu_increase;
         quicly_cc_add_cwnd(&cc->cwnd, max_udp_payload_size);
+        if (cc->type == &quicly_cc_type_cubic && cc->cwnd >= cc->ssthresh) {
+            cc->state.pico.bytes_to_mtu_increase = 0;
+            bytes = bytes_available;
+            goto CubicCA;
+        }
         cc->state.pico.bytes_to_mtu_increase = calc_bytes_per_mtu_increase(cc, loss, max_udp_payload_size);
     }
     cc->state.pico.bytes_to_mtu_increase -= bytes_available;
@@ -1015,6 +1022,26 @@ static void pico_on_late_ack(quicly_cc_t *cc, uint64_t pn, int64_t now)
     }
 }
 
+static void pico_on_persistent_congestion(quicly_cc_t *cc, const quicly_loss_t *loss, int64_t now, uint32_t max_udp_payload_size)
+{
+    if (quicly_cc_rapid_start_is_in_first_recovery(&cc->rapid_start)) {
+        if (cc->type == &quicly_cc_type_cubic) {
+            cc->state.pico.cubic.cwnd_prior = cubic_post_rapid_start_wmax(cc->cwnd, cc->rapid_start.by_ecn);
+            cc->state.pico.cubic.fast_convergence = 0;
+        }
+        pico_on_acked(cc, loss, 0, cc->recovery_end, (uint32_t)loss->sentmap.bytes_in_flight, 0, 0, now, max_udp_payload_size,
+                      prague_is_running(&cc->state.pico.prague) ? &(quicly_cc_ecn_counts_t){0} : NULL);
+    }
+    if (cc->type == &quicly_cc_type_cubic)
+        cc->state.pico.cubic.w_est = 0;
+    cc->cwnd = QUICLY_MIN_CWND * max_udp_payload_size;
+    cc->recovery_end = 0;
+    cc->state.pico.bytes_to_mtu_increase = 0;
+    cc->state.pico.undo.num_packets_lost = 0;
+    if (cc->cwnd_minimum > cc->cwnd)
+        cc->cwnd_minimum = cc->cwnd;
+}
+
 static void pico_on_sent(quicly_cc_t *cc, const quicly_loss_t *loss, uint32_t bytes, int64_t now)
 {
     /* Unused */
@@ -1137,21 +1164,49 @@ static void cuback_init(quicly_init_cc_t *self, quicly_cc_t *cc, const quicly_cc
     init_with_type(cc, &quicly_cc_type_cuback, conf, max_udp_payload_size, now);
 }
 
-quicly_cc_type_t quicly_cc_type_pico = {"pico",       &quicly_cc_pico_init, pico_on_acked,    pico_on_lost,
-                                        pico_on_sent, pico_on_switch,       pico_on_late_ack, quicly_cc_jumpstart_enter};
+quicly_cc_type_t quicly_cc_type_pico = {"pico",
+                                        &quicly_cc_pico_init,
+                                        pico_on_acked,
+                                        pico_on_lost,
+                                        pico_on_persistent_congestion,
+                                        pico_on_sent,
+                                        pico_on_switch,
+                                        pico_on_late_ack,
+                                        quicly_cc_jumpstart_enter};
 quicly_init_cc_t quicly_cc_pico_init = {pico_init};
 
-quicly_cc_type_t quicly_cc_type_reno = {"reno",       &quicly_cc_reno_init, pico_on_acked,    pico_on_lost,
-                                        pico_on_sent, reno_on_switch,       pico_on_late_ack, quicly_cc_jumpstart_enter};
+quicly_cc_type_t quicly_cc_type_reno = {"reno",
+                                        &quicly_cc_reno_init,
+                                        pico_on_acked,
+                                        pico_on_lost,
+                                        pico_on_persistent_congestion,
+                                        pico_on_sent,
+                                        reno_on_switch,
+                                        pico_on_late_ack,
+                                        quicly_cc_jumpstart_enter};
 quicly_init_cc_t quicly_cc_reno_init = {reno_init};
 
-quicly_cc_type_t quicly_cc_type_cubic = {
-    "cubic",          &quicly_cc_cubic_init,     pico_on_acked,          pico_on_lost, pico_on_sent, cubic_on_switch,
-    pico_on_late_ack, quicly_cc_jumpstart_enter, cubic_update_cc_limited};
+quicly_cc_type_t quicly_cc_type_cubic = {"cubic",
+                                         &quicly_cc_cubic_init,
+                                         pico_on_acked,
+                                         pico_on_lost,
+                                         pico_on_persistent_congestion,
+                                         pico_on_sent,
+                                         cubic_on_switch,
+                                         pico_on_late_ack,
+                                         quicly_cc_jumpstart_enter,
+                                         cubic_update_cc_limited};
 quicly_init_cc_t quicly_cc_cubic_init = {cubic_init};
 
-quicly_cc_type_t quicly_cc_type_cuback = {"cuback",     &quicly_cc_cuback_init, pico_on_acked,    pico_on_lost,
-                                          pico_on_sent, cuback_on_switch,       pico_on_late_ack, quicly_cc_jumpstart_enter};
+quicly_cc_type_t quicly_cc_type_cuback = {"cuback",
+                                          &quicly_cc_cuback_init,
+                                          pico_on_acked,
+                                          pico_on_lost,
+                                          pico_on_persistent_congestion,
+                                          pico_on_sent,
+                                          cuback_on_switch,
+                                          pico_on_late_ack,
+                                          quicly_cc_jumpstart_enter};
 quicly_init_cc_t quicly_cc_cuback_init = {cuback_init};
 
 quicly_cc_type_t *quicly_cc_all_types[] = {&quicly_cc_type_reno, &quicly_cc_type_cubic,  &quicly_cc_type_cubic_legacy,

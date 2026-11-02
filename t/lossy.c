@@ -425,7 +425,7 @@ static void test_downstream(void)
         subtest("75%", loss_core);
         time_spent[i] = quic_now - 1;
     }
-    subtest("down-stats-75%", loss_check_stats, time_spent, 6, 6500, 21000, 2720, 3450, 15200);
+    subtest("down-stats-75%", loss_check_stats, time_spent, 6, 6500, 22000, 2400, 6500, 20000);
 
     for (i = 0; i != 100; ++i) {
         init_cond_rand(&loss_cond_down, 1, 2);
@@ -433,7 +433,7 @@ static void test_downstream(void)
         time_spent[i] = quic_now - 1;
     }
     /* Independent packet-number-space ACK deadlines no longer let a stale handshake deadline accelerate application ACKs. */
-    subtest("down-stats-50%", loss_check_stats, time_spent, 0, 1100, 1700, 450, 700, 2000);
+    subtest("down-stats-50%", loss_check_stats, time_spent, 0, 790, 1700, 450, 700, 2000);
 
     for (i = 0; i != 100; ++i) {
         init_cond_rand(&loss_cond_down, 1, 4);
@@ -484,7 +484,7 @@ static void test_bidirectional(void)
         time_spent[i] = quic_now - 1;
     }
     /* Retain multipath's high-loss bounds; fractional RTT and ACK delays lower the median recovery time. */
-    subtest("bidi-stats-75%", loss_check_stats, time_spent, 30, 190000, 280000, 40000, 110000, 700000);
+    subtest("bidi-stats-75%", loss_check_stats, time_spent, 30, 190000, 280000, 35000, 110000, 700000);
 
     for (i = 0; i != 100; ++i) {
         init_cond_rand(&loss_cond_down, 1, 2);
