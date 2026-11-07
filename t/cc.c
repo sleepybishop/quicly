@@ -32,6 +32,34 @@
                                .rapid_start = (_rapid_start)})
 #define TEST_CC_CONF_WITHOUT_ABBA(conf) TEST_CC_CONF((conf)->initcwnd_packets, (conf)->normalize_mtu, 0, (conf)->rapid_start)
 
+static void test_cc_connection_initialization_and_switch(void)
+{
+    const quicly_cc_conf_t *conf = TEST_CC_CONF(10, 0, 0, 0);
+    struct _st_quicly_conn_public_t conn = {0};
+
+    for (quicly_cc_type_t **from = quicly_cc_all_types; *from != NULL; ++from) {
+        quicly_cc_t cc;
+        /* fresh controllers must not retain a pointer from uninitialized storage */
+        memset(&cc, 0xa5, sizeof(cc));
+        (*from)->cc_init->cb((*from)->cc_init, &cc, conf, 1200, 0);
+        ok(cc.type == *from && cc.conn == NULL);
+
+        for (quicly_cc_type_t **to = quicly_cc_all_types; *to != NULL; ++to) {
+            /* cover state reuse during startup and resets after entering congestion avoidance */
+            for (int in_ca = 0; in_ca != 2; ++in_ca) {
+                (*from)->cc_init->cb((*from)->cc_init, &cc, conf, 1200, 0);
+                cc.conn = (quicly_conn_t *)&conn;
+                if (in_ca) {
+                    cc.cwnd_exiting_slow_start = cc.cwnd_initial;
+                    cc.cwnd = cc.ssthresh = cc.cwnd_initial / 2;
+                }
+                ok((*to)->cc_switch(&cc));
+                ok(cc.type == *to && cc.conn == (quicly_conn_t *)&conn && cc.conf == conf);
+            }
+        }
+    }
+}
+
 static void test_pico_undo_loss(void)
 {
     quicly_cc_t cc;
@@ -1948,6 +1976,7 @@ static void test_prague_ecn_disabled(void)
 
 void test_cc(void)
 {
+    subtest("connection-initialization-and-switch", test_cc_connection_initialization_and_switch);
     subtest("prague-estimator", test_prague_estimator);
     subtest("prague-grow", test_prague_grow);
     subtest("prague-growth", test_prague_growth);

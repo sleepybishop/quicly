@@ -7408,7 +7408,7 @@ static quicly_error_t do_send(quicly_conn_t *conn, quicly_send_context_t *s)
                 }
             }
             if (!ack_only) {
-                /* schedule confirmation on first fresh ACK */
+                /* PTO, requested liveness, or confirmation after a fresh recovery ACK */
                 if (min_packets_to_send != 0 || send_ps->health.confirmation_pending) {
                     if ((ret = do_allocate_frame(conn, s, 1, ALLOCATE_FRAME_TYPE_ACK_ELICITING)) != 0)
                         goto Exit;
@@ -11129,6 +11129,20 @@ int quicly_get_path_stats(quicly_conn_t *conn, size_t path_index, quicly_path_st
     stats->remote = path->address.remote;
     stats->cwnd = (uint32_t)ps->cc.cwnd;
     stats->bytes_in_flight = (uint32_t)ps->loss.sentmap.bytes_in_flight;
+    return 0;
+}
+
+int quicly_request_path_probe(quicly_conn_t *conn, size_t path_index)
+{
+    if (conn == NULL || conn->super.state >= QUICLY_STATE_CLOSING || path_index >= QUICLY_MAX_PATH_INDICES ||
+        (path_index != 0 && !quicly_is_multipath(conn)) || conn->application == NULL ||
+        conn->application->cipher.egress.key.header_protection == NULL)
+        return -1;
+    struct st_quicly_conn_path_t *path = get_path(conn, path_index);
+    if (path == NULL || path->probe_only || path->abandoned || path->path_challenge.send_at != INT64_MAX ||
+        path->path_space->health.state == QUICLY_PATH_SUSPECT || !quicly_is_path_available(conn, path_index))
+        return -1;
+    path->path_space->health.confirmation_pending = 1;
     return 0;
 }
 
