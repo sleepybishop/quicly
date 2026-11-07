@@ -29,6 +29,8 @@ static uint64_t num_packets_lost = 0;
 
 static void on_loss_detected(quicly_loss_t *loss, const quicly_sent_packet_t *lost_packet, int is_time_threshold)
 {
+    ok(loss->on_loss_iter != NULL);
+    ok(quicly_sentmap_get((quicly_sentmap_iter_t *)loss->on_loss_iter)->packet_number == lost_packet->packet_number);
     ++num_packets_lost;
 }
 
