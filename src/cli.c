@@ -1318,8 +1318,9 @@ static void usage(const char *cmd)
            "                            server. If omitted, the command runs as a client.\n"
            "  -C <algo>[:<iw>[:<p>]]    specifies the congestion control algorithm (\"reno\"\n"
            "                            (default), \"cubic\", \"cubic-legacy\", \"pico\", or\n"
-           "                            \"cuback\"), as well as initial congestion window size\n"
+           "                            \"cuback\", \"bbr\"), as well as initial congestion window size\n"
            "                            (in packets, default: 10) and use of pacing.\n"
+           "                            BBR requires pacing (e.g., -C bbr:10:p).\n"
            "  -d draft-number           specifies the draft version number to be used (e.g.,\n"
            "                            29)\n"
            "  --disable-ecn             turns off ECN support (default is on)\n"
@@ -2016,6 +2017,11 @@ int main(int argc, char **argv)
     }
     argc -= optind;
     argv += optind;
+
+    if (ctx.egress[0].cc.init_cc == &quicly_cc_bbr_init && (!ctx.egress[0].pacing || ctx.egress[0].ecn == QUICLY_ECN_MODE_L4S)) {
+        fprintf(stderr, "BBR requires pacing and does not support L4S (use -C bbr:10:p)\n");
+        return 1;
+    }
 
     if (exit_after_handshake) {
         if (reqs[0].path != NULL) {
