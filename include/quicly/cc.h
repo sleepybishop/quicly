@@ -270,6 +270,8 @@ typedef struct st_quicly_cc_ecn_counts_t {
 } quicly_cc_ecn_counts_t;
 
 typedef struct st_quicly_cc_t {
+    /* back-pointer to connection */
+    struct st_quicly_conn_t *conn;
     /**
      * Congestion controller type.
      */

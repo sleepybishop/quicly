@@ -3953,6 +3953,68 @@ static quicly_context_t setup_multipath_scheduling_peers(quicly_conn_t **client,
     return saved;
 }
 
+static void test_requested_probe_before_application_keys(void)
+{
+    quicly_conn_t *client;
+    ok(quicly_connect(&client, &quic_ctx, "example.com", &fake_address.sa, NULL, new_master_id(), ptls_iovec_init(NULL, 0), NULL,
+                        NULL, NULL) == 0);
+    quicly_address_t dest, src;
+    struct iovec datagrams[8];
+    uint8_t buf[PTLS_ELEMENTSOF(datagrams) * quic_ctx.transport_params.max_udp_payload_size];
+    size_t count = PTLS_ELEMENTSOF(datagrams);
+    ok(quicly_send(client, &dest, &src, datagrams, &count, buf, sizeof(buf)) == 0);
+    ok(count != 0);
+    int64_t deadline = quicly_get_first_timeout(client);
+    ok(deadline > quic_now);
+
+    /* path zero exists before application keys; accepting a probe here would leave an unsent frame */
+    ok(quicly_request_path_probe(client, 0) == -1);
+    ok(!get_path(client, 0)->probe_requested);
+    ok(quicly_get_first_timeout(client) == deadline);
+    count = PTLS_ELEMENTSOF(datagrams);
+    ok(quicly_send(client, &dest, &src, datagrams, &count, buf, sizeof(buf)) == 0);
+    ok(count == 0);
+    ok(quicly_get_first_timeout(client) == deadline);
+
+    /* allocating the application space alone does not make it writable */
+    ok(setup_application_space(client) == 0);
+    ok(quicly_request_path_probe(client, 0) == -1);
+    ok(!get_path(client, 0)->probe_requested);
+    ok(quicly_get_first_timeout(client) == deadline);
+    quicly_free(client);
+}
+
+static void test_multipath_requested_probe(void)
+{
+    quicly_context_t saved = quic_ctx;
+    int64_t saved_now = quic_now;
+    quicly_conn_t *client, *server;
+    setup_multipath_scheduling_peers(&client, &server, &test_round_robin_path_scheduler);
+    quicly_path_space_t *alternative = client->path_spaces[1];
+    uint64_t frames_before = client->super.stats.num_frames_sent.ping + client->super.stats.num_frames_sent.immediate_ack;
+    uint64_t old_ack = alternative->num_packets.acked;
+    ok(quicly_request_path_probe(NULL, 0) == -1);
+    ok(quicly_request_path_probe(client, QUICLY_MAX_PATH_INDICES) == -1);
+    alternative->loss.pto_count = 2;
+    ok(quicly_request_path_probe(client, 1) == -1);
+    alternative->loss.pto_count = 0;
+    for (size_t i = 0; i < 100; ++i)
+        ok(quicly_request_path_probe(client, 1) == 0);
+    for (size_t i = 0; i < 100; ++i) {
+        ++quic_now;
+        transmit_multipath(client, server);
+        transmit_multipath(server, client);
+    }
+    ok(alternative->num_packets.acked > old_ack);
+    ok(client->super.stats.num_frames_sent.ping + client->super.stats.num_frames_sent.immediate_ack == frames_before + 1);
+    ok(alternative->loss.pto_count == 0);
+    quicly_free(client);
+    quicly_free(server);
+    quicly_free_default_cid_encryptor(quic_ctx.cid_encryptor);
+    quic_ctx = saved;
+    quic_now = saved_now;
+}
+
 static void deliver_multipath_cid(quicly_conn_t *src, quicly_conn_t *dst, size_t send_path, uint32_t path_id, uint64_t sequence,
                                   int legacy, const uint8_t token[16])
 {
@@ -6201,6 +6263,8 @@ int main(int argc, char **argv)
     subtest("multipath-lifecycle", test_multipath_lifecycle);
     subtest("multipath-scheduling", test_multipath_scheduling);
     subtest("multipath-custom-recovery", test_multipath_custom_recovery);
+    subtest("multipath-requested-probe", test_multipath_requested_probe);
+    subtest("requested-probe-before-application-keys", test_requested_probe_before_application_keys);
 
     subtest("stats-foreach", test_stats_foreach);
 
