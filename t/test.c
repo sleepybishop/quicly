@@ -6099,6 +6099,9 @@ static void test_multipath_custom_recovery(void)
     }
 }
 
+#include "bbr-native.h"
+#include "bbr-ecn.h"
+
 /* loss statistics must not depend on how many random bytes unrelated tests consumed */
 static void test_lossy_isolated(void)
 {
@@ -6265,6 +6268,17 @@ int main(int argc, char **argv)
     subtest("multipath-custom-recovery", test_multipath_custom_recovery);
     subtest("multipath-requested-probe", test_multipath_requested_probe);
     subtest("requested-probe-before-application-keys", test_requested_probe_before_application_keys);
+    subtest("bbr-native-accounting", test_bbr_native);
+    subtest("bbr-switch-clock", test_bbr_switch_clock);
+    subtest("bbr-sampler", test_bbr_sampler);
+    subtest("bbr-first-rtt", test_bbr_first_rtt);
+    subtest("bbr-math", test_bbr_math);
+    subtest("bbr-ecn-regressions", test_bbr_ecn_regressions);
+    subtest("bbr-congestion-and-undo", test_bbr_congestion_and_undo);
+    subtest("bbr-persistent-congestion", test_bbr_persistent_congestion);
+    subtest("bbr-idle-restart", test_bbr_idle_restart);
+    subtest("bbr-blackout", test_bbr_blackout);
+    subtest("bbr-configuration", test_bbr_configuration);
 
     subtest("stats-foreach", test_stats_foreach);
 
