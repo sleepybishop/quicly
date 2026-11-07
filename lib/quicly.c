@@ -304,6 +304,7 @@ typedef struct st_quicly_path_recovery_t {
     quicly_loss_t loss;
     /* congestion control state */
     quicly_cc_t cc;
+    uint32_t bbr_generation;
     /* pacer state */
     quicly_pacer_t *pacer;
     /* egress PN space */
@@ -2138,17 +2139,37 @@ static void enter_cc_limited(quicly_path_space_t *ps)
     ps->recovery->cc_limited_end_pn = UINT64_MAX;
 }
 
+static quicly_error_t on_ack_bbr_meta(quicly_sentmap_t *map, const quicly_sent_packet_t *packet, int acked, quicly_sent_t *sent);
+
+static void mark_bbr_flight_app_limited(quicly_path_space_t *ps, uint64_t from_pn)
+{
+    quicly_sentmap_iter_t iter;
+    quicly_sentmap_init_iter(&ps->recovery->loss.sentmap, &iter);
+    const quicly_sent_packet_t *pkt;
+    while ((pkt = quicly_sentmap_get(&iter))->packet_number != UINT64_MAX) {
+        if (pkt->packet_number >= from_pn && pkt->frames_in_flight) {
+            quicly_sent_t *meta = quicly_sentmap_find_frame(&iter, on_ack_bbr_meta);
+            if (meta != NULL && meta->data.bbr_meta.generation == ps->recovery->bbr_generation)
+                meta->data.bbr_meta.app_limited = 1;
+        }
+        quicly_sentmap_skip(&iter);
+    }
+}
+
 /**
  * Called when there is room to send but nothing to send. Packets already sent remain CC-limited (as they were sent or remained in
  * flight while CC-limited), but those sent from now on do not, until CWND becomes full again.
  */
-static void exit_cc_limited(quicly_conn_t *conn, quicly_path_space_t *ps, int can_send_stream_data)
+static int exit_cc_limited(quicly_conn_t *conn, quicly_path_space_t *ps, int can_send_stream_data)
 {
-    if (ps->recovery->cc_limited_end_pn != UINT64_MAX || ps->recovery->loss.sentmap.bytes_in_flight >= ps->recovery->cc.cwnd)
-        return;
-    if (conn->super.remote.address_validation.validated && (can_send_stream_data || path_has_sendable_datagrams(conn, ps)))
-        return;
-    ps->recovery->cc_limited_end_pn = ps->recovery->packet_number;
+    int app_limited = ps->recovery->loss.sentmap.bytes_in_flight < ps->recovery->cc.cwnd && !can_send_stream_data &&
+                      !path_has_sendable_datagrams(conn, ps);
+    if (ps->recovery->cc.type == &quicly_cc_type_bbr && app_limited)
+        quicly_bbr_set_app_limited(&ps->recovery->cc, ps->recovery->loss.sentmap.bytes_in_flight);
+    if (ps->recovery->cc_limited_end_pn == UINT64_MAX && ps->recovery->loss.sentmap.bytes_in_flight < ps->recovery->cc.cwnd &&
+        (!conn->super.remote.address_validation.validated || app_limited))
+        ps->recovery->cc_limited_end_pn = ps->recovery->packet_number;
+    return app_limited;
 }
 
 /**
@@ -2665,6 +2686,17 @@ static void stringify_address(char *buf, struct sockaddr *sa)
     sprintf(p, "%" PRIu16, port);
 }
 
+static void configure_bbr_path(quicly_path_space_t *ps)
+{
+    if (ps->recovery->cc.type != &quicly_cc_type_bbr)
+        return;
+    if (++ps->recovery->bbr_generation == 0)
+        ++ps->recovery->bbr_generation;
+    quicly_bbr_configure(&ps->recovery->cc, ps->recovery->max_udp_payload_size, ps->recovery->loss.rtt.smoothed, ps->recovery->bbr_generation, ps->conn->stash.now_double);
+}
+
+static void before_sentmap_expire(quicly_loss_t *loss);
+
 static quicly_error_t activate_path_recovery(quicly_conn_t *conn, quicly_path_space_t *ps, size_t path_index)
 {
     if (ps->recovery != NULL)
@@ -2704,6 +2736,8 @@ static quicly_error_t activate_path_recovery(quicly_conn_t *conn, quicly_path_sp
                      initial_rtt /* FIXME remember initial_rtt in session ticket */,
                      &conn->super.remote.transport_params.max_ack_delay, &conn->super.remote.transport_params.ack_delay_exponent);
 
+    recovery->loss.before_expire = before_sentmap_expire;
+
     recovery->max_udp_payload_size = conn->super.ctx->initial_egress_max_udp_payload_size;
     if (path_index > 0 && recovery->max_udp_payload_size > QUICLY_MIN_CLIENT_INITIAL_SIZE)
         recovery->max_udp_payload_size = QUICLY_MIN_CLIENT_INITIAL_SIZE;
@@ -2734,11 +2768,15 @@ static quicly_error_t activate_path_recovery(quicly_conn_t *conn, quicly_path_sp
     }
 
     ps->recovery = recovery;
+    configure_bbr_path(ps);
     return 0;
 }
 
 static quicly_error_t alloc_path_space(quicly_conn_t *conn, size_t path_index, uint32_t path_id)
 {
+    if (get_egress_context(conn)->cc.init_cc == &quicly_cc_bbr_init &&
+        (!get_egress_context(conn)->pacing || get_egress_context(conn)->ecn == QUICLY_ECN_MODE_L4S))
+        return QUICLY_TRANSPORT_ERROR_INTERNAL;
     if (path_id >= sizeof(conn->abandoned_paths_mask) * 8)
         return QUICLY_TRANSPORT_ERROR_PROTOCOL_VIOLATION;
 
@@ -3239,6 +3277,7 @@ static quicly_error_t promote_path(quicly_conn_t *conn, size_t path_index)
                     ps->recovery->loss.rtt.smoothed < get_egress_context(conn)->loss.default_initial_rtt
                         ? ps->recovery->loss.rtt.smoothed
                         : get_egress_context(conn)->loss.default_initial_rtt);
+    configure_bbr_path(ps);
 
     if (ps_index == 0) {
         /* reset ratemeter */
@@ -4661,6 +4700,34 @@ static inline quicly_path_space_t *get_path_space_from_loss(quicly_loss_t *loss)
     return recovery->path_space;
 }
 
+static quicly_error_t on_ack_bbr_times(quicly_sentmap_t *map, const quicly_sent_packet_t *packet, int acked, quicly_sent_t *sent)
+{
+    quicly_path_recovery_t *recovery = (void *)((char *)map - offsetof(quicly_path_recovery_t, loss.sentmap));
+    quicly_path_space_t *ps = recovery->path_space;
+    if (acked && ps->recovery->cc.type == &quicly_cc_type_bbr && packet->packet_number >= ps->recovery->pn_path_start) {
+        ps->recovery->cc.state.bbr.ack_times = sent->data.bbr_times;
+        ps->recovery->cc.state.bbr.ack_packet_id = packet->packet_number;
+        ps->recovery->cc.state.bbr.ack_times_valid = 1;
+    }
+    return 0;
+}
+
+static quicly_error_t on_ack_bbr_meta(quicly_sentmap_t *map, const quicly_sent_packet_t *packet, int acked, quicly_sent_t *sent)
+{
+    quicly_path_recovery_t *recovery = (void *)((char *)map - offsetof(quicly_path_recovery_t, loss.sentmap));
+    quicly_path_space_t *ps = recovery->path_space;
+    if (acked && ps->recovery->cc.type == &quicly_cc_type_bbr && packet->packet_number >= ps->recovery->pn_path_start) {
+        quicly_cc_bbr_t *b = &ps->recovery->cc.state.bbr;
+        if (b->ack_times_valid && b->ack_packet_id == packet->packet_number) {
+            quicly_bbr_packet_t sample = {.times = b->ack_times, .meta = sent->data.bbr_meta};
+            quicly_bbr_packet_acked(&ps->recovery->cc, &sample, packet->packet_number, packet->sent_at, ps->conn->stash.now_double);
+            sent->data.bbr_meta = sample.meta;
+        }
+        b->ack_times_valid = 0;
+    }
+    return 0;
+}
+
 static quicly_error_t on_ack_ack_ranges64(quicly_sentmap_t *map, const quicly_sent_packet_t *packet, int acked, quicly_sent_t *sent)
 {
     quicly_conn_t *conn = get_conn_from_sentmap(map);
@@ -5050,6 +5117,8 @@ static quicly_error_t on_ack_retire_connection_id(quicly_sentmap_t *map, const q
 
 static uint32_t calc_pacer_send_rate(quicly_path_space_t *ps)
 {
+    if (ps->recovery->cc.type == &quicly_cc_type_bbr)
+        return quicly_bbr_pacing_rate(&ps->recovery->cc);
     uint32_t multiplier;
 
     if (ps->recovery->cc.num_loss_episodes == 0) {
@@ -5822,6 +5891,21 @@ static quicly_error_t commit_send_packet(quicly_conn_t *conn, quicly_send_contex
         packet_bytes_in_flight = 0;
     }
     if (quicly_sentmap_is_open(&ps->recovery->loss.sentmap)) {
+        if (packet_bytes_in_flight != 0 && ps->recovery->cc.type == &quicly_cc_type_bbr) {
+            quicly_bbr_packet_t sample;
+            if (!quicly_bbr_packet_sent(&ps->recovery->cc, &sample, (uint16_t)packet_bytes_in_flight,
+                                        (uint32_t)(ps->recovery->loss.sentmap.bytes_in_flight + packet_bytes_in_flight), ps->recovery->packet_number,
+                                        conn->stash.now_double))
+                return QUICLY_TRANSPORT_ERROR_INTERNAL;
+            quicly_sent_t *times = quicly_sentmap_allocate(&ps->recovery->loss.sentmap, on_ack_bbr_times);
+            if (times == NULL)
+                return PTLS_ERROR_NO_MEMORY;
+            times->data.bbr_times = sample.times;
+            quicly_sent_t *meta = quicly_sentmap_allocate(&ps->recovery->loss.sentmap, on_ack_bbr_meta);
+            if (meta == NULL)
+                return PTLS_ERROR_NO_MEMORY;
+            meta->data.bbr_meta = sample.meta;
+        }
         if (s->target.ack_eliciting)
             ps->recovery->loss.sentmap._pending_packet->data.packet.ack_eliciting = 1;
         quicly_sentmap_commit(&ps->recovery->loss.sentmap, (uint16_t)packet_bytes_in_flight, on_promoted_path);
@@ -6663,6 +6747,15 @@ static void handle_lost_packet(quicly_conn_t *conn, quicly_path_space_t *ps, con
         PTLS_LOG_ELEMENT_NUMBER(pn, lost_packet->packet_number);
         PTLS_LOG_ELEMENT_NUMBER(packet_type, lost_packet->ack_epoch);
     });
+    if (ps->recovery->cc.type == &quicly_cc_type_bbr) {
+        ps->recovery->cc.state.bbr.loss_event_valid = 0;
+        if (ps->recovery->loss.on_loss_iter != NULL && lost_packet->packet_number >= ps->recovery->pn_path_start) {
+            quicly_sent_t *meta = quicly_sentmap_find_frame(ps->recovery->loss.on_loss_iter, on_ack_bbr_meta);
+            if (meta != NULL)
+                quicly_bbr_packet_lost(&ps->recovery->cc, &meta->data.bbr_meta, lost_packet->packet_number, lost_packet->sent_at,
+                                       (uint32_t)ps->recovery->loss.sentmap.bytes_in_flight, conn->stash.now_double);
+        }
+    }
     notify_congestion_to_cc(conn, ps, lost_packet->cc_bytes_in_flight, lost_packet->packet_number, next_pn);
     QUICLY_PROBE(QUICTRACE_CC_LOST, conn, conn->stash.now, &ps->recovery->loss.rtt, ps->recovery->cc.cwnd,
                  ps->recovery->loss.sentmap.bytes_in_flight);
@@ -6681,6 +6774,62 @@ static void on_loss_detected_by_alarm(quicly_loss_t *loss, const quicly_sent_pac
     quicly_conn_t *conn = ps->conn;
     /* the packet that is sent upon the alarm regardless of CWND (see `calc_send_window`) is part of the congestion episode */
     handle_lost_packet(conn, ps, lost_packet, is_time_threshold, ps->recovery->packet_number + 1);
+}
+
+static void check_bbr_persistent_congestion(quicly_path_space_t *ps)
+{
+    quicly_cc_bbr_t *b = &ps->recovery->cc.state.bbr;
+    if (b->loss_scan_first_pn == UINT64_MAX)
+        return;
+    uint64_t from = b->loss_scan_first_pn, through = b->loss_scan_last_pn;
+    b->loss_scan_first_pn = UINT64_MAX;
+    b->loss_scan_last_pn = 0;
+    if (from <= b->loss_last_pn) {
+        /* different ACK epochs can expose an unresolved packet below the last loss; rebuild both sides */
+        from = 0;
+        if (through < b->loss_last_pn)
+            through = b->loss_last_pn;
+        b->loss_run_valid = 0;
+    } else if (b->loss_run_valid) {
+        from = b->loss_last_pn + 1;
+    } else {
+        b->loss_run_valid = 0;
+    }
+
+    /* ACKed entries are removed, while retained ACK-only packets and deliberate PN skips bridge lost packets;
+     * scan the sentmap once per loss batch */
+    quicly_sentmap_iter_t iter;
+    quicly_sentmap_init_iter(&ps->recovery->loss.sentmap, &iter);
+    const quicly_sent_packet_t *packet;
+    uint64_t expected = from;
+    while ((packet = quicly_sentmap_get(&iter))->packet_number <= through) {
+        if (packet->packet_number >= from) {
+            if (packet->packet_number != expected &&
+                !(packet->expired_before &&
+                  (iter.previous_packet_number != UINT64_MAX || expected >= ps->recovery->loss.sentmap.expired_head_from)))
+                b->loss_run_valid = 0;
+            expected = packet->packet_number + 1;
+            if (packet->ack_eliciting) {
+                quicly_sent_t *meta = quicly_sentmap_find_frame(&iter, on_ack_bbr_meta);
+                if (packet->cc_bytes_in_flight != 0 || meta == NULL ||
+                    meta->data.bbr_meta.generation != b->sampler.generation ||
+                    !(meta->data.bbr_meta.flags & QUICLY_BBR_PACKET_LOST)) {
+                    b->loss_run_valid = 0;
+                } else {
+                    quicly_bbr_track_persistent_loss(&ps->recovery->cc, &ps->recovery->loss, packet->packet_number, packet->sent_at);
+                }
+            }
+        }
+        quicly_sentmap_skip(&iter);
+    }
+}
+
+static void before_sentmap_expire(quicly_loss_t *loss)
+{
+    quicly_path_recovery_t *recovery = (void *)((char *)loss - offsetof(quicly_path_recovery_t, loss));
+    quicly_path_space_t *ps = recovery->path_space;
+    if (ps->recovery->cc.type == &quicly_cc_type_bbr)
+        check_bbr_persistent_congestion(ps);
 }
 
 static quicly_error_t send_max_streams(quicly_conn_t *conn, int uni, quicly_send_context_t *s)
@@ -7713,6 +7862,10 @@ static quicly_error_t service_path_loss_alarm(quicly_conn_t *conn, quicly_path_s
                                         conn->initial == NULL && conn->handshake == NULL, min_packets_to_send, restrict_sending,
                                         on_loss_detected_by_alarm)) != 0)
             return ret;
+        if (ps->recovery->cc.type == &quicly_cc_type_bbr) {
+            check_bbr_persistent_congestion(ps);
+            quicly_bbr_apply_persistent_congestion(&ps->recovery->cc);
+        }
         assert(*min_packets_to_send > 0);
         if (quicly_is_multipath(conn) || has_application_path_eligibility(conn))
             ps->recovery->last_recovery_at = conn->stash.now_double;
@@ -7803,7 +7956,12 @@ static quicly_error_t do_send(quicly_conn_t *conn, quicly_send_context_t *s)
     int validation_only = !path_can_send_packet(conn, s->path_index);
     struct st_quicly_conn_path_t *path = get_send_path(conn, s);
     quicly_path_space_t *send_ps = path->path_space;
+    uint64_t orig_pn = send_ps->recovery->packet_number;
     size_t min_packets_to_send = 0, orig_bytes_inflight = 0, path_dgrams_consumed = 0, conn_dgrams_consumed = 0;
+    quicly_cc_t saved_bbr_cc;
+    quicly_pacer_t saved_pacer;
+    int bbr_restarted_from_idle = 0, pacer_saved = 0;
+    uint32_t saved_bbr_generation = send_ps->recovery->bbr_generation;
     quicly_error_t ret = 0;
 
     if (path == send_ps->addrs[0] && (ret = service_path_loss_alarm(conn, send_ps, &min_packets_to_send, &restrict_sending)) != 0)
@@ -7819,6 +7977,20 @@ static quicly_error_t do_send(quicly_conn_t *conn, quicly_send_context_t *s)
             conn->stash.now) {
         update_ecn_state(conn, send_ps, QUICLY_ECN_OFF);
         /* TODO reset CC? */
+    }
+
+    if (send_ps->recovery->cc.type == &quicly_cc_type_bbr) {
+        quicly_bbr_sync_mtu(&send_ps->recovery->cc, send_ps->recovery->max_udp_payload_size);
+        if (send_ps->recovery->loss.sentmap.bytes_in_flight == 0 && send_ps->recovery->cc.state.bbr.sampler.rst.app_limited != 0) {
+            quicly_bbr_apply_persistent_congestion(&send_ps->recovery->cc);
+            saved_bbr_cc = send_ps->recovery->cc;
+            if (send_ps->recovery->pacer != NULL) {
+                saved_pacer = *send_ps->recovery->pacer;
+                pacer_saved = 1;
+            }
+            bbr_restarted_from_idle = 1;
+            quicly_bbr_restart_from_idle(&send_ps->recovery->cc, &send_ps->recovery->loss, send_ps->recovery->max_udp_payload_size, conn->stash.now_double);
+        }
     }
 
     { /* calculate send window */
@@ -8082,6 +8254,12 @@ Exit:
         if (conn_dgrams_consumed != 0)
             unmark_datagram_queue(&conn->egress.datagram_frame_payloads);
     }
+    if (bbr_restarted_from_idle && send_ps->recovery->loss.sentmap.bytes_in_flight == 0 && send_ps->recovery->cc.type == &quicly_cc_type_bbr &&
+        send_ps->recovery->bbr_generation == saved_bbr_generation) {
+        send_ps->recovery->cc = saved_bbr_cc;
+        if (pacer_saved)
+            *send_ps->recovery->pacer = saved_pacer;
+    }
     if (ret == 0) {
         /* update timers, cc and delivery rate estimator states */
         int can_send_stream_data = scheduler_can_send(conn);
@@ -8092,8 +8270,10 @@ Exit:
                          pacer_can_send_at(send_ps) > conn->stash.now);
         if (!restrict_sending && send_ps->recovery->loss.sentmap.bytes_in_flight >= send_ps->recovery->cc.cwnd) {
             enter_cc_limited(send_ps);
-        } else {
-            exit_cc_limited(conn, send_ps, path_can_send_stream);
+        } else if (exit_cc_limited(conn, send_ps, path_can_send_stream) && !restrict_sending &&
+                   s->num_datagrams < s->max_datagrams && pacer_can_send_at(send_ps) <= conn->stash.now &&
+                   send_ps->recovery->cc.type == &quicly_cc_type_bbr && send_ps->recovery->packet_number > orig_pn) {
+            mark_bbr_flight_app_limited(send_ps, orig_pn);
         }
         if (s->num_datagrams != 0)
             update_idle_timeout(conn, 0);
@@ -8164,6 +8344,14 @@ int quicly_has_datagram_frames(quicly_conn_t *conn)
 
 int quicly_set_cc(quicly_conn_t *conn, quicly_cc_type_t *cc)
 {
+    if (cc == &quicly_cc_type_bbr) {
+        if (is_l4s(conn))
+            return 0;
+        for (size_t i = 0; i < PTLS_ELEMENTSOF(conn->path_spaces); ++i)
+            if (conn->path_spaces[i] != NULL && conn->path_spaces[i]->recovery != NULL &&
+                conn->path_spaces[i]->recovery->pacer == NULL)
+                return 0;
+    }
     quicly_cc_t original[QUICLY_MAX_PATH_SPACES];
     for (size_t i = 0; i < PTLS_ELEMENTSOF(conn->path_spaces); ++i)
         if (conn->path_spaces[i] != NULL && conn->path_spaces[i]->recovery != NULL)
@@ -8180,6 +8368,14 @@ int quicly_set_cc(quicly_conn_t *conn, quicly_cc_type_t *cc)
                     conn->path_spaces[j]->recovery->cc = original[j];
             return 0;
         }
+    }
+    if (cc == &quicly_cc_type_bbr) {
+        /* this API can be called both by the application and from a protocol callback */
+        lock_now(conn, 1);
+        for (size_t i = 0; i < PTLS_ELEMENTSOF(conn->path_spaces); ++i)
+            if (conn->path_spaces[i] != NULL && conn->path_spaces[i]->recovery != NULL && original[i].type != cc)
+                configure_bbr_path(conn->path_spaces[i]);
+        unlock_now(conn);
     }
     return 1;
 }
@@ -9106,6 +9302,9 @@ static quicly_error_t process_ack_frame_core(quicly_conn_t *conn, struct st_quic
     if (frame->largest_acknowledged >= ack_ps->recovery->packet_number)
         return QUICLY_TRANSPORT_ERROR_PROTOCOL_VIOLATION;
 
+    if (ack_ps->recovery->cc.type == &quicly_cc_type_bbr)
+        quicly_bbr_begin_ack(&ack_ps->recovery->cc, conn->stash.now_double);
+
     uint64_t pn_acked = frame->smallest_acknowledged;
 
     switch (state->epoch) {
@@ -9177,6 +9376,8 @@ static quicly_error_t process_ack_frame_core(quicly_conn_t *conn, struct st_quic
                 ++conn->super.stats.num_packets.ack_received_promoted_paths;
 
             int is_valid_pn = ack_ps->recovery->pn_path_start <= pn_acked;
+            if (is_valid_pn && ack_ps->recovery->cc.type == &quicly_cc_type_bbr)
+                quicly_bbr_acknowledge_packet(&ack_ps->recovery->cc, pn_acked);
             if (is_valid_pn) {
                 if (largest_newly_acked.pn == UINT64_MAX || pn_acked > largest_newly_acked.pn) {
                     largest_newly_acked.pn = pn_acked;
@@ -9239,21 +9440,24 @@ static quicly_error_t process_ack_frame_core(quicly_conn_t *conn, struct st_quic
 
     /* Update loss detection engine on ack. The function uses ack_delay only when the largest_newly_acked is also the largest acked
      * so far. So, it does not matter if the ack_delay being passed in does not apply to the largest_newly_acked. */
-    quicly_loss_on_ack_received(&ack_ps->recovery->loss, largest_newly_acked.pn, largest_late_acked,
-                                ack_ps->recovery->packet_number, state->epoch, conn->stash.now_double, largest_newly_acked.sent_at,
-                                frame->ack_delay,
+    if (ack_ps->recovery->cc.type == &quicly_cc_type_bbr)
+        ack_ps->recovery->cc.state.bbr.rtt_sample_valid = includes_ack_eliciting && largest_newly_acked.pn != UINT64_MAX &&
+                                                largest_newly_acked.pn >= ack_ps->recovery->loss.largest_acked_packet_plus1.all_;
+    quicly_loss_on_ack_received(&ack_ps->recovery->loss, largest_newly_acked.pn, largest_late_acked, ack_ps->recovery->packet_number, state->epoch,
+                                conn->stash.now_double, largest_newly_acked.sent_at, frame->ack_delay,
                                 includes_ack_eliciting ? includes_late_ack ? QUICLY_LOSS_ACK_RECEIVED_KIND_ACK_ELICITING_LATE_ACK
                                                                            : QUICLY_LOSS_ACK_RECEIVED_KIND_ACK_ELICITING
                                                        : QUICLY_LOSS_ACK_RECEIVED_KIND_NON_ACK_ELICITING);
+    if (ack_ps->recovery->cc.type == &quicly_cc_type_bbr && ack_ps->recovery->cc.state.bbr.rtt_sample_valid)
+        quicly_bbr_update_rtt(&ack_ps->recovery->cc, ack_ps->recovery->loss.rtt.latest, largest_newly_acked.sent_at, conn->stash.now_double);
 
     /* OnPacketAcked and OnPacketAckedCC */
-    ack_ps->recovery->cc.type->cc_on_acked(&ack_ps->recovery->cc, &ack_ps->recovery->loss, (uint32_t)bytes_acked,
-                                           frame->largest_acknowledged,
-                                           (uint32_t)(ack_ps->recovery->loss.sentmap.bytes_in_flight + bytes_acked), cc_limited,
-                                           ack_ps->recovery->packet_number, conn->stash.now, ack_ps->recovery->max_udp_payload_size,
-                                           ack_ps->recovery->ecn.state != QUICLY_ECN_OFF && is_l4s(conn) ? &ecn_counts : NULL);
-    QUICLY_PROBE(QUICTRACE_CC_ACK, conn, conn->stash.now, &ack_ps->recovery->loss.rtt, ack_ps->recovery->cc.cwnd,
-                 ack_ps->recovery->loss.sentmap.bytes_in_flight);
+    if (ack_ps->recovery->cc.type != &quicly_cc_type_bbr)
+        ack_ps->recovery->cc.type->cc_on_acked(&ack_ps->recovery->cc, &ack_ps->recovery->loss, (uint32_t)bytes_acked, frame->largest_acknowledged,
+                                     (uint32_t)(ack_ps->recovery->loss.sentmap.bytes_in_flight + bytes_acked), cc_limited,
+                                     ack_ps->recovery->packet_number, conn->stash.now, ack_ps->recovery->max_udp_payload_size,
+                                     ack_ps->recovery->ecn.state != QUICLY_ECN_OFF && is_l4s(conn) ? &ecn_counts : NULL);
+    QUICLY_PROBE(QUICTRACE_CC_ACK, conn, conn->stash.now, &ack_ps->recovery->loss.rtt, ack_ps->recovery->cc.cwnd, ack_ps->recovery->loss.sentmap.bytes_in_flight);
 
     QUICLY_PROBE(CC_ACK_RECEIVED, conn, conn->stash.now, frame->largest_acknowledged, bytes_acked, ack_ps->recovery->cc.cwnd,
                  ack_ps->recovery->loss.sentmap.bytes_in_flight);
@@ -9268,6 +9472,15 @@ static quicly_error_t process_ack_frame_core(quicly_conn_t *conn, struct st_quic
     if ((ret = quicly_loss_detect_loss(&ack_ps->recovery->loss, conn->stash.now, conn->super.remote.transport_params.max_ack_delay,
                                        conn->initial == NULL && conn->handshake == NULL, on_loss_detected)) != 0)
         return ret;
+
+    /* BBR consumes the ACK only after native loss detection has added this ACK's loss evidence */
+    if (ack_ps->recovery->cc.type == &quicly_cc_type_bbr) {
+        check_bbr_persistent_congestion(ack_ps);
+        ack_ps->recovery->cc.type->cc_on_acked(&ack_ps->recovery->cc, &ack_ps->recovery->loss, (uint32_t)bytes_acked, frame->largest_acknowledged,
+                                     (uint32_t)ack_ps->recovery->loss.sentmap.bytes_in_flight, cc_limited, ack_ps->recovery->packet_number,
+                                     conn->stash.now, ack_ps->recovery->max_udp_payload_size,
+                                     ecn_counts.ce != 0 ? &ecn_counts : NULL);
+    }
 
     /* ECN: report CE as congestion; for L4S, the counts have already been fed to the marking estimator through `cc_on_acked` */
     if (ecn_counts.ce != 0)
