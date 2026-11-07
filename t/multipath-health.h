@@ -429,8 +429,7 @@ static void test_requested_probe_before_application_keys(void)
     int64_t deadline = quicly_get_first_timeout(client);
     ok(deadline > quic_now);
 
-    /* Path zero exists before application keys. Accepting a probe here would
-     * leave an immediately due control frame that the send path cannot emit. */
+    /* path zero exists before application keys; accepting a probe here would leave an unsent frame */
     ok(quicly_request_path_probe(client, 0) == -1);
     ok(!client->path_spaces[0]->health.confirmation_pending);
     ok(quicly_get_first_timeout(client) == deadline);
@@ -439,7 +438,7 @@ static void test_requested_probe_before_application_keys(void)
     ok(count == 0);
     ok(quicly_get_first_timeout(client) == deadline);
 
-    /* Allocating the application space alone does not make it writable. */
+    /* allocating the application space alone does not make it writable */
     ok(setup_application_space(client) == 0);
     ok(quicly_request_path_probe(client, 0) == -1);
     ok(!client->path_spaces[0]->health.confirmation_pending);

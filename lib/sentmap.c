@@ -100,6 +100,8 @@ quicly_error_t quicly_sentmap_prepare(quicly_sentmap_t *map, uint64_t packet_num
     if ((map->_pending_packet = quicly_sentmap_allocate(map, quicly_sentmap__type_packet)) == NULL)
         return PTLS_ERROR_NO_MEMORY;
     map->_pending_packet->data.packet = (quicly_sent_packet_t){packet_number, now, ack_epoch};
+    map->_pending_packet->data.packet.expired_before = map->expired_tail_until != 0 && packet_number == map->expired_tail_until;
+    map->expired_tail_until = 0;
     return 0;
 }
 
@@ -125,6 +127,7 @@ struct st_quicly_sent_block_t *quicly_sentmap__new_block(quicly_sentmap_t *map)
 
 void quicly_sentmap_skip(quicly_sentmap_iter_t *iter)
 {
+    iter->previous_packet_number = iter->p->data.packet.packet_number;
     do {
         next_entry(iter);
     } while (iter->p->acked != quicly_sentmap__type_packet);
@@ -150,6 +153,8 @@ quicly_error_t quicly_sentmap_update(quicly_sentmap_t *map, quicly_sentmap_iter_
         iter->p->data.packet.cc_bytes_in_flight = 0;
     }
     iter->p->data.packet.frames_in_flight = 0;
+    if (event == QUICLY_SENTMAP_EVENT_LOST)
+        iter->p->data.packet.declared_lost = 1;
 
     int should_notify = event == QUICLY_SENTMAP_EVENT_ACKED || packet.frames_in_flight,
         should_discard = event == QUICLY_SENTMAP_EVENT_ACKED || event == QUICLY_SENTMAP_EVENT_EXPIRED;
@@ -166,6 +171,24 @@ quicly_error_t quicly_sentmap_update(quicly_sentmap_t *map, quicly_sentmap_iter_
             should_notify = 0;
         if (should_discard)
             discard_entry(map, iter);
+    }
+
+    if (should_discard) {
+        /* preserve the distinction between expired and ACKed gaps without retaining expired entries */
+        int at_head = iter->previous_packet_number == UINT64_MAX;
+        int continuous = event == QUICLY_SENTMAP_EVENT_EXPIRED && (!packet.ack_eliciting || packet.declared_lost) &&
+                         (at_head || packet.packet_number == iter->previous_packet_number + 1 || packet.expired_before);
+        if (at_head)
+            map->expired_head_from = packet.expired_before ? map->expired_head_from : packet.packet_number;
+        if (iter->p != &quicly_sentmap__end_iter) {
+            quicly_sent_packet_t *next = &iter->p->data.packet;
+            next->expired_before = continuous && (next->packet_number == packet.packet_number + 1 || next->expired_before);
+        } else {
+            map->expired_tail_until = continuous ? (map->expired_tail_until != 0 ? map->expired_tail_until : packet.packet_number + 1)
+                                                : 0;
+        }
+    } else {
+        iter->previous_packet_number = packet.packet_number;
     }
 
     return ret;

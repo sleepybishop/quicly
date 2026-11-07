@@ -25,6 +25,8 @@
 quicly_error_t quicly_loss_init_sentmap_iter(quicly_loss_t *loss, quicly_sentmap_iter_t *iter, int64_t now, uint32_t max_ack_delay,
                                              int is_closing)
 {
+    if (loss->before_expire != NULL)
+        loss->before_expire(loss);
     quicly_sentmap_init_iter(&loss->sentmap, iter);
 
     double retire_before = now - quicly_loss_get_sentmap_expiration_time(loss, max_ack_delay);
@@ -142,10 +144,10 @@ quicly_error_t quicly_loss_detect_loss_after_ack(quicly_loss_t *loss, int64_t no
             if (sent->ack_eliciting)
                 max_lost_pn = sent->packet_number;
             if (sent->cc_bytes_in_flight != 0) {
-                const quicly_sentmap_iter_t *previous_iter = loss->on_loss_iter;
-                loss->on_loss_iter = &iter;
                 if (sent->ack_eliciting && loss->persistent_congestion.first_rtt_sample_pn <= sent->packet_number)
                     newly_lost_ack_eliciting = 1;
+                const quicly_sentmap_iter_t *previous_iter = loss->on_loss_iter;
+                loss->on_loss_iter = &iter;
                 on_loss_detected(loss, sent, !CHECK_PACKET_THRESHOLD(sent));
                 loss->on_loss_iter = previous_iter;
                 if ((ret = quicly_sentmap_update(&loss->sentmap, &iter, QUICLY_SENTMAP_EVENT_LOST)) != 0)

@@ -45,7 +45,7 @@ static void test_cc_connection_initialization_and_switch(void)
         ok(cc.type == *from && cc.conn == NULL);
 
         for (quicly_cc_type_t **to = quicly_cc_all_types; *to != NULL; ++to) {
-            /* cover state reuse during startup and resets after entering congestion avoidance, including BBR switches */
+            /* cover state reuse during startup and resets after entering congestion avoidance */
             for (int in_ca = 0; in_ca != 2; ++in_ca) {
                 (*from)->cc_init->cb((*from)->cc_init, &cc, conf, 1200, 0);
                 cc.conn = (quicly_conn_t *)&conn;
@@ -2006,7 +2006,7 @@ static void test_persistent_congestion_cwnd(void)
             cc.type->cc_on_acked(&cc, &loss, ack_bytes, 20, cc.cwnd, 1, 21, 1300, mtu, NULL);
         }
         uint32_t cwnd_at_ca_entry = cc.cwnd;
-        ok(cwnd_at_ca_entry >= cc.ssthresh);
+        ok(cc.type == &quicly_cc_type_cubic_legacy ? cwnd_at_ca_entry > cc.ssthresh : cwnd_at_ca_entry == cc.ssthresh);
         cc.type->cc_on_acked(&cc, &loss, mtu, 20, cwnd_at_ca_entry, 1, 21, 1301, mtu, NULL);
         ok(cc.cwnd >= cwnd_at_ca_entry);
         cc.type->cc_on_acked(&cc, &loss, cwnd_at_ca_entry, 20, cwnd_at_ca_entry, 1, 21, 1400, mtu, NULL);

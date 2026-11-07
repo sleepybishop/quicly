@@ -556,6 +556,11 @@ struct st_quicly_context_t {
      * maximum number of DATAGRAM frame payloads that can be queued per path (0 uses default)
      */
     size_t max_datagram_frame_payloads;
+    /**
+     * when non-zero, allows `quicly_send` to emit multiple variable-sized UDP datagrams in a single call instead of padding
+     * non-terminal datagrams to full path MTU for GSO
+     */
+    uint8_t allow_variable_datagram_sizes : 1;
 };
 
 /**
@@ -1147,6 +1152,8 @@ typedef struct st_quicly_stream_callbacks_t {
      * being written.  `wrote_all` is a boolean out parameter indicating if the application has written all the available data.
      * As this callback is triggered by calling quicly_stream_sync_sendbuf (stream, 1) when tx data is present, it assumes data
      * to be available - that is `len` return value should be non-zero.
+     * If the application fails to provide the data, it should reset the stream by calling `quicly_reset_stream` (and optionally
+     * `quicly_request_stop`). The connection cannot be closed from within this callback.
      */
     void (*on_send_emit)(quicly_stream_t *stream, size_t off, void *dst, size_t *len, int *wrote_all);
     /**

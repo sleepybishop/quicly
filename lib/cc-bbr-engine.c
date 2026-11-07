@@ -41,7 +41,7 @@ static void quicly_bbr_log_infof(quicly_bbr_log *log, int event, const char *for
 
 
 
-#define QUICLY_BBR_BBR_MAX_BW_FILTERLEN 2
+#define QUICLY_BBR_BBR_MAX_BW_FILTERLEN 1
 
 #define QUICLY_BBR_BBR_EXTRA_ACKED_FILTERLEN 10
 
@@ -313,6 +313,11 @@ static void bbr_on_init(quicly_bbr_cc_bbr *bbr, quicly_bbr_conn_stat *cstat,
   bbr->extra_acked_delivered = 0;
   bbr->full_bw_reached = 0;
 
+  bbr->ecn_bw = UINT64_MAX;
+  bbr->ecn_cwnd = UINT64_MAX;
+  bbr->max_bw = 0;
+  bbr->bw = 0;
+
   bbr_reset_congestion_signals(bbr);
   bbr_reset_shortterm_model(bbr);
   bbr_init_round_counting(bbr);
@@ -327,9 +332,6 @@ static void bbr_on_init(quicly_bbr_cc_bbr *bbr, quicly_bbr_conn_stat *cstat,
   bbr->loss_round_delivered = UINT64_MAX;
 
   bbr->rounds_since_probe_up = 0;
-
-  bbr->max_bw = 0;
-  bbr->bw = 0;
 
   bbr->cycle_count = 0;
 
@@ -369,6 +371,9 @@ static void bbr_on_init(quicly_bbr_cc_bbr *bbr, quicly_bbr_conn_stat *cstat,
   bbr->undo_bw_shortterm = 0;
   bbr->undo_inflight_shortterm = 0;
   bbr->undo_inflight_longterm = 0;
+  bbr->undo_round_count = 0;
+  bbr->undo_bytes_lost_in_round = 0;
+  bbr->undo_loss_events_in_round = 0;
 }
 
 static void bbr_reset_congestion_signals(quicly_bbr_cc_bbr *bbr) {
@@ -380,6 +385,7 @@ static void bbr_reset_congestion_signals(quicly_bbr_cc_bbr *bbr) {
 static void bbr_reset_shortterm_model(quicly_bbr_cc_bbr *bbr) {
   bbr->bw_shortterm = UINT64_MAX;
   bbr->inflight_shortterm = UINT64_MAX;
+  bbr_bound_bw_for_model(bbr);
 }
 
 static void bbr_init_round_counting(quicly_bbr_cc_bbr *bbr) {
@@ -428,6 +434,7 @@ static void bbr_check_startup_high_loss(quicly_bbr_cc_bbr *bbr) {
     return;
   }
 
+  bbr->undo_state = QUICLY_BBR_BBR_STATE_STARTUP;
   bbr->full_bw_reached = 1;
   bbr->inflight_longterm =
     quicly_bbr_max(bbr_bdp_multiple(bbr, bbr->cwnd_gain_h), bbr->inflight_latest);
@@ -454,9 +461,14 @@ static void bbr_set_pacing_rate_with_gain(const quicly_bbr_cc_bbr *bbr,
 
   interval_m = (QUICLY_BBR_SECONDS << 10) * 100 * 100 / pacing_gain_h / bbr->bw /
                (100 - QUICLY_BBR_BBR_PACING_MARGIN_PERCENT);
+  if (bbr->ecn_bw != UINT64_MAX) {
+    interval_m =
+      quicly_bbr_max(interval_m, (QUICLY_BBR_SECONDS << 10) / bbr->ecn_bw);
+  }
   interval_m = quicly_bbr_max(interval_m, 1);
 
-  if (bbr->full_bw_reached || interval_m < cstat->pacing_interval_m) {
+  if (bbr->full_bw_reached || bbr_is_in_probe_bw_state(bbr) ||
+      bbr->ecn_bw != UINT64_MAX || interval_m < cstat->pacing_interval_m) {
     cstat->pacing_interval_m = interval_m;
   }
 }
@@ -555,10 +567,12 @@ static void bbr_update_congestion_signals(quicly_bbr_cc_bbr *bbr,
   }
 
   if (!bbr->loss_round_start) {
+    bbr_bound_bw_for_model(bbr);
     return;
   }
 
   bbr_adapt_lower_bounds_from_congestion(bbr, cstat);
+  bbr_bound_bw_for_model(bbr);
 
   bbr->is_loss_in_round = 0;
   bbr->undo_loss_in_round = 0;
@@ -599,6 +613,7 @@ static void bbr_loss_lower_bounds(quicly_bbr_cc_bbr *bbr) {
 
 static void bbr_bound_bw_for_model(quicly_bbr_cc_bbr *bbr) {
   bbr->bw = quicly_bbr_min(bbr->max_bw, bbr->bw_shortterm);
+  bbr->bw = quicly_bbr_min(bbr->bw, bbr->ecn_bw);
 }
 
 static void bbr_update_max_bw(quicly_bbr_cc_bbr *bbr, const quicly_bbr_conn_stat *cstat,
@@ -1010,6 +1025,7 @@ static void bbr_handle_inflight_too_high(quicly_bbr_cc_bbr *bbr,
   }
 
   if (bbr->state == QUICLY_BBR_BBR_STATE_PROBE_BW_UP) {
+    bbr->undo_state = QUICLY_BBR_BBR_STATE_PROBE_BW_UP;
     bbr_start_probe_bw_down(bbr, ts);
   }
 }
@@ -1030,10 +1046,14 @@ static void bbr_note_loss(quicly_bbr_cc_bbr *bbr, const quicly_bbr_conn_stat *cs
 static void bbr_save_state_upon_loss(quicly_bbr_cc_bbr *bbr,
                                      const quicly_bbr_conn_stat *cstat) {
   bbr_save_cwnd(bbr, cstat);
-  bbr->undo_state = bbr->state;
+  /* only a loss-induced phase change needs to be undone */
+  bbr->undo_state = QUICLY_BBR_BBR_STATE_NONE;
   bbr->undo_bw_shortterm = bbr->bw_shortterm;
   bbr->undo_inflight_shortterm = bbr->inflight_shortterm;
   bbr->undo_inflight_longterm = bbr->inflight_longterm;
+  bbr->undo_round_count = bbr->round_count;
+  bbr->undo_bytes_lost_in_round = bbr->bytes_lost_in_round;
+  bbr->undo_loss_events_in_round = bbr->loss_events_in_round;
 }
 
 static void bbr_handle_spurious_loss_detection(quicly_bbr_cc_bbr *bbr,
@@ -1042,6 +1062,11 @@ static void bbr_handle_spurious_loss_detection(quicly_bbr_cc_bbr *bbr,
 
   bbr->is_loss_in_round = 0;
   bbr->undo_loss_in_round = 0;
+  /* discard this episode's loss events while preserving earlier episodes in the same round */
+  bbr->bytes_lost_in_round = bbr->round_count == bbr->undo_round_count
+                               ? bbr->undo_bytes_lost_in_round : 0;
+  bbr->loss_events_in_round = bbr->round_count == bbr->undo_round_count
+                                ? bbr->undo_loss_events_in_round : 0;
 
   bbr_reset_full_bw(bbr);
 
@@ -1169,6 +1194,7 @@ static void bbr_enter_probe_rtt(quicly_bbr_cc_bbr *bbr) {
   bbr->state = QUICLY_BBR_BBR_STATE_PROBE_RTT;
   bbr->pacing_gain_h = 100;
   bbr->cwnd_gain_h = QUICLY_BBR_BBR_PROBE_RTT_CWND_GAIN_H;
+  bbr->prev_probe_precautionary = 0;
 }
 
 static void bbr_handle_probe_rtt(quicly_bbr_cc_bbr *bbr, quicly_bbr_conn_stat *cstat,
@@ -1215,6 +1241,9 @@ static void bbr_mark_connection_app_limited(quicly_bbr_cc_bbr *bbr,
 
 static void bbr_exit_probe_rtt(quicly_bbr_cc_bbr *bbr, quicly_bbr_tstamp ts) {
   bbr_reset_shortterm_model(bbr);
+  bbr->probe_rtt_done_stamp = UINT64_MAX;
+  bbr->probe_rtt_round_done = 0;
+  bbr->probe_rtt_expired = 0;
 
   if (bbr->full_bw_reached) {
     bbr_start_probe_bw_down(bbr, ts);
@@ -1232,11 +1261,24 @@ static void bbr_handle_restart_from_idle(quicly_bbr_cc_bbr *bbr,
 
     bbr->idle_restart = 1;
     bbr->extra_acked_interval_start = ts;
+    bbr->extra_acked_delivered = 0;
 
     if (bbr_is_in_probe_bw_state(bbr)) {
       bbr_set_pacing_rate_with_gain(bbr, cstat, 100);
+      bbr_set_send_quantum(bbr, cstat);
     } else if (bbr->state == QUICLY_BBR_BBR_STATE_PROBE_RTT) {
-      bbr_check_probe_rtt_done(bbr, cstat, ts);
+      if (bbr->probe_rtt_done_stamp == UINT64_MAX &&
+          cstat->bytes_in_flight <= bbr_probe_rtt_cwnd(bbr, cstat)) {
+        bbr->probe_rtt_done_stamp = ts + QUICLY_BBR_BBR_PROBE_RTT_DURATION;
+        bbr->probe_rtt_round_done = 0;
+        bbr_start_round(bbr);
+      } else {
+        bbr_check_probe_rtt_done(bbr, cstat, ts);
+        if (bbr->state != QUICLY_BBR_BBR_STATE_PROBE_RTT) {
+          quicly_bbr_cc_bbr_update_pacing(bbr, cstat);
+          bbr_bound_cwnd_for_model(bbr, cstat);
+        }
+      }
     }
   }
 }
@@ -1365,6 +1407,7 @@ static void bbr_bound_cwnd_for_model(const quicly_bbr_cc_bbr *bbr,
   }
 
   cap = quicly_bbr_min(cap, bbr->inflight_shortterm);
+  cap = quicly_bbr_min(cap, bbr->ecn_cwnd);
   cap = quicly_bbr_max(cap, mpcwnd);
 
   cstat->cwnd = quicly_bbr_min(cstat->cwnd, cap);
@@ -1508,6 +1551,13 @@ void quicly_bbr_cc_bbr_init(quicly_bbr_cc_bbr *bbr, quicly_bbr_log *log,
   };
 
   bbr_on_init(bbr, cstat, initial_ts);
+}
+
+void quicly_bbr_cc_bbr_update_pacing(quicly_bbr_cc_bbr *bbr,
+                                      quicly_bbr_conn_stat *cstat) {
+  bbr_set_pacing_rate(bbr, cstat);
+  bbr_set_send_quantum(bbr, cstat);
+  bbr_update_offload_budget(bbr, cstat);
 }
 
 

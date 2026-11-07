@@ -224,30 +224,28 @@ static void test_late_ack_threshold_adjustment(void)
 static void test_overdue_alarm(void)
 {
     quicly_loss_t loss;
-    double last_sent[QUICLY_NUM_EPOCHS] = {INFINITY, INFINITY, INFINITY, 100};
-    unsigned outstanding_epochs = 1u << QUICLY_EPOCH_1RTT;
+    const double sent_at[QUICLY_NUM_EPOCHS] = {100, INFINITY, INFINITY, INFINITY};
     quicly_loss_init(&loss, &quicly_spec_context.egress[0].loss, 40, &quicly_spec_context.transport_params.max_ack_delay,
                      &quicly_spec_context.transport_params.ack_delay_exponent);
-    quicly_loss_update_alarm(&loss, 100, last_sent, outstanding_epochs, 1, 1, 1, 1, 1);
+    quicly_loss_update_alarm(&loss, 100, sent_at, 1, 1, 0, 1, 1, 1);
     int64_t deadline = loss.alarm_at;
     ok(deadline > 100);
 
     /* ACK processing and sends on other paths must not indefinitely defer PTO. */
     for (int i = 0; i != 4; ++i) {
         int64_t at = deadline + i * 25;
-        quicly_loss_update_alarm(&loss, at, last_sent, outstanding_epochs, 1, 1, 1, 0, 1);
+        quicly_loss_update_alarm(&loss, at, sent_at, 1, 1, 0, 1, 0, 1);
         ok(loss.alarm_at <= at);
     }
-    quicly_loss_update_alarm(&loss, deadline + 100, last_sent, outstanding_epochs, 1, 1, 1, 1, 1);
+    quicly_loss_update_alarm(&loss, deadline + 100, sent_at, 1, 1, 0, 1, 1, 1);
     ok(loss.alarm_at > deadline + 100);
 
     /* The same rule applies to time-threshold loss detection. */
     loss.loss_time = deadline;
-    quicly_loss_update_alarm(&loss, deadline + 101, last_sent, outstanding_epochs, 1, 1, 1, 0, 1);
+    quicly_loss_update_alarm(&loss, deadline + 101, sent_at, 1, 1, 0, 1, 0, 1);
     ok(loss.alarm_at <= deadline + 101);
-    /* Loss detection clears its deadline once no more time-threshold losses remain. With no PTO space, disable the alarm. */
     loss.loss_time = INT64_MAX;
-    quicly_loss_update_alarm(&loss, deadline + 101, last_sent, 0, 0, 1, 1, 0, 1);
+    quicly_loss_update_alarm(&loss, deadline + 101, sent_at, 0, 0, 0, 1, 0, 1);
     ok(loss.alarm_at == INT64_MAX);
     ok(loss.loss_time == INT64_MAX);
     quicly_loss_dispose(&loss);
@@ -664,15 +662,10 @@ static void test_persistent_congestion(void)
     now = 121;
     acked(&loss, 1, QUICLY_EPOCH_1RTT);
     send_ack_eliciting(&loss, 4, QUICLY_EPOCH_1RTT, 400);
-    send_ack_eliciting(&loss, 5, QUICLY_EPOCH_1RTT, 401);
-    now = 425;
-    acked(&loss, 5, QUICLY_EPOCH_1RTT);
+    send_ack_eliciting(&loss, 7, QUICLY_EPOCH_1RTT, 401);
+    now = 420;
+    acked(&loss, 7, QUICLY_EPOCH_1RTT);
     detect_loss_after_ack(&loss);
-    /* The late ACK can raise the RTT estimate; wait for the remaining packet's loss deadline. */
-    if (loss.loss_time != INT64_MAX) {
-        now = loss.loss_time;
-        detect_loss_after_ack(&loss);
-    }
     ok(num_packets_lost == 3);
     ok(num_persistent_congestion == 0);
     quicly_loss_dispose(&loss);

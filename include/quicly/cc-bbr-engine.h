@@ -502,6 +502,8 @@ typedef struct quicly_bbr_cc_bbr {
   /* Lower bounds */
   uint64_t bw_shortterm;
   uint64_t inflight_shortterm;
+  uint64_t ecn_bw;
+  uint64_t ecn_cwnd;
 
   /* Round counting */
   uint64_t next_round_delivered;
@@ -526,6 +528,9 @@ typedef struct quicly_bbr_cc_bbr {
   uint64_t undo_bw_shortterm;
   uint64_t undo_inflight_shortterm;
   uint64_t undo_inflight_longterm;
+  uint64_t undo_round_count;
+  uint64_t undo_bytes_lost_in_round;
+  size_t undo_loss_events_in_round;
 
   uint64_t loss_round_delivered;
   uint64_t rounds_since_probe_up;
@@ -560,6 +565,10 @@ typedef struct quicly_bbr_cc_bbr {
 void quicly_bbr_cc_bbr_init(quicly_bbr_cc_bbr *bbr, quicly_bbr_log *log,
                         quicly_bbr_conn_stat *cstat, quicly_bbr_rst *rst,
                         quicly_bbr_tstamp initial_ts, quicly_bbr_pcg32 *pcg);
+
+/* refresh pacing and batching after adapter model or state updates */
+void quicly_bbr_cc_bbr_update_pacing(quicly_bbr_cc_bbr *bbr,
+                                      quicly_bbr_conn_stat *cstat);
 
 
 #endif

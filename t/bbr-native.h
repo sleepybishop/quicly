@@ -256,41 +256,334 @@ static void test_bbr_switch_clock(void)
     quic_now = saved_now;
 }
 
+static quicly_sent_t *bbr_record_test_packet(quicly_path_space_t *ps, uint64_t pn, double sent_at, uint16_t bytes, int skipped)
+{
+    quicly_bbr_packet_t sample;
+    if (bytes != 0)
+        ok(quicly_bbr_packet_sent(&ps->cc, &sample, bytes, (uint32_t)ps->loss.sentmap.bytes_in_flight + bytes, pn, sent_at));
+    ok(quicly_sentmap_prepare(&ps->loss.sentmap, pn, sent_at, QUICLY_EPOCH_1RTT) == 0);
+    ps->loss.sentmap._pending_packet->data.packet.path_id = ps->path_id;
+    quicly_sent_t *meta = NULL;
+    if (bytes != 0) {
+        quicly_sent_t *times = quicly_sentmap_allocate(&ps->loss.sentmap, on_ack_bbr_times);
+        meta = quicly_sentmap_allocate(&ps->loss.sentmap, on_ack_bbr_meta);
+        ok(times != NULL && meta != NULL);
+        times->data.bbr_times = sample.times;
+        meta->data.bbr_meta = sample.meta;
+    } else if (skipped) {
+        ok(quicly_sentmap_allocate(&ps->loss.sentmap, on_invalid_ack) != NULL);
+    }
+    quicly_sentmap_commit(&ps->loss.sentmap, bytes, 0);
+    ps->packet_number = pn + 1;
+    return meta;
+}
+
+static void bbr_lose_test_packet(quicly_path_space_t *ps, uint64_t pn, double now)
+{
+    quicly_sentmap_iter_t iter;
+    quicly_sentmap_init_iter(&ps->loss.sentmap, &iter);
+    while (quicly_sentmap_get(&iter)->packet_number < pn)
+        quicly_sentmap_skip(&iter);
+    const quicly_sent_packet_t *packet = quicly_sentmap_get(&iter);
+    ok(packet->packet_number == pn && packet->cc_bytes_in_flight != 0);
+    quicly_sent_t *meta = quicly_sentmap_find_frame(&iter, on_ack_bbr_meta);
+    ok(meta != NULL);
+    quicly_bbr_packet_lost(&ps->cc, &meta->data.bbr_meta, pn, packet->sent_at,
+                           (uint32_t)ps->loss.sentmap.bytes_in_flight, now);
+    ps->cc.type->cc_on_lost(&ps->cc, &ps->loss, packet->cc_bytes_in_flight, pn, ps->packet_number, now, 1200);
+    ok(quicly_sentmap_update(&ps->loss.sentmap, &iter, QUICLY_SENTMAP_EVENT_LOST) == 0);
+}
+
+static void bbr_ack_test_packet(quicly_path_space_t *ps, uint64_t pn, double now)
+{
+    quicly_sentmap_iter_t iter;
+    quicly_sentmap_init_iter(&ps->loss.sentmap, &iter);
+    while (quicly_sentmap_get(&iter)->packet_number < pn)
+        quicly_sentmap_skip(&iter);
+    ok(quicly_sentmap_get(&iter)->packet_number == pn);
+    ps->conn->stash.now_double = now;
+    quicly_bbr_begin_ack(&ps->cc, now);
+    quicly_bbr_acknowledge_packet(&ps->cc, pn);
+    ok(quicly_sentmap_update(&ps->loss.sentmap, &iter, QUICLY_SENTMAP_EVENT_ACKED) == 0);
+}
+
 static void test_bbr_congestion_and_undo(void)
 {
-    quicly_cc_t cc;
+    quicly_path_space_t ps = {0};
+    quicly_cc_t *cc = &ps.cc;
+    quicly_loss_t *loss = &ps.loss;
     quicly_cc_conf_t conf = {.init_cc = &quicly_cc_bbr_init, .initcwnd_packets = 100};
-    quicly_cc_bbr_init.cb(&quicly_cc_bbr_init, &cc, &conf, 1200, 0);
-    quicly_bbr_configure(&cc, 1200, 100, 1, 0);
-    quicly_loss_t loss;
+    quicly_cc_bbr_init.cb(&quicly_cc_bbr_init, cc, &conf, 1200, 0);
+    quicly_bbr_configure(cc, 1200, 100, 1, 0);
     uint16_t delay = 25;
     uint8_t exponent = 3;
-    quicly_loss_init(&loss, &quic_ctx.egress[0].loss, 100, &delay, &exponent);
-    loss.rtt.latest = loss.rtt.minimum = loss.rtt.smoothed = 100;
-    loss.rtt.variance = 5;
-    quicly_bbr_packet_t packets[2];
-    uint32_t initial = cc.cwnd;
-    ok(quicly_bbr_packet_sent(&cc, packets, 1000, 1000, 0, 0));
-    ok(quicly_bbr_packet_sent(&cc, packets + 1, 1000, 2000, 1, 1000));
-    loss.sentmap.bytes_in_flight = 2000;
-    for (size_t i = 0; i < 2; ++i) {
-        quicly_bbr_packet_lost(&cc, &packets[i].meta, i, i * 1000, (uint32_t)loss.sentmap.bytes_in_flight, 2000);
-        cc.type->cc_on_lost(&cc, &loss, 1000, i, 2, 2000, 1200);
-        loss.sentmap.bytes_in_flight -= 1000;
+    quicly_loss_init(loss, &quic_ctx.egress[0].loss, 100, &delay, &exponent);
+    loss->rtt.latest = loss->rtt.minimum = loss->rtt.smoothed = 100;
+    loss->rtt.variance = 5;
+    cc->state.bbr.stats.first_rtt_sample_ts = 0;
+    uint32_t initial = cc->cwnd;
+    quicly_sent_t *meta[2];
+    meta[0] = bbr_record_test_packet(&ps, 0, 0, 1000, 0);
+    meta[1] = bbr_record_test_packet(&ps, 1, 1000, 1000, 0);
+    bbr_lose_test_packet(&ps, 0, 2000);
+    bbr_lose_test_packet(&ps, 1, 2000);
+    check_bbr_persistent_congestion(&ps);
+    ok(cc->state.bbr.persistent_pending);
+    quicly_bbr_begin_ack(cc, 2000);
+    cc->type->cc_on_acked(cc, loss, 0, 1, 0, 0, 2, 2000, 1200, NULL);
+    ok(cc->state.bbr.persistent_events == 1);
+    ok(cc->cwnd == 4800);
+    quicly_bbr_packet_t packets[2] = {{.times = {0, 0, 0}, .meta = meta[0]->data.bbr_meta},
+                                      {.times = {0, 0, 0}, .meta = meta[1]->data.bbr_meta}};
+    quicly_bbr_begin_ack(cc, 3000);
+    quicly_bbr_packet_acked(cc, packets, 0, 0, 3000);
+    ok(cc->num_loss_episodes_undone == 0 && cc->cwnd == 4800);
+    quicly_bbr_packet_acked(cc, packets + 1, 1, 1000, 3000);
+    ok(cc->num_loss_episodes_undone == 1 && cc->cwnd >= initial);
+    quicly_bbr_packet_acked(cc, packets + 1, 1, 1000, 3001);
+    ok(cc->num_loss_episodes_undone == 1);
+    quicly_loss_dispose(loss);
+}
+
+static void bbr_test_detected_loss(quicly_loss_t *loss, const quicly_sent_packet_t *packet, int is_time_threshold)
+{
+    (void)is_time_threshold;
+    quicly_path_space_t *ps = (void *)((char *)loss - offsetof(quicly_path_space_t, loss));
+    quicly_sent_t *meta = quicly_sentmap_find_frame(loss->on_loss_iter, on_ack_bbr_meta);
+    ok(meta != NULL);
+    quicly_bbr_packet_lost(&ps->cc, &meta->data.bbr_meta, packet->packet_number, packet->sent_at,
+                           (uint32_t)loss->sentmap.bytes_in_flight, ps->conn->stash.now_double);
+    ps->cc.type->cc_on_lost(&ps->cc, loss, packet->cc_bytes_in_flight, packet->packet_number, ps->packet_number,
+                            (int64_t)ps->conn->stash.now_double, 1200);
+}
+
+static void test_bbr_persistent_expiration(void)
+{
+    quicly_cc_conf_t conf = {.init_cc = &quicly_cc_bbr_init, .initcwnd_packets = 100};
+    uint16_t delay = 25;
+    uint8_t exponent = 3;
+    for (int scenario = 0; scenario != 6; ++scenario) {
+        quicly_conn_t conn = {0};
+        quicly_path_space_t ps = {.conn = &conn};
+        quicly_cc_bbr_init.cb(&quicly_cc_bbr_init, &ps.cc, &conf, 1200, 0);
+        quicly_bbr_configure(&ps.cc, 1200, 100, 1, 0);
+        quicly_loss_init(&ps.loss, &quic_ctx.egress[0].loss, 100, &delay, &exponent);
+        ps.loss.before_expire = before_sentmap_expire;
+        ps.loss.rtt.latest = ps.loss.rtt.minimum = ps.loss.rtt.smoothed = 100;
+        ps.loss.rtt.variance = 5;
+        ps.cc.state.bbr.stats.first_rtt_sample_ts = 0;
+        if (scenario < 2) {
+            /* an expired unacknowledged ACK-only packet bridges the run, whereas an ACKed one splits it */
+            bbr_record_test_packet(&ps, 0, 1, 1000, 0);
+            bbr_record_test_packet(&ps, 1, 250, 0, 0);
+            bbr_record_test_packet(&ps, 2, 500, 1000, 0);
+            for (uint64_t pn = 3; pn != 40; ++pn)
+                bbr_record_test_packet(&ps, pn, 800, 1000, 0);
+            if (scenario == 1)
+                bbr_ack_test_packet(&ps, 1, 850);
+            conn.stash.now_double = 900;
+            ps.loss.largest_acked_packet_plus1.all_ = ps.loss.largest_acked_packet_plus1.per_epoch[QUICLY_EPOCH_1RTT] = 4;
+            ok(quicly_loss_detect_loss(&ps.loss, 900, delay, 1, bbr_test_detected_loss) == 0);
+            check_bbr_persistent_congestion(&ps);
+            ok(ps.cc.state.bbr.persistent_pending == (scenario == 0));
+        } else if (scenario < 4) {
+            /* Both handshake modes retain the newly detected loss batch for persistent-congestion tracking. */
+            for (uint64_t pn = 0; pn != 40; ++pn)
+                bbr_record_test_packet(&ps, pn, pn == 0 ? 0 : 1000 + pn, 1000, 0);
+            conn.stash.now_double = 2000;
+            ps.loss.largest_acked_packet_plus1.all_ = ps.loss.largest_acked_packet_plus1.per_epoch[QUICLY_EPOCH_1RTT] = 42;
+            ok(quicly_loss_detect_loss(&ps.loss, 2000, delay, scenario == 3, bbr_test_detected_loss) == 0);
+            check_bbr_persistent_congestion(&ps);
+            ok(ps.cc.state.bbr.persistent_pending);
+            ok(ps.loss.sentmap.num_packets == 40);
+        } else {
+            /* preserve a safe expiration prefix, including when it reaches the tail before another packet is sent */
+            bbr_record_test_packet(&ps, 0, 0, 1000, 0);
+            bbr_record_test_packet(&ps, 1, 100, 0, 0);
+            if (scenario == 4)
+                bbr_record_test_packet(&ps, 2, 1000, 1000, 0);
+            bbr_lose_test_packet(&ps, 0, 1100);
+            check_bbr_persistent_congestion(&ps);
+            quicly_sentmap_iter_t iter;
+            quicly_sentmap_init_iter(&ps.loss.sentmap, &iter);
+            ok(quicly_sentmap_update(&ps.loss.sentmap, &iter, QUICLY_SENTMAP_EVENT_EXPIRED) == 0);
+            ok(quicly_sentmap_update(&ps.loss.sentmap, &iter, QUICLY_SENTMAP_EVENT_EXPIRED) == 0);
+            if (scenario == 5)
+                bbr_record_test_packet(&ps, 2, 1200, 1000, 0);
+            bbr_lose_test_packet(&ps, 2, 1300);
+            check_bbr_persistent_congestion(&ps);
+            ok(ps.cc.state.bbr.persistent_pending);
+        }
+        quicly_loss_dispose(&ps.loss);
     }
-    ok(cc.state.bbr.persistent_pending);
-    quicly_bbr_begin_ack(&cc, 2000);
-    cc.type->cc_on_acked(&cc, &loss, 0, 1, 0, 0, 2, 2000, 1200, NULL);
-    ok(cc.state.bbr.persistent_events == 1);
-    ok(cc.cwnd == 4800);
-    quicly_bbr_begin_ack(&cc, 3000);
-    quicly_bbr_packet_acked(&cc, packets, 0, 0, 3000);
-    ok(cc.num_loss_episodes_undone == 0 && cc.cwnd == 4800);
-    quicly_bbr_packet_acked(&cc, packets + 1, 1, 1000, 3000);
-    ok(cc.num_loss_episodes_undone == 1 && cc.cwnd >= initial);
-    quicly_bbr_packet_acked(&cc, packets + 1, 1, 1000, 3001);
-    ok(cc.num_loss_episodes_undone == 1);
-    quicly_loss_dispose(&loss);
+}
+
+static void test_bbr_persistent_congestion(void)
+{
+    test_bbr_persistent_expiration();
+    enum { SKIPPED, ACK_ONLY, ACKED_ACK_ONLY, MISSING, UNRESOLVED, OLD_GENERATION, ACKED_DATA };
+    for (int kind = SKIPPED; kind <= ACKED_DATA; ++kind) {
+        quicly_conn_t conn = {0};
+        quicly_path_space_t ps = {.conn = &conn};
+        quicly_cc_conf_t conf = {.init_cc = &quicly_cc_bbr_init, .initcwnd_packets = 100};
+        quicly_cc_bbr_init.cb(&quicly_cc_bbr_init, &ps.cc, &conf, 1200, 0);
+        quicly_bbr_configure(&ps.cc, 1200, 100, 1, 0);
+        uint16_t delay = 25;
+        uint8_t exponent = 3;
+        quicly_loss_init(&ps.loss, &quic_ctx.egress[0].loss, 100, &delay, &exponent);
+        ps.loss.rtt.latest = ps.loss.rtt.minimum = ps.loss.rtt.smoothed = 100;
+        ps.loss.rtt.variance = 5;
+        ps.cc.state.bbr.stats.first_rtt_sample_ts = 0;
+        bbr_record_test_packet(&ps, 0, 0, 1000, 0);
+        quicly_sent_t *middle = NULL;
+        if (kind != MISSING)
+            middle = bbr_record_test_packet(&ps, 1, 500, kind >= UNRESOLVED ? 1000 : 0, kind == SKIPPED);
+        bbr_record_test_packet(&ps, 2, 1000, 1000, 0);
+        if (kind == ACKED_ACK_ONLY || kind == ACKED_DATA) {
+            bbr_ack_test_packet(&ps, 1, 1500);
+        } else if (kind == OLD_GENERATION) {
+            bbr_lose_test_packet(&ps, 1, 1500);
+            --middle->data.bbr_meta.generation;
+        }
+        bbr_lose_test_packet(&ps, 0, 2000);
+        check_bbr_persistent_congestion(&ps);
+        bbr_lose_test_packet(&ps, 2, 2000);
+        check_bbr_persistent_congestion(&ps);
+        int persistent = kind == SKIPPED || kind == ACK_ONLY;
+        ok(ps.cc.state.bbr.persistent_pending == persistent);
+        quicly_bbr_apply_persistent_congestion(&ps.cc);
+        ok(ps.cc.state.bbr.persistent_events == persistent);
+        if (kind == UNRESOLVED) {
+            /* different ACK epochs can leave an unresolved packet between already-lost packets */
+            bbr_lose_test_packet(&ps, 1, 2100);
+            check_bbr_persistent_congestion(&ps);
+            ok(ps.cc.state.bbr.persistent_pending);
+            quicly_bbr_apply_persistent_congestion(&ps.cc);
+            ok(ps.cc.state.bbr.persistent_events == 1);
+            /* replaying the same retained evidence must not notify twice */
+            ps.cc.state.bbr.loss_scan_first_pn = 0;
+            ps.cc.state.bbr.loss_scan_last_pn = 2;
+            check_bbr_persistent_congestion(&ps);
+            ok(!ps.cc.state.bbr.persistent_pending);
+        }
+        if (kind == ACK_ONLY || kind == UNRESOLVED) {
+            /* a late ACK splits the run so the retained suffix plus a later loss can form a fresh interval */
+            bbr_ack_test_packet(&ps, 1, 2200);
+            check_bbr_persistent_congestion(&ps);
+            ok(ps.cc.state.bbr.loss_run_valid && ps.cc.state.bbr.loss_first_pn == 2);
+            ok(!ps.cc.state.bbr.persistent_notified);
+            bbr_record_test_packet(&ps, 3, 2300, 1000, 0);
+            bbr_lose_test_packet(&ps, 3, 2400);
+            check_bbr_persistent_congestion(&ps);
+            ok(ps.cc.state.bbr.persistent_pending);
+            quicly_bbr_apply_persistent_congestion(&ps.cc);
+            ok(ps.cc.state.bbr.persistent_events == 2);
+        }
+        quicly_loss_dispose(&ps.loss);
+    }
+
+    /* exercise ACK-only success through the native ACK path */
+    quicly_context_t saved = quic_ctx;
+    int64_t saved_now = quic_now;
+    quic_ctx.egress[0].cc.init_cc = &quicly_cc_bbr_init;
+    quic_ctx.egress[0].cc.initcwnd_packets = 100;
+    quic_ctx.egress[0].pacing = 1;
+    for (int ack_middle = 0; ack_middle != 2; ++ack_middle) {
+        quicly_conn_t *client, *server;
+        health_setup(&client, &server);
+        quicly_path_space_t *ps = client->path_spaces[0];
+        uint64_t pn = ps->packet_number, events = ps->cc.state.bbr.persistent_events;
+        double sent_at = quic_now;
+        bbr_record_test_packet(ps, pn, sent_at, 1000, 0);
+        bbr_record_test_packet(ps, pn + 1, sent_at + 500, 0, 0);
+        bbr_record_test_packet(ps, pn + 2, sent_at + 1000, 1000, 0);
+        bbr_record_test_packet(ps, pn + 3, sent_at + 1900, 0, 0);
+        ps->last_retransmittable_sent_at[QUICLY_EPOCH_1RTT] = sent_at + 1000;
+        ps->loss.rtt.latest = ps->loss.rtt.minimum = ps->loss.rtt.smoothed = 100;
+        ps->loss.rtt.variance = 5;
+        quic_now += 2000;
+        lock_now(client, 0);
+        quicly_ack_frame_t ack = {.largest_acknowledged = pn + 3,
+                                   .smallest_acknowledged = pn + (ack_middle ? 1 : 3),
+                                   .ack_block_lengths = {1, 1},
+                                   .gaps = {1},
+                                   .num_gaps = ack_middle};
+        struct st_quicly_handle_payload_state_t state = {.epoch = QUICLY_EPOCH_1RTT, .frame_type = QUICLY_FRAME_TYPE_ACK};
+        ok(process_ack_frame_core(client, &state, ps->path_id, &ack) == 0);
+        ok(ps->cc.state.bbr.persistent_events == events + !ack_middle);
+        if (!ack_middle) {
+            ack = (quicly_ack_frame_t){.largest_acknowledged = pn + 1, .smallest_acknowledged = pn + 1,
+                                       .ack_block_lengths = {1}};
+            ok(process_ack_frame_core(client, &state, ps->path_id, &ack) == 0);
+            ok(ps->cc.state.bbr.loss_run_valid && ps->cc.state.bbr.loss_first_pn == pn + 2);
+            ok(!ps->cc.state.bbr.persistent_notified);
+        }
+        unlock_now(client);
+        quicly_free(client);
+        quicly_free(server);
+        quicly_free_default_cid_encryptor(quic_ctx.cid_encryptor);
+    }
+    quic_ctx = saved;
+    quic_now = saved_now;
+}
+
+struct st_bbr_idle_switch_scheduler_t {
+    quicly_stream_scheduler_t super;
+    int called, switch_back;
+};
+
+static quicly_error_t bbr_switch_during_idle_send(quicly_stream_scheduler_t *self, quicly_conn_t *conn, quicly_send_context_t *s)
+{
+    (void)s;
+    struct st_bbr_idle_switch_scheduler_t *sched = (void *)self;
+    if (!sched->called++) {
+        ok(quicly_set_cc(conn, &quicly_cc_type_cubic));
+        if (sched->switch_back)
+            ok(quicly_set_cc(conn, &quicly_cc_type_bbr));
+    }
+    return 0;
+}
+
+static void test_bbr_idle_switch(void)
+{
+    for (int switch_back = 0; switch_back != 2; ++switch_back) {
+        quicly_conn_t *client, *server;
+        health_setup(&client, &server);
+        quicly_path_space_t *ps = client->path_spaces[0];
+        ok(ps->cc.type == &quicly_cc_type_bbr && ps->loss.sentmap.bytes_in_flight == 0);
+        quicly_bbr_set_app_limited(&ps->cc, 0);
+        uint32_t generation = ps->bbr_generation;
+        quicly_stream_t *stream;
+        ok(quicly_open_stream(client, &stream, 0) == 0);
+        ok(quicly_set_stream_path_affinity(stream, 0) == 0);
+        ok(quicly_streambuf_egress_write(stream, "pending", 7) == 0);
+        quicly_stream_scheduler_t *original = quic_ctx.stream_scheduler;
+        struct st_bbr_idle_switch_scheduler_t sched = {.super = *original, .switch_back = switch_back};
+        sched.super.do_send = bbr_switch_during_idle_send;
+        quic_ctx.stream_scheduler = &sched.super;
+        quicly_address_t dest, src;
+        struct iovec dgrams[10];
+        uint8_t dgram_buf[15000];
+        size_t num_dgrams = PTLS_ELEMENTSOF(dgrams);
+        ok(quicly_send(client, &dest, &src, dgrams, &num_dgrams, dgram_buf, sizeof(dgram_buf)) == 0);
+        ok(sched.called != 0 && num_dgrams == 0);
+        for (size_t i = 0; i != PTLS_ELEMENTSOF(client->path_spaces); ++i) {
+            quicly_path_space_t *current = client->path_spaces[i];
+            if (current == NULL)
+                continue;
+            ok(current->cc.type == (switch_back ? &quicly_cc_type_bbr : &quicly_cc_type_cubic));
+            if (switch_back) {
+                ok(current->cc.state.bbr.sampler.generation == current->bbr_generation);
+                ok(current->cc.state.bbr.engine.rst == &current->cc.state.bbr.sampler.rst);
+            }
+        }
+        if (switch_back)
+            ok(ps->bbr_generation != generation);
+        quic_ctx.stream_scheduler = original;
+        quicly_free(client);
+        quicly_free(server);
+        quicly_free_default_cid_encryptor(quic_ctx.cid_encryptor);
+    }
 }
 
 static void test_bbr_idle_restart(void)
@@ -337,19 +630,79 @@ static void test_bbr_idle_restart(void)
     cc.type->cc_on_sent(&cc, &loss, 1200, 2000);
     ok(!b->engine.idle_restart);
 
-    /* if an idle completes ProbeRTT, the restored window must be visible immediately */
+    /* if an idle completes probe_rtt, the restored window must be visible immediately */
     b->engine.state = QUICLY_BBR_BBR_STATE_PROBE_RTT;
     b->engine.probe_rtt_done_stamp = quicly_bbr_time(2500);
     b->engine.prior_cwnd = 50000;
+    b->engine.extra_acked_delivered = 9999;
     cc.cwnd = b->stats.cwnd = 4800;
     quicly_bbr_set_app_limited(&cc, 0);
     ok(quicly_bbr_packet_sent(&cc, &packet, 1200, 1200, 3, 3000.5));
     loss.sentmap.bytes_in_flight = 1200;
     cc.type->cc_on_sent(&cc, &loss, 1200, 3000);
     ok(b->engine.state == QUICLY_BBR_BBR_STATE_PROBE_BW_CRUISE);
+    ok(b->engine.extra_acked_delivered == 0);
     ok(cc.cwnd == 50000 && b->stats.cwnd == 50000);
     ok(b->stats.bytes_in_flight == 1200);
+
+    /* idle restart in probe_rtt with unarmed done_stamp arms the timer */
+    b->engine.state = QUICLY_BBR_BBR_STATE_PROBE_RTT;
+    b->engine.probe_rtt_done_stamp = UINT64_MAX;
+    b->engine.min_rtt = 100 * QUICLY_BBR_MILLISECONDS;
+    cc.cwnd = b->stats.cwnd = 4800;
+    loss.sentmap.bytes_in_flight = 0;
+    quicly_bbr_set_app_limited(&cc, 0);
+    quicly_bbr_restart_from_idle(&cc, &loss, 1200, 4000.0);
+    ok(b->engine.state == QUICLY_BBR_BBR_STATE_PROBE_RTT);
+    ok(b->engine.probe_rtt_done_stamp == quicly_bbr_time(4200.0));
     quicly_loss_dispose(&loss);
+
+    /* do_send must restore probe_rtt cwnd before computing send_window, while ACK-only do_send rolls back */
+    quicly_context_t saved = quic_ctx;
+    int64_t saved_now = quic_now;
+    quic_ctx.egress[0].cc.init_cc = &quicly_cc_bbr_init;
+    quic_ctx.egress[0].cc.initcwnd_packets = 100;
+    quic_ctx.egress[0].pacing = 1;
+    quicly_conn_t *client, *server;
+    health_setup(&client, &server);
+    quicly_path_space_t *primary = client->path_spaces[0];
+    quicly_cc_bbr_t *pb = &primary->cc.state.bbr;
+    pb->engine.state = QUICLY_BBR_BBR_STATE_PROBE_RTT;
+    pb->engine.full_bw_reached = 1;
+    pb->engine.bw = pb->engine.max_bw = 10000000;
+    pb->engine.min_rtt = 10 * QUICLY_BBR_MILLISECONDS;
+    pb->engine.prior_cwnd = 60000;
+    primary->cc.cwnd = pb->stats.cwnd = 4800;
+    quic_now += 1000;
+    pb->engine.probe_rtt_done_stamp = quicly_bbr_time(quic_now - 10);
+    quicly_bbr_set_app_limited(&primary->cc, 0);
+    /* no-op send (with empty flight and nothing queued) must roll back the tentative idle restart */
+    quicly_address_t dest, src;
+    struct iovec dgrams[10];
+    uint8_t dgram_buf[15000];
+    size_t num_dgrams = PTLS_ELEMENTSOF(dgrams);
+    ok(quicly_send(client, &dest, &src, dgrams, &num_dgrams, dgram_buf, sizeof(dgram_buf)) == 0);
+    ok(num_dgrams == 0);
+    ok(pb->engine.state == QUICLY_BBR_BBR_STATE_PROBE_RTT);
+    ok(primary->cc.cwnd == 4800);
+    /* now write 10000 bytes (> 4800 probe_rtt cwnd) and verify a single quicly_send sends the full flight */
+    quicly_stream_t *stream;
+    ok(quicly_open_stream(client, &stream, 0) == 0);
+    ok(quicly_set_stream_path_affinity(stream, 0) == 0);
+    uint8_t burst[10000];
+    memset(burst, 0x5a, sizeof(burst));
+    ok(quicly_streambuf_egress_write(stream, burst, sizeof(burst)) == 0);
+    num_dgrams = PTLS_ELEMENTSOF(dgrams);
+    ok(quicly_send(client, &dest, &src, dgrams, &num_dgrams, dgram_buf, sizeof(dgram_buf)) == 0);
+    ok(pb->engine.state == QUICLY_BBR_BBR_STATE_PROBE_BW_CRUISE);
+    ok(primary->cc.cwnd == 60000);
+    ok(primary->loss.sentmap.bytes_in_flight > 4800);
+    quicly_free(client);
+    quicly_free(server);
+    quicly_free_default_cid_encryptor(quic_ctx.cid_encryptor);
+    test_bbr_idle_switch();
+    quic_ctx = saved;
+    quic_now = saved_now;
 }
 
 static void test_bbr_blackout(void)

@@ -72,6 +72,8 @@ SET(QUICLY_LIBRARY_FILES
 SET(UNITTEST_SOURCE_FILES
     deps/picotest/picotest.c
     t/bplus_ranges.c
+    t/bbr-first-rtt.c
+    t/bbr-math.c
     t/bbr-sampler.c
     t/cc.c
     t/frame.c

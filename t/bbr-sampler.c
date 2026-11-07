@@ -159,6 +159,93 @@ static void test_engine_initialization_and_persistent_congestion(void)
     ok(stats.cwnd == 4800 && !engine.in_loss_recovery);
 }
 
+static void test_loss_undo_preserves_bandwidth_plateau(void)
+{
+    for (int probe_bw = 0; probe_bw != 2; ++probe_bw) {
+        quicly_bbr_rst rst = {0};
+        quicly_bbr_cc_bbr engine;
+        quicly_bbr_pcg32 random;
+        quicly_bbr_conn_stat stats = {.cwnd = 120000,
+                                      .max_tx_udp_payload_size = 1200,
+                                      .smoothed_rtt = 100 * MS,
+                                      .min_rtt = 100 * MS,
+                                      .congestion_recovery_start_ts = UINT64_MAX,
+                                      .delivery_rate_sec = 1000000};
+        quicly_bbr_pcg32_init(&random, 1);
+        quicly_bbr_cc_bbr_init(&engine, NULL, &stats, &rst, 0, &random);
+        if (probe_bw) {
+            engine.state = QUICLY_BBR_BBR_STATE_PROBE_BW_UP;
+            engine.full_bw_reached = engine.is_bw_probe_sample = 1;
+            engine.pacing_gain_h = 125;
+            engine.cwnd_gain_h = 225;
+        }
+        /* a single loss below the loss threshold must not undo an independently observed bandwidth plateau */
+        for (size_t round = 0; round != 4; ++round) {
+            if (round == 3) {
+                quicly_bbr_cc_pkt packet = {.pkt_num = 100, .pktlen = 1200, .sent_ts = 250 * MS, .tx_in_flight = 120000};
+                rst.lost = packet.pktlen;
+                engine.cc.on_pkt_lost(&engine.cc, &stats, &packet, 399 * MS);
+                ok(engine.undo_state == QUICLY_BBR_BBR_STATE_NONE);
+            }
+            uint64_t prior = rst.delivered;
+            rst.delivered += 100000;
+            rst.rs = (quicly_bbr_rs){.prior_delivered = prior,
+                                     .delivered = 100000,
+                                     .tx_in_flight = 120000,
+                                     .lost = rst.lost};
+            quicly_bbr_cc_ack ack = {.bytes_delivered = 100000,
+                                     .bytes_lost = round == 3 ? 1200 : 0,
+                                     .pkt_delivered = prior,
+                                     .largest_pkt_sent_ts = (round * 100 + 1) * MS,
+                                     .rtt = 100 * MS};
+            engine.cc.on_ack_recv(&engine.cc, &stats, &ack, (round + 1) * 100 * MS);
+        }
+        ok(engine.full_bw_reached && engine.full_bw_count == 3);
+        ok(engine.state == (probe_bw ? QUICLY_BBR_BBR_STATE_PROBE_BW_DOWN : QUICLY_BBR_BBR_STATE_PROBE_BW_CRUISE));
+        quicly_bbr_bbr_state state = engine.state;
+        uint64_t pacing_gain = engine.pacing_gain_h;
+        /* a late ACK disproves the only loss after the normal plateau transition has completed */
+        engine.cc.on_spurious_congestion(&engine.cc, &stats, 410 * MS);
+        quicly_bbr_cc_bbr_update_pacing(&engine, &stats);
+        ok(engine.state == state && engine.full_bw_reached);
+        ok(engine.pacing_gain_h == pacing_gain);
+    }
+}
+
+static void test_startup_high_loss_undo(void)
+{
+    quicly_bbr_rst rst = {.delivered = 120000};
+    quicly_bbr_cc_bbr engine;
+    quicly_bbr_pcg32 random;
+    quicly_bbr_conn_stat stats = {.cwnd = 120000,
+                                  .max_tx_udp_payload_size = 1200,
+                                  .smoothed_rtt = 100 * MS,
+                                  .min_rtt = 100 * MS,
+                                  .congestion_recovery_start_ts = 100 * MS,
+                                  .delivery_rate_sec = 1000000};
+    quicly_bbr_pcg32_init(&random, 1);
+    quicly_bbr_cc_bbr_init(&engine, NULL, &stats, &rst, 0, &random);
+    /* losses in a round after the first full recovery round can end Startup */
+    engine.in_loss_recovery = 1;
+    engine.round_count = 2;
+    engine.round_count_at_recovery = 1;
+    engine.next_round_delivered = rst.delivered;
+    for (size_t i = 0; i != 7; ++i) {
+        quicly_bbr_cc_pkt packet = {.pkt_num = (int64_t)i, .pktlen = 1200, .sent_ts = MS, .tx_in_flight = 120000};
+        rst.lost += packet.pktlen;
+        engine.cc.on_pkt_lost(&engine.cc, &stats, &packet, (200 + i) * MS);
+        rst.delivered += 1200;
+        rst.rs = (quicly_bbr_rs){.delivered = 1200 * (i + 1), .tx_in_flight = 120000, .lost = rst.lost};
+        quicly_bbr_cc_ack ack = {.bytes_delivered = 1200, .bytes_lost = 1200, .largest_pkt_sent_ts = 50 * MS, .rtt = 100 * MS};
+        engine.cc.on_ack_recv(&engine.cc, &stats, &ack, (200 + i) * MS);
+    }
+    ok(engine.full_bw_reached && engine.state != QUICLY_BBR_BBR_STATE_STARTUP);
+    ok(engine.undo_state == QUICLY_BBR_BBR_STATE_STARTUP);
+    engine.cc.on_spurious_congestion(&engine.cc, &stats, 210 * MS);
+    ok(!engine.full_bw_reached && engine.state == QUICLY_BBR_BBR_STATE_STARTUP);
+    ok(engine.pacing_gain_h == 277 && engine.undo_state == QUICLY_BBR_BBR_STATE_NONE);
+}
+
 static void init_probe_bw_loss_test(quicly_cc_t *cc, quicly_loss_t *loss)
 {
     static const quicly_cc_conf_t conf = {.init_cc = &quicly_cc_bbr_init, .initcwnd_packets = 100};
@@ -200,6 +287,7 @@ static void test_probe_bw_loss_undo(void)
     for (size_t i = 0; i < 2; ++i)
         lose_probe_bw_packet(&cc, &loss, packets + i, i, 2, i + 1, 200);
     ok(b->engine.state == QUICLY_BBR_BBR_STATE_PROBE_BW_DOWN);
+    ok(b->engine.undo_state == QUICLY_BBR_BBR_STATE_PROBE_BW_UP);
     ok(b->engine.inflight_longterm < 100000);
     ok(packets[0].meta.loss_epoch == packets[1].meta.loss_epoch);
     quicly_bbr_begin_ack(&cc, 200);
@@ -257,6 +345,129 @@ static void test_probe_bw_new_loss_round_undo(void)
     ok(cc.num_loss_episodes_undone == 1 && b->undo_pending == 0);
     ok(b->engine.inflight_longterm == latest_bound);
     ok(b->engine.state != QUICLY_BBR_BBR_STATE_PROBE_BW_REFILL);
+}
+
+static void test_startup_loss_round_undo(void)
+{
+    static const quicly_cc_conf_t conf = {.init_cc = &quicly_cc_bbr_init, .initcwnd_packets = 100};
+    static const quicly_loss_conf_t loss_conf = {.min_pto = 1};
+    static const uint16_t max_ack_delay = 25;
+    quicly_cc_t cc;
+    quicly_cc_bbr_init.cb(&quicly_cc_bbr_init, &cc, &conf, 1200, 0);
+    quicly_bbr_configure(&cc, 1200, 100, 1, 0);
+    quicly_cc_bbr_t *b = &cc.state.bbr;
+    quicly_loss_t loss = {.conf = &loss_conf,
+                          .max_ack_delay = &max_ack_delay,
+                          .rtt = {.latest = 100, .minimum = 100, .smoothed = 100, .variance = 5}};
+    quicly_bbr_packet_t packets[32];
+    for (size_t i = 0; i < PTLS_ELEMENTSOF(packets); ++i)
+        ok(quicly_bbr_packet_sent(&cc, packets + i, 1200, (i + 1) * 1200, i, 1 + i / 100.0));
+    loss.sentmap.bytes_in_flight = sizeof(packets) / sizeof(packets[0]) * 1200;
+
+    /* reordering produces seven ACKs with packet-threshold losses in the same flight */
+    for (size_t batch = 0; batch < 7; ++batch) {
+        uint64_t largest = 3 + 4 * batch;
+        quicly_bbr_begin_ack(&cc, 100 + batch);
+        quicly_bbr_packet_acked(&cc, packets + largest, largest, 1 + largest / 100.0, 100 + batch);
+        loss.sentmap.bytes_in_flight -= 1200;
+        for (size_t i = 0; i <= largest - 3; ++i) {
+            if (packets[i].meta.flags != 0)
+                continue;
+            lose_probe_bw_packet(&cc, &loss, packets + i, i, PTLS_ELEMENTSOF(packets), 1 + i / 100.0, 100 + batch);
+        }
+        cc.type->cc_on_acked(&cc, &loss, 1200, largest, (uint32_t)loss.sentmap.bytes_in_flight, 1,
+                             PTLS_ELEMENTSOF(packets), 100 + batch, 1200, NULL);
+    }
+    ok(b->engine.state == QUICLY_BBR_BBR_STATE_STARTUP && b->engine.in_loss_recovery);
+    ok(b->engine.loss_events_in_round == 7 && b->engine.bytes_lost_in_round != 0);
+    uint64_t round = b->engine.round_count, cumulative_lost = b->sampler.rst.lost, stats_lost = b->stats.bytes_lost;
+
+    quicly_bbr_begin_ack(&cc, 200);
+    for (size_t i = 0; i < PTLS_ELEMENTSOF(packets); ++i)
+        if (packets[i].meta.flags & QUICLY_BBR_PACKET_LOST)
+            quicly_bbr_packet_acked(&cc, packets + i, i, 1 + i / 100.0, 200);
+    ok(cc.num_loss_episodes_undone == 1 && b->undo_pending == 0 && !b->engine.in_loss_recovery);
+    ok(cc.num_loss_episodes_undone_in_startup == 1);
+    cc.type->cc_on_acked(&cc, &loss, 0, 27, (uint32_t)loss.sentmap.bytes_in_flight, 1,
+                         PTLS_ELEMENTSOF(packets), 200, 1200, NULL);
+
+    /* undo must work before a new round clears counters, without rewriting packet loss snapshots */
+    ok(b->engine.round_count == round && !b->engine.round_start);
+    ok(b->sampler.rst.lost == cumulative_lost && b->stats.bytes_lost == stats_lost);
+    ok(b->sampler.rst.rs.lost == cumulative_lost);
+    ok(b->engine.loss_events_in_round == 0 && b->engine.bytes_lost_in_round == 0);
+    ok(b->engine.state == QUICLY_BBR_BBR_STATE_STARTUP && !b->engine.full_bw_reached);
+}
+
+static void test_startup_loss_round_undo_preserves_prior_epoch(void)
+{
+    static const quicly_cc_conf_t conf = {.init_cc = &quicly_cc_bbr_init, .initcwnd_packets = 100};
+    static const quicly_loss_conf_t loss_conf = {.min_pto = 1};
+    static const uint16_t max_ack_delay = 25;
+    quicly_cc_t cc;
+    quicly_cc_bbr_init.cb(&quicly_cc_bbr_init, &cc, &conf, 1200, 0);
+    quicly_bbr_configure(&cc, 1200, 100, 1, 0);
+    quicly_cc_bbr_t *b = &cc.state.bbr;
+    quicly_loss_t loss = {.conf = &loss_conf,
+                          .max_ack_delay = &max_ack_delay,
+                          .rtt = {.latest = 100, .minimum = 100, .smoothed = 100, .variance = 5}};
+    quicly_bbr_packet_t packets[10];
+    for (size_t i = 0; i < 6; ++i)
+        ok(quicly_bbr_packet_sent(&cc, packets + i, 1200, (i + 1) * 1200, i, 1 + i / 100.0));
+    loss.sentmap.bytes_in_flight = 7200;
+
+    quicly_bbr_begin_ack(&cc, 101);
+    quicly_bbr_packet_acked(&cc, packets, 0, 1, 101);
+    loss.sentmap.bytes_in_flight -= 1200;
+    cc.type->cc_on_acked(&cc, &loss, 1200, 0, (uint32_t)loss.sentmap.bytes_in_flight, 1, 6, 101, 1200, NULL);
+    for (size_t i = 6; i < 8; ++i) {
+        loss.sentmap.bytes_in_flight += 1200;
+        ok(quicly_bbr_packet_sent(&cc, packets + i, 1200, (uint32_t)loss.sentmap.bytes_in_flight, i, 96 + i));
+    }
+
+    /* start a loss round after the packet round has already begun */
+    quicly_bbr_begin_ack(&cc, 104);
+    quicly_bbr_packet_acked(&cc, packets + 1, 1, 1.01, 104);
+    loss.sentmap.bytes_in_flight -= 1200;
+    lose_probe_bw_packet(&cc, &loss, packets + 2, 2, 8, 1.02, 104);
+    cc.type->cc_on_acked(&cc, &loss, 1200, 1, (uint32_t)loss.sentmap.bytes_in_flight, 1, 8, 104, 1200, NULL);
+    for (size_t i = 8; i < 10; ++i) {
+        loss.sentmap.bytes_in_flight += 1200;
+        ok(quicly_bbr_packet_sent(&cc, packets + i, 1200, (uint32_t)loss.sentmap.bytes_in_flight, i, 97 + i));
+    }
+
+    /* a new packet round can contain losses from the preceding undo epoch */
+    quicly_bbr_begin_ack(&cc, 107);
+    quicly_bbr_packet_acked(&cc, packets + 6, 6, 102, 107);
+    loss.sentmap.bytes_in_flight -= 1200;
+    lose_probe_bw_packet(&cc, &loss, packets + 3, 3, 10, 1.03, 107);
+    cc.type->cc_on_acked(&cc, &loss, 1200, 6, (uint32_t)loss.sentmap.bytes_in_flight, 1, 10, 107, 1200, NULL);
+    ok(b->engine.round_start && b->engine.loss_events_in_round == 1);
+    ok(packets[2].meta.loss_epoch == packets[3].meta.loss_epoch);
+    uint64_t round = b->engine.round_count;
+
+    quicly_bbr_begin_ack(&cc, 108);
+    quicly_bbr_packet_acked(&cc, packets + 8, 8, 105, 108);
+    loss.sentmap.bytes_in_flight -= 1200;
+    cc.type->cc_on_acked(&cc, &loss, 1200, 8, (uint32_t)loss.sentmap.bytes_in_flight, 1, 10, 108, 1200, NULL);
+    ok(b->engine.loss_round_start && !b->engine.round_start && !b->engine.undo_loss_in_round);
+
+    /* only this later epoch is disproved; the genuine loss from packet 3 must remain counted */
+    quicly_bbr_begin_ack(&cc, 109);
+    quicly_bbr_packet_acked(&cc, packets + 9, 9, 106, 109);
+    loss.sentmap.bytes_in_flight -= 1200;
+    lose_probe_bw_packet(&cc, &loss, packets + 4, 4, 10, 1.04, 109);
+    cc.type->cc_on_acked(&cc, &loss, 1200, 9, (uint32_t)loss.sentmap.bytes_in_flight, 1, 10, 109, 1200, NULL);
+    ok(packets[4].meta.loss_epoch != packets[3].meta.loss_epoch);
+    ok(b->engine.loss_events_in_round == 2 && b->engine.bytes_lost_in_round == 2400);
+
+    quicly_bbr_begin_ack(&cc, 110);
+    quicly_bbr_packet_acked(&cc, packets + 4, 4, 1.04, 110);
+    cc.type->cc_on_acked(&cc, &loss, 0, 4, (uint32_t)loss.sentmap.bytes_in_flight, 1, 10, 110, 1200, NULL);
+    ok(cc.num_loss_episodes_undone == 1);
+    ok(b->engine.round_count == round && !b->engine.round_start);
+    ok(b->engine.loss_events_in_round == 1 && b->engine.bytes_lost_in_round == 1200);
+    ok(b->sampler.rst.lost == 3600 && b->stats.bytes_lost == 3600);
 }
 
 static void test_probe_bw_growth_with_cumulative_acks(void)
@@ -424,9 +635,105 @@ static void test_native_rtt_adjustments(void)
     }
 }
 
+static void test_max_bw_filter_ecn_and_probe_rtt_ordering(void)
+{
+    static const quicly_cc_conf_t conf = {.init_cc = &quicly_cc_bbr_init, .initcwnd_packets = 100};
+    static const quicly_loss_conf_t loss_conf = {.min_pto = 1};
+    static const uint16_t max_ack_delay = 25;
+    quicly_cc_t cc;
+    quicly_cc_bbr_init.cb(&quicly_cc_bbr_init, &cc, &conf, 1200, 0);
+    quicly_bbr_configure(&cc, 1200, 100, 1, 0);
+    quicly_cc_bbr_t *b = &cc.state.bbr;
+    quicly_loss_t loss = {.conf = &loss_conf,
+                          .max_ack_delay = &max_ack_delay,
+                          .rtt = {.latest = 100, .minimum = 100, .smoothed = 100, .variance = 1}};
+
+    /* max_bw_filter win = 1 retains max_bw across cycles c and c + 1, expiring cycle c in cycle c + 2 */
+    quicly_bbr_wf_update(&b->engine.max_bw_filter, 1000000, 0);
+    quicly_bbr_wf_update(&b->engine.max_bw_filter, 500000, 1);
+    ok(quicly_bbr_wf_get_best(&b->engine.max_bw_filter) == 1000000);
+    quicly_bbr_wf_update(&b->engine.max_bw_filter, 400000, 2);
+    ok(quicly_bbr_wf_get_best(&b->engine.max_bw_filter) == 500000);
+
+    /* classic ECN bounds survive REFILL and probe_rtt until a clean post-CE packet is acked */
+    quicly_bbr_configure(&cc, 1200, 100, 2, 0);
+    b->engine.full_bw_reached = 1;
+    b->engine.state = QUICLY_BBR_BBR_STATE_PROBE_BW_CRUISE;
+    quicly_bbr_wf_update(&b->engine.max_bw_filter, 1000000, 0);
+    b->engine.max_bw = b->engine.bw = 1000000;
+    b->engine.min_rtt = b->engine.probe_rtt_min_delay = 100 * MS;
+    b->engine.inflight_longterm = 80000;
+    cc.cwnd = b->stats.cwnd = 50000;
+    b->engine.prev_probe_precautionary = 1;
+    b->engine.prev_probe_too_high = 0;
+
+    quicly_bbr_packet_t p[3];
+    ok(quicly_bbr_packet_sent(&cc, p, 1200, 1200, 0, 10));
+    ok(quicly_bbr_packet_sent(&cc, p + 1, 1200, 2400, 1, 20));
+    loss.sentmap.bytes_in_flight = 2400;
+    cc.type->cc_on_lost(&cc, &loss, 0, 0, 2, 110, 1200);
+    ok(b->engine.ecn_cwnd == 35000 && cc.cwnd == 35000);
+    ok(b->engine.ecn_bw == 700000 && b->engine.bw == 700000);
+    ok(b->engine.inflight_longterm == 80000);
+    ok(b->engine.prev_probe_too_high == 1);
+    ok(b->engine.state == QUICLY_BBR_BBR_STATE_PROBE_BW_DOWN);
+
+    /* ACK of packet 1 (sent before ecn_ce_end_pn == 2) that triggers REFILL must not release ECN bounds */
+    b->engine.bw_probe_wait = 0;
+    b->engine.cycle_stamp = 0;
+    loss.sentmap.bytes_in_flight = 0;
+    quicly_bbr_begin_ack(&cc, 120);
+    b->rtt_sample_valid = 1;
+    quicly_bbr_packet_acked(&cc, p + 1, 1, 20, 120);
+    quicly_bbr_update_rtt(&cc, 100, 20, 120);
+    cc.type->cc_on_acked(&cc, &loss, 1200, 1, 0, 0, 2, 120, 1200, NULL);
+    ok(b->engine.state == QUICLY_BBR_BBR_STATE_PROBE_BW_REFILL);
+    ok(b->engine.ecn_cwnd == 35000 && b->engine.ecn_bw == 700000);
+    ok(cc.cwnd <= 35000 && b->engine.bw == 700000);
+
+    /* clean ACK of packet 2 (sent at pn == 2 >= ecn_ce_end_pn) releases ECN bounds */
+    ok(quicly_bbr_packet_sent(&cc, p + 2, 1200, 1200, 2, 130));
+    quicly_bbr_begin_ack(&cc, 230);
+    b->rtt_sample_valid = 1;
+    quicly_bbr_packet_acked(&cc, p + 2, 2, 130, 230);
+    quicly_bbr_update_rtt(&cc, 100, 130, 230);
+    cc.type->cc_on_acked(&cc, &loss, 1200, 2, 0, 0, 3, 230, 1200, NULL);
+    ok(b->engine.ecn_cwnd == UINT64_MAX && b->engine.ecn_bw == UINT64_MAX);
+    ok(b->engine.bw == 1000000);
+
+    /* probe_rtt entry clears stale prev_probe_precautionary and uses the current ACK's updated bw */
+    quicly_bbr_configure(&cc, 1200, 100, 3, 0);
+    b->engine.full_bw_reached = 1;
+    b->engine.state = QUICLY_BBR_BBR_STATE_PROBE_BW_CRUISE;
+    b->engine.prev_probe_precautionary = 1;
+    b->engine.min_rtt = b->engine.probe_rtt_min_delay = 100 * MS;
+    b->engine.probe_rtt_min_stamp = 0;
+    b->engine.min_rtt_stamp = 0;
+    ok(quicly_bbr_packet_sent(&cc, p, 12000, 12000, 0, 5000));
+    /* leave 5500 bytes in flight: > 4800 (4 * MTU if bw were still 0), but <= 6000 (0.5 * BDP once current ACK updates bw) */
+    loss.sentmap.bytes_in_flight = 5500;
+    quicly_bbr_begin_ack(&cc, 5100);
+    b->rtt_sample_valid = 1;
+    quicly_bbr_packet_acked(&cc, p, 0, 5000, 5100);
+    quicly_bbr_update_rtt(&cc, 100, 5000, 5100);
+    cc.type->cc_on_acked(&cc, &loss, 12000, 0, 5500, 0, 1, 5100, 1200, NULL);
+    ok(b->engine.state == QUICLY_BBR_BBR_STATE_PROBE_RTT);
+    ok(!b->engine.prev_probe_precautionary);
+    ok(b->engine.probe_rtt_done_stamp != UINT64_MAX);
+
+    /* MTU change updates send_quantum, offload_budget, and cwnd floor without resetting state */
+    cc.cwnd = b->stats.cwnd = 4800;
+    quicly_bbr_sync_mtu(&cc, 1500);
+    ok(b->stats.max_tx_udp_payload_size == 1500);
+    ok(cc.cwnd == 6000);
+    ok(b->stats.send_quantum >= 3000 && b->engine.offload_budget == 3 * b->stats.send_quantum);
+}
+
 void test_bbr_sampler(void)
 {
     subtest("initialization-and-persistent-congestion", test_engine_initialization_and_persistent_congestion);
+    subtest("loss-undo-preserves-bandwidth-plateau", test_loss_undo_preserves_bandwidth_plateau);
+    subtest("startup-high-loss-undo", test_startup_high_loss_undo);
     subtest("compression-and-ack-order", test_compression_and_ack_order);
     subtest("loss-late-ack-and-generation", test_loss_late_ack_and_generation);
     subtest("loss-during-ack", test_loss_discovered_during_ack);
@@ -435,7 +742,10 @@ void test_bbr_sampler(void)
     subtest("switch-with-inflight-packets", test_switch_with_inflight_packets);
     subtest("probe-bw-loss-undo", test_probe_bw_loss_undo);
     subtest("probe-bw-new-loss-round-undo", test_probe_bw_new_loss_round_undo);
+    subtest("startup-loss-round-undo", test_startup_loss_round_undo);
+    subtest("startup-loss-round-undo-preserves-prior-epoch", test_startup_loss_round_undo_preserves_prior_epoch);
     subtest("probe-bw-growth-with-cumulative-acks", test_probe_bw_growth_with_cumulative_acks);
     subtest("submillisec-rtt-and-recovery-ordering", test_submillisec_rtt_and_recovery_ordering);
     subtest("native-rtt-adjustments", test_native_rtt_adjustments);
+    subtest("max-bw-filter-ecn-and-probe-rtt-ordering", test_max_bw_filter_ecn_and_probe_rtt_ordering);
 }

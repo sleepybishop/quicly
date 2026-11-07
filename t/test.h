@@ -68,6 +68,8 @@ void test_local_cid(void);
 void test_jumpstart(void);
 void test_cc(void);
 void test_bbr_sampler(void);
+void test_bbr_first_rtt(void);
+void test_bbr_math(void);
 #if QUICLY_HAVE_FLEXICAST
 void test_flexicast(void);
 void test_flexicast_cc_regressions(void);

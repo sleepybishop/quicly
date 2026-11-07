@@ -12,7 +12,9 @@ typedef struct st_quicly_cc_bbr_t {
     quicly_bbr_pcg32 random;
     quicly_bbr_packet_times_t ack_times;
     uint64_t event_time, ack_packet_id, ack_bytes, ack_largest_sent_at, ack_rtt, min_rtt_ns, pending_lost, last_lost_sent_at;
+    uint64_t ack_max_pn, ecn_ce_end_pn, ecn_recovery_end;
     uint64_t undo_pending, loss_first_pn, loss_last_pn, loss_first_sent_at, persistent_events;
+    uint64_t loss_scan_first_pn, loss_scan_last_pn, persistent_notified_pn;
     uint32_t undo_epoch;
     unsigned persistent_pending : 1;
     unsigned persistent_notified : 1;
@@ -22,6 +24,7 @@ typedef struct st_quicly_cc_bbr_t {
     unsigned loss_event_valid : 1;
     unsigned in_ack : 1;
     unsigned ack_congestion_event : 1;
+    unsigned undo_was_in_startup : 1;
 } quicly_cc_bbr_t;
 
 uint64_t quicly_bbr_time(double ms);
@@ -34,7 +37,13 @@ int quicly_bbr_packet_sent(struct st_quicly_cc_t *cc, quicly_bbr_packet_t *packe
 void quicly_bbr_packet_acked(struct st_quicly_cc_t *cc, quicly_bbr_packet_t *packet, uint64_t pn, double sent_at, double now);
 void quicly_bbr_packet_lost(struct st_quicly_cc_t *cc, quicly_bbr_packet_meta_t *packet, uint64_t pn, double sent_at,
                             uint32_t inflight, double now);
+/* include ACK-only packets when invalidating a persistent-congestion run */
+void quicly_bbr_acknowledge_packet(struct st_quicly_cc_t *cc, uint64_t pn);
+/* called in send order after native sentmap continuity has been checked */
+void quicly_bbr_track_persistent_loss(struct st_quicly_cc_t *cc, const struct quicly_loss_t *loss, uint64_t pn, double sent_at);
 uint32_t quicly_bbr_pacing_rate(struct st_quicly_cc_t *cc);
 void quicly_bbr_set_app_limited(struct st_quicly_cc_t *cc, uint64_t inflight);
 void quicly_bbr_apply_persistent_congestion(struct st_quicly_cc_t *cc);
+void quicly_bbr_sync_mtu(struct st_quicly_cc_t *cc, uint16_t mtu);
+void quicly_bbr_restart_from_idle(struct st_quicly_cc_t *cc, const struct quicly_loss_t *loss, uint16_t mtu, double now);
 #endif

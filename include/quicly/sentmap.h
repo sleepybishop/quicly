@@ -61,14 +61,10 @@ typedef struct st_quicly_sent_packet_t {
      * if sent on a promoted path
      */
     uint8_t promoted_path : 1;
-    /**
-     * if the packet was protected using 1-RTT keys (as opposed to 0-RTT, which shares the same packet number space)
-     */
-    uint8_t is_1rtt : 1;
-    /**
-     * if the packet was sent with an ECN-capable codepoint
-     */
-    uint8_t ecn_marked : 1;
+    /** the preceding packet-number gap contains only expired, unacknowledged packets */
+    uint8_t expired_before : 1;
+    /** distinguishes declared loss from discarding a packet-number space */
+    uint8_t declared_lost : 1;
     /**
      * if the packet is a DPLPMTUD probe; retained until the sentmap entry is discarded so that later resets of the PMTUD search do
      * not cause probe loss to be reported as congestion
@@ -278,12 +274,18 @@ struct st_quicly_sentmap_t {
      * is non-NULL between prepare and commit, pointing to the packet header that is being written to
      */
     quicly_sent_t *_pending_packet;
+    /** lower bound of a safe expiration gap before the first retained packet */
+    uint64_t expired_head_from;
+    /** next PN after a safe expiration gap at the tail; zero when there is no such gap */
+    uint64_t expired_tail_until;
 };
 
 typedef struct st_quicly_sentmap_iter_t {
     quicly_sent_t *p;
     size_t count;
     struct st_quicly_sent_block_t **ref;
+    /** preceding retained packet, or UINT64_MAX at the head */
+    uint64_t previous_packet_number;
 } quicly_sentmap_iter_t;
 
 extern const quicly_sent_t quicly_sentmap__end_iter;
@@ -387,6 +389,7 @@ inline quicly_sent_t *quicly_sentmap_allocate(quicly_sentmap_t *map, quicly_sent
 inline void quicly_sentmap_init_iter(quicly_sentmap_t *map, quicly_sentmap_iter_t *iter)
 {
     /* set up the iterator */
+    iter->previous_packet_number = UINT64_MAX;
     iter->ref = &map->head;
     if (map->head != NULL) {
         assert(map->head->num_entries != 0);
@@ -406,7 +409,7 @@ inline const quicly_sent_packet_t *quicly_sentmap_get(quicly_sentmap_iter_t *ite
     return &iter->p->data.packet;
 }
 
-/* Internal frame lookup; the returned entry is valid until the map changes. */
+/* internal frame lookup; the returned entry is valid until the map changes */
 quicly_sent_t *quicly_sentmap_find_frame(const quicly_sentmap_iter_t *packet, quicly_sent_acked_cb callback);
 
 #ifdef __cplusplus

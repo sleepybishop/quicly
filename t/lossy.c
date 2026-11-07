@@ -277,7 +277,6 @@ static void test_even(void)
 
 struct loss_cond_t loss_cond_down, loss_cond_up;
 static unsigned num_failures_in_loss_core;
-static int validate_server_address;
 
 static void loss_core(void)
 {
@@ -292,7 +291,7 @@ static void loss_core(void)
         uint8_t rawbuf[quic_ctx.transport_params.max_udp_payload_size];
         size_t num_packets;
         quicly_decoded_packet_t decoded;
-        quicly_address_token_plaintext_t address_token = {.type = QUICLY_ADDRESS_TOKEN_TYPE_RESUMPTION};
+
         ret = quicly_connect(&client, &quic_ctx, "example.com", &fake_address.sa, NULL, new_master_id(), ptls_iovec_init(NULL, 0),
                              NULL, NULL, NULL);
         ok(ret == 0);
@@ -303,8 +302,7 @@ static void loss_core(void)
         quic_now += 10;
         decode_packets(&decoded, &raw, 1);
         ok(num_packets == 1);
-        ret = quicly_accept(&server, &quic_ctx, NULL, &fake_address.sa, &decoded, validate_server_address ? &address_token : NULL,
-                            new_master_id(), NULL, NULL);
+        ret = quicly_accept(&server, &quic_ctx, NULL, &fake_address.sa, &decoded, NULL, new_master_id(), NULL, NULL);
         ok(ret == 0);
         quic_now += 10;
     }
@@ -432,30 +430,27 @@ static void test_downstream(void)
     loss_cond_up = cond_true;
 
     num_failures_in_loss_core = 0;
-    /* At this extreme loss rate, validating the synthetic address keeps the test focused on loss recovery instead of the
-     * server's anti-amplification limit. */
-    validate_server_address = 1;
     for (i = 0; i != 100; ++i) {
         init_cond_rand(&loss_cond_down, 3, 4);
         subtest("75%", loss_core);
         time_spent[i] = quic_now - 1;
     }
-    subtest("down-stats-75%", loss_check_stats, time_spent, 6, 8900, 21000, 2200, 4000, 15200);
-    validate_server_address = 0;
+    subtest("down-stats-75%", loss_check_stats, time_spent, 6, 6500, 22000, 2400, 6500, 20000);
 
     for (i = 0; i != 100; ++i) {
         init_cond_rand(&loss_cond_down, 1, 2);
         subtest("50%", loss_core);
         time_spent[i] = quic_now - 1;
     }
-    subtest("down-stats-50%", loss_check_stats, time_spent, 0, 750, 1190, 350, 500, 1526);
+    /* Independent packet-number-space ACK deadlines no longer let a stale handshake deadline accelerate application ACKs. */
+    subtest("down-stats-50%", loss_check_stats, time_spent, 0, 790, 1700, 450, 700, 2000);
 
     for (i = 0; i != 100; ++i) {
         init_cond_rand(&loss_cond_down, 1, 4);
         subtest("25%", loss_core);
         time_spent[i] = quic_now - 1;
     }
-    subtest("down-stats-25%", loss_check_stats, time_spent, 0, 150, 225, 140, 200, 478);
+    subtest("down-stats-25%", loss_check_stats, time_spent, 0, 200, 270, 180, 250, 500);
 
     for (i = 0; i != 100; ++i) {
         init_cond_rand(&loss_cond_down, 1, 10);
@@ -469,7 +464,7 @@ static void test_downstream(void)
         subtest("5%", loss_core);
         time_spent[i] = quic_now - 1;
     }
-    subtest("down-stats-5%", loss_check_stats, time_spent, 0, 90, 126, 80, 80, 260);
+    subtest("down-stats-5%", loss_check_stats, time_spent, 0, 90, 130, 80, 80, 250);
 
     for (i = 0; i != 100; ++i) {
         init_cond_rand(&loss_cond_down, 1, 40);
@@ -492,16 +487,14 @@ static void test_bidirectional(void)
     size_t i;
 
     num_failures_in_loss_core = 0;
-    validate_server_address = 1;
     for (i = 0; i != 100; ++i) {
         init_cond_rand(&loss_cond_down, 3, 4);
         init_cond_rand(&loss_cond_up, 3, 4);
         subtest("75%", loss_core);
         time_spent[i] = quic_now - 1;
     }
-    /* Keep the established combined-feature recovery bounds for the deterministic loss schedule. */
-    subtest("bidi-stats-75%", loss_check_stats, time_spent, 35, 250000, 320000, 80000, 170000, 760000);
-    validate_server_address = 0;
+    /* Retain multipath's high-loss bounds; fractional RTT and ACK delays lower the median recovery time. */
+    subtest("bidi-stats-75%", loss_check_stats, time_spent, 30, 190000, 280000, 35000, 110000, 700000);
 
     for (i = 0; i != 100; ++i) {
         init_cond_rand(&loss_cond_down, 1, 2);
@@ -509,7 +502,7 @@ static void test_bidirectional(void)
         subtest("50%", loss_core);
         time_spent[i] = quic_now - 1;
     }
-    subtest("bidi-stats-50%", loss_check_stats, time_spent, 0, 3000, 12000, 1500, 2500, 20000);
+    subtest("bidi-stats-50%", loss_check_stats, time_spent, 0, 2500, 6500, 850, 1600, 10000);
 
     for (i = 0; i != 100; ++i) {
         init_cond_rand(&loss_cond_down, 1, 4);
@@ -517,7 +510,7 @@ static void test_bidirectional(void)
         subtest("25%", loss_core);
         time_spent[i] = quic_now - 1;
     }
-    subtest("bidi-stats-25%", loss_check_stats, time_spent, 0, 251, 380, 185, 300, 715);
+    subtest("bidi-stats-25%", loss_check_stats, time_spent, 0, 240, 350, 170, 260, 700);
 
     for (i = 0; i != 100; ++i) {
         init_cond_rand(&loss_cond_down, 1, 10);
@@ -541,7 +534,7 @@ static void test_bidirectional(void)
         subtest("2.5%", loss_core);
         time_spent[i] = quic_now - 1;
     }
-    subtest("bidi-stats-2.5%", loss_check_stats, time_spent, 0, 80, 105, 80, 80, 220);
+    subtest("bidi-stats-2.5%", loss_check_stats, time_spent, 0, 85, 110, 80, 80, 200);
 
     for (i = 0; i != 100; ++i) {
         init_cond_rand(&loss_cond_down, 1, 64);

@@ -3,6 +3,7 @@
 #include <limits.h>
 #include <string.h>
 #include "quicly/cc-bbr-sampler.h"
+#include "bbr/math.h"
 
 _Static_assert(sizeof(quicly_bbr_packet_times_t) == 24, "sentmap time payload");
 _Static_assert(sizeof(quicly_bbr_packet_meta_t) == 24, "sentmap metadata payload");
@@ -91,8 +92,7 @@ void quicly_bbr_sampler_finish_ack(quicly_bbr_sampler_t *sampler, quicly_bbr_con
     rs->lost = rst->lost - sampler->selected_lost;
     if (rs->interval == 0 || rs->interval < stats->min_rtt)
         return;
-    __uint128_t rate = (__uint128_t)rs->delivered * QUICLY_BBR_SECONDS / rs->interval;
-    stats->delivery_rate_sec = rate > UINT64_MAX ? UINT64_MAX : (uint64_t)rate;
+    stats->delivery_rate_sec = quicly_bbr_muldiv(rs->delivered, QUICLY_BBR_SECONDS, rs->interval);
 }
 
 void quicly_bbr_sampler_app_limited(quicly_bbr_sampler_t *sampler, uint64_t inflight)

@@ -539,6 +539,45 @@ static void test_adjust_stream_frame_layout(void)
 #undef TEST
 }
 
+/**
+ * When a CRYPTO frame is shortened to make room for the length field, the length field must be sized for the shortened length,
+ * and the payload must be the largest that fits in the space.
+ */
+static void test_adjust_crypto_frame_layout(void)
+{
+    /* minimum, both sides of the boundary of 1-byte and 2-byte length fields, and a large frame */
+    static const size_t capacities[] = {2, 64, 65, 1200};
+    static const size_t expected_lens[] = {1, 63, 63, 1198};
+    static uint8_t buf[2 + 1200], expected[1200];
+
+    for (size_t i = 0; i < sizeof(expected); ++i)
+        expected[i] = (uint8_t)(i * 7 + 1);
+
+    for (size_t i = 0; i < PTLS_ELEMENTSOF(capacities); ++i) {
+        size_t capacity = capacities[i];
+        /* CRYPTO frame at offset zero, with payload filling all the space being available */
+        buf[0] = QUICLY_FRAME_TYPE_CRYPTO;
+        buf[1] = 0;
+        memcpy(buf + 2, expected, capacity);
+        uint8_t *dst = buf + 2, *const dst_end = buf + 2 + capacity, *frame_at = buf;
+        size_t len = capacity;
+        int wrote_all = 1;
+        adjust_stream_frame_layout(&dst, dst_end, &len, &wrote_all, &frame_at);
+
+        ok(dst <= dst_end);
+        ok(!wrote_all);
+        ok(frame_at == buf);
+        ok(len == expected_lens[i]);
+        const uint8_t *src = buf + 1; /* skip the frame type */
+        quicly_stream_frame_t frame;
+        ok(quicly_decode_crypto_frame(&src, dst, &frame) == 0);
+        ok(src == dst);
+        ok(frame.offset == 0);
+        ok(frame.data.len == len);
+        ok(memcmp(frame.data.base, expected, len) == 0);
+    }
+}
+
 static void get_now_cb(quicly_now_t *self, double *now)
 {
     *now = quic_now + quic_now_submillisec;
@@ -910,10 +949,8 @@ static void test_transport_parameters(void)
     ok(quicly_decode_transport_parameter_list(&decoded, NULL, NULL, NULL, NULL, tp_buf.base, tp_buf.base + tp_buf.off) == 0);
     ok(decoded.grease_quic_bit == 1);
     ptls_buffer_dispose(&tp_buf);
-    {
     /* Unknown and reserved versions do not crowd a later locally-supported version out of the bounded decoded list. The wire
      * count is retained separately for validation of an explicitly empty Available Versions list. */
-    ptls_buffer_t tp_buf;
     ptls_buffer_init(&tp_buf, "", 0);
     ok(encode_version_information_for_test(&tp_buf, 20) == 0);
     ok(quicly_decode_transport_parameter_list(&decoded, NULL, NULL, NULL, NULL, tp_buf.base, tp_buf.base + tp_buf.off) == 0);
@@ -929,7 +966,7 @@ static void test_transport_parameters(void)
        QUICLY_TRANSPORT_ERROR_TRANSPORT_PARAMETER);
 
     /* Clients advertise only the chosen version, because compatible first-flight conversion is not implemented. */
-    quicly_transport_parameters_t encode_params = quicly_spec_context.transport_params;
+    encode_params = quicly_spec_context.transport_params;
     ok(set_version_information(&encode_params, QUICLY_PROTOCOL_VERSION_1, 0, NULL) == 0);
     ptls_buffer_init(&tp_buf, "", 0);
     ok(quicly_encode_transport_parameter_list(&tp_buf, &encode_params, NULL, NULL, NULL, NULL, 0) == 0);
@@ -974,7 +1011,7 @@ static void test_transport_parameters(void)
     ok(decoded.version_information.num_available_versions == 0);
     ok(decoded.version_information.available_versions[0] == 0);
     ptls_buffer_dispose(&tp_buf);
-    }
+
 }
 
 static size_t decode_packet_once(quicly_context_t *ctx, const uint8_t *bytes, size_t len)
@@ -2216,6 +2253,56 @@ static void test_ack_for_unsent_pn(void)
     lock_now(server, 0);
     ok(handle_ack_frame(server, &state) == QUICLY_TRANSPORT_ERROR_PROTOCOL_VIOLATION);
     unlock_now(server);
+
+    quicly_free(client);
+    quicly_free(server);
+}
+
+/* Queues `num_frames` DATAGRAM frames of 1000 bytes each, and returns the number of datagrams the server sends. */
+static size_t datagram_frame_amplification_send(quicly_conn_t *server, size_t num_frames)
+{
+    quicly_address_t dest, src;
+    struct iovec datagrams[8];
+    uint8_t buf[PTLS_ELEMENTSOF(datagrams) * quic_ctx.transport_params.max_udp_payload_size], payload[1000] = {0};
+    size_t num_datagrams = PTLS_ELEMENTSOF(datagrams);
+
+    for (size_t i = 0; i != num_frames; ++i)
+        quicly_send_datagram_frames(server, &(ptls_iovec_t){payload, sizeof(payload)}, 1);
+    ok(quicly_send(server, &dest, &src, datagrams, &num_datagrams, buf, sizeof(buf)) == 0);
+    return num_datagrams;
+}
+
+/* A server that has not validated the client's address stops sending queued DATAGRAMs at the per-path anti-amplification limit. */
+static void test_datagram_frame_amplification_limit(void)
+{
+    quicly_conn_t *client, *server;
+    quicly_address_t dest, src;
+    struct iovec datagram;
+    uint8_t buf[quic_ctx.transport_params.max_udp_payload_size];
+    quicly_decoded_packet_t decoded;
+    size_t num_datagrams = 1;
+
+    /* the client's Initial reaches the server, but nothing the server sends is delivered back, so the address stays unvalidated */
+    ok(quicly_connect(&client, &quic_ctx, "example.com", &fake_address.sa, NULL, new_master_id(), ptls_iovec_init(NULL, 0), NULL,
+                      NULL, NULL) == 0);
+    ok(quicly_send(client, &dest, &src, &datagram, &num_datagrams, buf, sizeof(buf)) == 0);
+    ok(decode_packets(&decoded, &datagram, 1) == 1);
+    ok(quicly_accept(&server, &quic_ctx, NULL, &fake_address.sa, &decoded, NULL, new_master_id(), NULL, NULL) == 0);
+    uint64_t budget = server->super.stats.num_bytes.received * quic_ctx.pre_validation_amplification_limit;
+
+    /* Without the limit, each round would emit another datagram. As is the case with frames subject to the send window, the limit
+     * is exceeded by no more than one datagram. */
+    for (size_t i = 0; i != 16; ++i)
+        num_datagrams = datagram_frame_amplification_send(server, 1);
+    ok(num_datagrams == 0);
+    ok(server->super.stats.num_bytes.sent <= budget + server->path_spaces[0]->max_udp_payload_size);
+
+    /* Leave enough per-path allowance for one datagram; the next queued frame must wait for more credit. */
+    uint64_t num_frames_sent = server->super.stats.num_frames_sent.datagram;
+    server->super.stats.num_bytes.sent = budget - 1200;
+    get_path(server, 0)->bytes_sent = budget - 1200;
+    ok(datagram_frame_amplification_send(server, 2) == 1);
+    ok(server->super.stats.num_frames_sent.datagram == num_frames_sent + 1);
 
     quicly_free(client);
     quicly_free(server);
@@ -3592,6 +3679,72 @@ static void test_stop_sending_after_reset(int application_reset)
     quicly_free(server);
 }
 
+static void reset_in_on_send_emit_emit(quicly_stream_t *stream, size_t off, void *dst, size_t *len, int *wrote_all)
+{
+    /* act like an application failing to read the payload (e.g., pread(2) returning short as the file shrank) */
+    *len = 0;
+    *wrote_all = 1;
+    quicly_reset_stream(stream, QUICLY_ERROR_FROM_APPLICATION_ERROR_CODE(1));
+}
+
+/**
+ * When the application resets the stream from within `on_send_emit`, the sentmap entry that has been allocated for the STREAM frame
+ * must not be left uninitialized, as it is handled by `on_ack_stream` when the packet is acked or deemed lost.
+ */
+static void test_reset_in_on_send_emit(void)
+{
+    quicly_conn_t *client, *server;
+    quicly_stream_t *stream;
+    quicly_stream_callbacks_t callbacks = stream_callbacks;
+    callbacks.on_send_emit = reset_in_on_send_emit_emit;
+
+    test_setup_connected_peers(&client, &server);
+    ok(quicly_open_stream(client, &stream, 0) == 0);
+    stream->callbacks = &callbacks;
+    ok(quicly_streambuf_egress_write(stream, "hello", 5) == 0);
+
+    /* fill the unused slots of the sentmap with stale entries of the stream, each carrying an inverted range, so that the test
+     * reliably detects use of the entry being left uninitialized */
+    struct st_quicly_sent_block_t *tail = client->path_spaces[0]->loss.sentmap.tail;
+    ok(tail != NULL && tail->next_insert_at < PTLS_ELEMENTSOF(tail->entries) - 4);
+    if (tail != NULL) {
+        for (size_t i = tail->next_insert_at; i < PTLS_ELEMENTSOF(tail->entries); ++i) {
+            tail->entries[i].acked = on_ack_stream;
+            tail->entries[i].data.stream.stream_id = stream->stream_id;
+            tail->entries[i].data.stream.args.start = 10;
+            tail->entries[i].data.stream.args.end = 5;
+            tail->entries[i].data.stream.args.eos_type = QUICLY_SENDSTATE_EOS_TYPE_NONE;
+        }
+    }
+
+    /* send; the application resets the stream while the STREAM frame is being built */
+    transmit(client, server);
+    ok(quicly_sendstate_eos_type(&stream->sendstate) == QUICLY_SENDSTATE_EOS_TYPE_RESET);
+
+    /* the entry allocated for the dropped STREAM frame is a no-op, and the entries of the stream that are in flight carry valid
+     * ranges */
+    size_t num_noop_entries = 0;
+    for (struct st_quicly_sent_block_t *block = client->path_spaces[0]->loss.sentmap.head; block != NULL; block = block->next) {
+        for (size_t i = 0; i < block->next_insert_at; ++i) {
+            quicly_sent_t *sent = block->entries + i;
+            if (sent->acked == on_ack_noop) {
+                ++num_noop_entries;
+            } else if (sent->acked == on_ack_stream && sent->data.stream.stream_id == stream->stream_id) {
+                ok(sent->data.stream.args.start <= sent->data.stream.args.end);
+            }
+        }
+    }
+    ok(num_noop_entries == 1);
+
+    /* receive ACK; the client used to trip on the inverted range, then complete the transfer */
+    quic_now += QUICLY_DELAYED_ACK_TIMEOUT;
+    transmit(server, client);
+    ok(quicly_sendstate_transfer_complete(&stream->sendstate));
+
+    quicly_free(client);
+    quicly_free(server);
+}
+
 static void test_stop_sending_after_fin(int fin_state)
 {
     /* STOP_SENDING(id=0, error=11) */
@@ -3664,6 +3817,152 @@ static void test_fin_below_received(void)
 
     quicly_free(client);
     quicly_free(server);
+}
+
+/**
+ * Returns if the connection-level ingress credit charged is `expected`, and is what has been returned plus what each stream still
+ * holds in memory.
+ */
+static int ingress_credit_is_correct(quicly_conn_t *conn, uint64_t expected)
+{
+    uint64_t held = 0;
+    quicly_stream_t *stream;
+
+    kh_foreach_value(conn->streams, stream, {
+        if (stream->stream_id >= 0)
+            held += quicly_recvstate_bytes_allocated(&stream->recvstate) - stream->recvstate.data_off;
+    });
+
+    return conn->ingress.max_data.bytes_consumed == expected &&
+           conn->ingress.max_data.bytes_consumed == conn->ingress.max_data.bytes_shifted + held;
+}
+
+#define INGRESS_CREDIT_NUM_EVENTS 16
+#define INGRESS_CREDIT_MAX_EVENTS 5
+
+static uint8_t *encode_stream_frame(uint8_t *dst, quicly_stream_id_t stream_id, uint64_t off, const char *data, size_t len,
+                                    int is_fin)
+{
+    *dst++ = QUICLY_FRAME_TYPE_STREAM_BASE | QUICLY_FRAME_TYPE_STREAM_BIT_OFF | QUICLY_FRAME_TYPE_STREAM_BIT_LEN |
+             (is_fin ? QUICLY_FRAME_TYPE_STREAM_BIT_FIN : 0);
+    dst = quicly_encodev(dst, stream_id);
+    dst = quicly_encodev(dst, off);
+    dst = quicly_encodev(dst, len);
+    memcpy(dst, data, len);
+    return dst + len;
+}
+
+/**
+ * Applies one of the events enumerated by `test_ingress_credit_exhaustive` to a stream of 3 bytes. Returns if successful.
+ * `credit_used` is updated to the connection-level credit that the stream uses as defined by RFC 9000 Section 4.5; i.e., the final
+ * size if known, otherwise the largest offset received.
+ */
+static int apply_ingress_credit_event(quicly_conn_t *conn, quicly_stream_id_t stream_id, size_t event, uint64_t *credit_used)
+{
+    uint8_t frame[32], *dst = frame;
+    uint64_t used;
+
+    switch (event) {
+    case 0: /* RESET_STREAM */
+    case 1:
+    case 2:
+    case 3: /* RESET_STREAM_AT of Reliable Size 1 to 3 */
+        dst = quicly_encode_reset_stream_frame(dst, stream_id, 11, 3, event);
+        used = 3;
+        break;
+    case 4:
+    case 5: {
+        /* the application consumes one byte, or all the bytes available */
+        quicly_stream_t *stream;
+        size_t avail;
+        if ((stream = quicly_get_stream(conn, stream_id)) != NULL && (avail = quicly_streambuf_ingress_get(stream).len) != 0)
+            quicly_streambuf_ingress_shift(stream, event == 4 ? 1 : avail);
+        return 1;
+    }
+    default: {
+        /* STREAM frames of each range, with and without FIN */
+        static const struct {
+            uint8_t off, end, is_fin;
+        } streams[] = {{0, 1}, {0, 2}, {0, 3}, {1, 2}, {1, 3}, {2, 3}, {0, 3, 1}, {1, 3, 1}, {2, 3, 1}, {3, 3, 1}};
+        PTLS_BUILD_ASSERT(6 + PTLS_ELEMENTSOF(streams) == INGRESS_CREDIT_NUM_EVENTS);
+        assert(event - 6 < PTLS_ELEMENTSOF(streams));
+        uint8_t off = streams[event - 6].off, end = streams[event - 6].end;
+        dst = encode_stream_frame(dst, stream_id, off, &"xyz"[off], end - off, streams[event - 6].is_fin);
+        used = end;
+    } break;
+    }
+
+    if (*credit_used < used)
+        *credit_used = used;
+    return inject_frames(conn, frame, dst - frame) == 0;
+}
+
+/**
+ * Applies every sequence of up to INGRESS_CREDIT_MAX_EVENTS events to a unidirectional stream of 3 bytes, the events being the
+ * STREAM frames of each range with and without FIN, the FIN-only STREAM frame, RESET_STREAM, RESET_STREAM_AT of each non-zero
+ * Reliable Size, and the application consuming one or all the bytes available. The stream being unidirectional, quicly destroys it
+ * once all the bytes up to the end of the stream (or to the Reliable Size) are received; if that has not happened after the events,
+ * a STREAM frame carrying all the bytes and the FIN is applied to make it happen. After each event, and after the stream is
+ * destroyed, the connection-level credit charged is checked against the value defined by RFC 9000 Section 4.5, and against what has
+ * been returned plus what the streams still hold. Streams being independent of each other, this covers the credit accounting of any
+ * mix of streams up to that length, without relying on chance.
+ */
+static void test_ingress_credit_exhaustive(void)
+{
+    quicly_transport_parameters_t orig = quic_ctx.transport_params;
+    quicly_stream_callbacks_t callbacks = stream_callbacks;
+    quicly_conn_t *client, *server;
+    quicly_stream_id_t stream_id = 2; /* client-initiated unidirectional */
+    uint64_t num_sequences = 0, credit_used_by_previous = 0;
+    int failed = 0;
+
+    callbacks.on_destroy = quicly_streambuf_destroy; /* the default one leaks the buffer, which matters with this many streams */
+
+    /* nothing is sent by the server, hence the limits are set high enough to cover all the sequences */
+    quic_ctx.transport_params.reset_stream_at = 1;
+    quic_ctx.transport_params.max_streams_uni = 1 << 24;
+    quic_ctx.transport_params.max_data = 1 << 30;
+    test_setup_connected_peers(&client, &server);
+
+    for (size_t len = 1; len <= INGRESS_CREDIT_MAX_EVENTS; ++len) {
+        uint64_t count = 1;
+        for (size_t i = 0; i < len; ++i)
+            count *= INGRESS_CREDIT_NUM_EVENTS;
+        for (uint64_t seq = 0; seq < count; ++seq, stream_id += 4, ++num_sequences) {
+            quicly_stream_t *stream;
+            uint64_t credit_used = 0;
+            if (quicly_get_or_open_stream(server, stream_id, &stream) != 0 || stream == NULL)
+                goto Fail;
+            stream->callbacks = &callbacks;
+            for (uint64_t i = 0, events = seq; i < len; ++i, events /= INGRESS_CREDIT_NUM_EVENTS) {
+                if (!apply_ingress_credit_event(server, stream_id, events % INGRESS_CREDIT_NUM_EVENTS, &credit_used) ||
+                    !ingress_credit_is_correct(server, credit_used_by_previous + credit_used))
+                    goto Fail;
+            }
+            if (quicly_get_stream(server, stream_id) != NULL) {
+                if (!apply_ingress_credit_event(server, stream_id, 12 /* STREAM(off=0, len=3, FIN) */, &credit_used))
+                    goto Fail;
+                if (quicly_get_stream(server, stream_id) != NULL ||
+                    !ingress_credit_is_correct(server, credit_used_by_previous + credit_used))
+                    goto Fail;
+            }
+            credit_used_by_previous += credit_used;
+            continue;
+        Fail:
+            /* stop here, as the connection might have been left in a state that taints the subsequent sequences */
+            note("failed at length %zu, sequence %" PRIu64, len, seq);
+            failed = 1;
+            goto Exit;
+        }
+    }
+
+Exit:
+    ok(!failed);
+    note("%" PRIu64 " sequences", num_sequences);
+
+    quicly_free(client);
+    quicly_free(server);
+    quic_ctx.transport_params = orig;
 }
 
 /**
@@ -5840,6 +6139,7 @@ static void test_multipath_path_loss(void)
 #include "multipath-scheduling.h"
 #include "multipath-health.h"
 #include "bbr-native.h"
+#include "bbr-ecn.h"
 
 #include "datagram-queue.h"
 #include "custom-scheduler-recovery.h"
@@ -6535,6 +6835,7 @@ int main(int argc, char **argv)
     subtest("path-sentmap", test_path_sentmap);
     subtest("loss", test_loss);
     subtest("adjust-stream-frame-layout", test_adjust_stream_frame_layout);
+    subtest("adjust-crypto-frame-layout", test_adjust_crypto_frame_layout);
     subtest("test-vector", test_vector);
     subtest("test-retry-aead", test_retry_aead);
     subtest("transport-parameters", test_transport_parameters);
@@ -6563,6 +6864,7 @@ int main(int argc, char **argv)
     subtest("jumpstart-cwnd", test_jumpstart_cwnd);
     subtest("jumpstart", test_jumpstart);
     subtest("ack-for-unsent-pn", test_ack_for_unsent_pn);
+    subtest("datagram-frame-amplification-limit", test_datagram_frame_amplification_limit);
     subtest("frames-for-unopened-local-stream", test_frames_for_unopened_local_stream);
     subtest("frames-opening-peer-stream", test_frames_opening_peer_stream);
     subtest("ack-frequency", test_ack_frequency);
@@ -6596,6 +6898,7 @@ int main(int argc, char **argv)
     subtest("reset-stream-at-gap-above", test_reset_stream_at_gap_above);
     subtest("reset-stream-at-after-fin", test_reset_stream_at_after_fin);
     subtest("fin-below-received", test_fin_below_received);
+    subtest("ingress-credit-exhaustive", test_ingress_credit_exhaustive);
     subtest("reset-stream-at-completing", test_reset_completing_transfer, 3, 1, 0);
     subtest("reset-stream-at-zero-completing", test_reset_completing_transfer, 0, 1, 0);
     subtest("reset-stream-completing", test_reset_completing_transfer, 0, 0, 0);
@@ -6603,6 +6906,7 @@ int main(int argc, char **argv)
     subtest("reset-stream-completing-null-cb", test_reset_completing_transfer, 0, 0, 1);
     subtest("stop-sending-after-reset", test_stop_sending_after_reset, 1);
     subtest("stop-sending-repeated", test_stop_sending_after_reset, 0);
+    subtest("reset-in-on-send-emit", test_reset_in_on_send_emit);
     subtest("stop-sending-before-fin", test_stop_sending_after_fin, QUICLY_SENDSTATE_EOS_STATE_UNSENT);
     subtest("stop-sending-after-fin", test_stop_sending_after_fin, QUICLY_SENDSTATE_EOS_STATE_INFLIGHT);
     subtest("stop-sending-after-fin-acked", test_stop_sending_after_fin, QUICLY_SENDSTATE_EOS_STATE_DELIVERED);
@@ -6659,7 +6963,11 @@ int main(int argc, char **argv)
     subtest("bbr-native-accounting", test_bbr_native);
     subtest("bbr-switch-clock", test_bbr_switch_clock);
     subtest("bbr-sampler", test_bbr_sampler);
+    subtest("bbr-first-rtt", test_bbr_first_rtt);
+    subtest("bbr-math", test_bbr_math);
+    subtest("bbr-ecn-regressions", test_bbr_ecn_regressions);
     subtest("bbr-congestion-and-undo", test_bbr_congestion_and_undo);
+    subtest("bbr-persistent-congestion", test_bbr_persistent_congestion);
     subtest("bbr-idle-restart", test_bbr_idle_restart);
     subtest("bbr-blackout", test_bbr_blackout);
     subtest("bbr-configuration", test_bbr_configuration);
