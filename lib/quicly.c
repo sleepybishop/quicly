@@ -271,6 +271,8 @@ struct st_quicly_conn_path_t {
      * if the path has completed address and MTU validation
      */
     uint8_t validated : 1;
+    /* The application requested an ACK-eliciting liveness probe on this path. */
+    uint8_t probe_requested : 1;
     /**
      * when the path was abandoned, or INT64_MAX if not abandoned
      */
@@ -1955,6 +1957,7 @@ quicly_error_t quicly_get_stats(quicly_conn_t *conn, quicly_stats_t *stats)
     stats->rtt = ps->recovery->loss.rtt;
     stats->loss_thresholds = ps->recovery->loss.thresholds;
     stats->cc = ps->recovery->cc;
+    stats->cc.conn = NULL;
     stats->jumpstart.prev_rate = ps->recovery->jumpstart.prev_rate;
     stats->jumpstart.prev_rtt = ps->recovery->jumpstart.prev_rtt;
     stats->jumpstart.new_rtt = ps->recovery->jumpstart.new_rtt;
@@ -2718,6 +2721,8 @@ static quicly_error_t activate_path_recovery(quicly_conn_t *conn, quicly_path_sp
         return QUICLY_TRANSPORT_ERROR_INTERNAL;
     }
 
+    recovery->cc.conn = conn;
+
     if (get_egress_context(conn)->pacing) {
         if ((recovery->pacer = malloc(sizeof(*recovery->pacer))) == NULL) {
             quicly_loss_dispose(&recovery->loss);
@@ -3219,8 +3224,9 @@ static quicly_error_t promote_path(quicly_conn_t *conn, size_t path_index)
     conn->super.stats.num_paths.promoted += 1;
 
     /* reset CC */
-    ps->recovery->cc.type->cc_init->cb(ps->recovery->cc.type->cc_init, &ps->recovery->cc, &get_egress_context(conn)->cc,
-                                       ps->recovery->max_udp_payload_size, conn->stash.now);
+    ps->recovery->cc.type->cc_init->cb(ps->recovery->cc.type->cc_init, &ps->recovery->cc, &get_egress_context(conn)->cc, ps->recovery->max_udp_payload_size,
+                             conn->stash.now);
+    ps->recovery->cc.conn = conn;
     ps->recovery->cc_limited_end_pn = 0;
 
     if (ps_index == 0) {
@@ -5250,6 +5256,8 @@ static int64_t path_ordinary_send_at(quicly_conn_t *conn, struct st_quicly_conn_
 static int path_has_pending_control(quicly_conn_t *conn, size_t path_index)
 {
     int app_writable = path_validation_ready(conn);
+    if (app_writable && get_path(conn, path_index)->probe_requested)
+        return 1;
     uint8_t flows = conn->egress.pending_flows;
     if (path_index != 0)
         flows &= ~((1u << QUICLY_EPOCH_INITIAL) | (1u << QUICLY_EPOCH_HANDSHAKE));
@@ -7729,8 +7737,9 @@ static quicly_error_t service_path_loss_alarm(quicly_conn_t *conn, quicly_path_s
                 (ret = mark_frames_on_pto(conn, ps, QUICLY_EPOCH_HANDSHAKE, &bytes_to_mark)) != 0)
                 return ret;
             /* after repeated PTOs on a multipath path, requeue the full 1-RTT flight when a healthy path can carry it */
-            if (quicly_is_multipath(conn) && conn->initial == NULL && conn->handshake == NULL &&
-                ps->recovery->loss.pto_count >= 2) {
+            if (quicly_is_multipath(conn) && conn->initial == NULL && conn->handshake == NULL && ps->recovery->loss.pto_count >= 2) {
+                if (ps->addrs[0] != NULL)
+                    ps->addrs[0]->probe_requested = 0;
                 size_t mp_bytes = path_has_healthy_alternative(conn, ps) ? SIZE_MAX : bytes_to_mark;
                 if (mp_bytes != 0 && (ret = mark_frames_on_pto(conn, ps, QUICLY_EPOCH_1RTT, &mp_bytes)) != 0)
                     return ret;
@@ -7933,9 +7942,10 @@ static quicly_error_t do_send(quicly_conn_t *conn, quicly_send_context_t *s)
                         (ret = emit_datagram_queue(conn, s, &conn->egress.datagram_frame_payloads, &conn_dgrams_consumed, 1)) != 0)
                         goto Exit;
                 }
-                if (min_packets_to_send != 0) {
+                if (min_packets_to_send != 0 || path->probe_requested) {
                     if ((ret = do_allocate_frame(conn, s, 1, ALLOCATE_FRAME_TYPE_ACK_ELICITING)) != 0)
                         goto Exit;
+                    path->probe_requested = 0;
                     if (get_epoch(s->current.first_byte) == QUICLY_EPOCH_1RTT &&
                         conn->super.remote.transport_params.min_ack_delay_usec != UINT64_MAX) {
                         *s->dst++ = QUICLY_FRAME_TYPE_IMMEDIATE_ACK;
@@ -8163,6 +8173,7 @@ int quicly_set_cc(quicly_conn_t *conn, quicly_cc_type_t *cc)
         if (conn->path_spaces[i] == NULL || conn->path_spaces[i]->recovery == NULL)
             continue;
         int success = cc->cc_switch(&conn->path_spaces[i]->recovery->cc);
+        conn->path_spaces[i]->recovery->cc.conn = conn;
         if (!success) {
             for (size_t j = 0; j < PTLS_ELEMENTSOF(conn->path_spaces); ++j)
                 if (conn->path_spaces[j] != NULL && conn->path_spaces[j]->recovery != NULL)
@@ -11677,6 +11688,18 @@ int quicly_get_path_stats(quicly_conn_t *conn, size_t path_index, quicly_path_st
         .abandoned = path->abandoned,
         .validated = path->initial ? conn->super.remote.address_validation.validated != 0 : path->validated != 0,
     };
+    return 0;
+}
+
+int quicly_request_path_probe(quicly_conn_t *conn, size_t path_index)
+{
+    if (conn == NULL || conn->super.state >= QUICLY_STATE_CLOSING || (path_index != 0 && !quicly_is_multipath(conn)) ||
+        !path_validation_ready(conn) || !quicly_is_path_available(conn, path_index))
+        return -1;
+    struct st_quicly_conn_path_t *path = get_path(conn, path_index);
+    if (path->path_challenge.send_at != INT64_MAX || (quicly_is_multipath(conn) && path->path_space->recovery->loss.pto_count >= 2))
+        return -1;
+    path->probe_requested = 1;
     return 0;
 }
 
