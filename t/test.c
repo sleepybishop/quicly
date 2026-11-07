@@ -2288,19 +2288,20 @@ static void test_datagram_frame_amplification_limit(void)
     ok(quicly_send(client, &dest, &src, &datagram, &num_datagrams, buf, sizeof(buf)) == 0);
     ok(decode_packets(&decoded, &datagram, 1) == 1);
     ok(quicly_accept(&server, &quic_ctx, NULL, &fake_address.sa, &decoded, NULL, new_master_id(), NULL, NULL) == 0);
-    uint64_t budget = server->super.stats.num_bytes.received * quic_ctx.pre_validation_amplification_limit;
+    struct st_quicly_conn_path_t *path = get_path(server, 0);
+    uint64_t budget = path->bytes_received * quic_ctx.pre_validation_amplification_limit;
 
     /* Without the limit, each round would emit another datagram. As is the case with frames subject to the send window, the limit
      * is exceeded by no more than one datagram. */
     for (size_t i = 0; i != 16; ++i)
         num_datagrams = datagram_frame_amplification_send(server, 1);
     ok(num_datagrams == 0);
-    ok(server->super.stats.num_bytes.sent <= budget + server->path_spaces[0]->max_udp_payload_size);
+    ok(path->bytes_sent <= budget + server->path_spaces[0]->max_udp_payload_size);
 
-    /* Leave enough per-path allowance for one datagram; the next queued frame must wait for more credit. */
+    /* A datagram is started as long as some allowance remains, but the second frame, which needs another datagram, is not sent (the
+     * number of bytes sent is overwritten to set the remaining allowance). */
     uint64_t num_frames_sent = server->super.stats.num_frames_sent.datagram;
-    server->super.stats.num_bytes.sent = budget - 1200;
-    get_path(server, 0)->bytes_sent = budget - 1200;
+    path->bytes_sent = budget - 500;
     ok(datagram_frame_amplification_send(server, 2) == 1);
     ok(server->super.stats.num_frames_sent.datagram == num_frames_sent + 1);
 
