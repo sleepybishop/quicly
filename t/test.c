@@ -1011,7 +1011,6 @@ static void test_transport_parameters(void)
     ok(decoded.version_information.num_available_versions == 0);
     ok(decoded.version_information.available_versions[0] == 0);
     ptls_buffer_dispose(&tp_buf);
-
 }
 
 static size_t decode_packet_once(quicly_context_t *ctx, const uint8_t *bytes, size_t len)
@@ -2272,7 +2271,17 @@ static size_t datagram_frame_amplification_send(quicly_conn_t *server, size_t nu
     return num_datagrams;
 }
 
-/* A server that has not validated the client's address stops sending queued DATAGRAMs at the per-path anti-amplification limit. */
+static size_t num_datagram_frames_received;
+
+static void on_receive_datagram_frame(quicly_receive_datagram_frame_t *self, quicly_conn_t *conn, ptls_iovec_t payload)
+{
+    ++num_datagram_frames_received;
+}
+
+static quicly_receive_datagram_frame_t receive_datagram_frame = {on_receive_datagram_frame};
+
+/* DATAGRAM frames are not congestion controlled, but a server that has not validated the client's address stops sending them once
+ * the anti-amplification limit is reached. */
 static void test_datagram_frame_amplification_limit(void)
 {
     quicly_conn_t *client, *server;
@@ -2281,6 +2290,9 @@ static void test_datagram_frame_amplification_limit(void)
     uint8_t buf[quic_ctx.transport_params.max_udp_payload_size];
     quicly_decoded_packet_t decoded;
     size_t num_datagrams = 1;
+
+    quic_ctx.transport_params.max_datagram_frame_size = UINT16_MAX;
+    quic_ctx.receive_datagram_frame = &receive_datagram_frame;
 
     /* the client's Initial reaches the server, but nothing the server sends is delivered back, so the address stays unvalidated */
     ok(quicly_connect(&client, &quic_ctx, "example.com", &fake_address.sa, NULL, new_master_id(), ptls_iovec_init(NULL, 0), NULL,
@@ -2307,6 +2319,42 @@ static void test_datagram_frame_amplification_limit(void)
 
     quicly_free(client);
     quicly_free(server);
+    quic_ctx.transport_params.max_datagram_frame_size = 0;
+    quic_ctx.receive_datagram_frame = NULL;
+}
+
+/* DATAGRAM frames larger than the max_datagram_frame_size transport parameter of the peer are not sent, as are all DATAGRAM frames
+ * when the peer does not send the transport parameter (RFC 9221 Section 3). */
+static void test_datagram_frame_max_size(void)
+{
+    static uint8_t payload[1000];
+    quicly_conn_t *client, *server;
+
+    /* the peer does not support DATAGRAM frames */
+    test_setup_connected_peers(&client, &server);
+    quicly_send_datagram_frames(server, &(ptls_iovec_t){payload, 1}, 1);
+    transmit(server, client);
+    ok(server->super.stats.num_frames_sent.datagram == 0);
+    quicly_free(client);
+    quicly_free(server);
+
+    /* the peer accepts frames up to 1000 bytes, which carry up to 997 bytes of payload (1-byte type and 2-byte length) */
+    quic_ctx.transport_params.max_datagram_frame_size = 1000;
+    quic_ctx.receive_datagram_frame = &receive_datagram_frame;
+    num_datagram_frames_received = 0;
+    test_setup_connected_peers(&client, &server);
+    quicly_send_datagram_frames(server, &(ptls_iovec_t){payload, 997}, 1);
+    transmit(server, client);
+    ok(server->super.stats.num_frames_sent.datagram == 1);
+    ok(num_datagram_frames_received == 1);
+    quicly_send_datagram_frames(server, &(ptls_iovec_t){payload, 998}, 1);
+    transmit(server, client);
+    ok(server->super.stats.num_frames_sent.datagram == 1);
+    ok(num_datagram_frames_received == 1);
+    quicly_free(client);
+    quicly_free(server);
+    quic_ctx.transport_params.max_datagram_frame_size = 0;
+    quic_ctx.receive_datagram_frame = NULL;
 }
 
 static quicly_error_t test_handle_stream_level_frame(quicly_conn_t *conn,
@@ -3045,6 +3093,28 @@ static void test_retransmit(void)
 
     quic_ctx.transport_params = orig;
     quic_ctx.generate_resumption_token = NULL;
+}
+
+/**
+ * Tests that requesting a resumption token is a no-op when the context has no `generate_resumption_token` callback.
+ */
+static void test_send_resumption_token_without_generator(void)
+{
+    quicly_conn_t *client, *server;
+    quicly_stats_t stats;
+
+    ok(quic_ctx.generate_resumption_token == NULL);
+    test_setup_connected_peers(&client, &server);
+
+    ok(quicly_send_resumption_token(server) == 0);
+    exchange_until_idle(client, server);
+    ok(quicly_get_state(client) == QUICLY_STATE_CONNECTED);
+    ok(quicly_get_state(server) == QUICLY_STATE_CONNECTED);
+    quicly_get_stats(server, &stats);
+    ok(stats.num_frames_sent.new_token == 0);
+
+    quicly_free(client);
+    quicly_free(server);
 }
 
 static void test_retransmit_max_stream_data_lower_window(void)
@@ -4237,6 +4307,65 @@ static void test_migration_during_handshake(void)
     subtest("migrate-before-3nd", do_test_migration_during_handshake, 1);
 }
 
+/**
+ * When a PATH_CHALLENGE is to be sent on a backup path at the moment the loss timer fires, the timer is handled when sending
+ * packets on the primary path, rather than being consumed while sending the probe on the backup path.
+ */
+static void test_pto_with_backup_path_probe(void)
+{
+    quicly_conn_t *client, *server;
+    struct sockaddr_in newaddr = {.sin_family = AF_INET, .sin_addr.s_addr = htonl(0x7f000002), .sin_port = htons(12345)};
+    quicly_address_t destaddr, srcaddr;
+    struct iovec datagrams[8];
+    uint8_t buf[PTLS_ELEMENTSOF(datagrams) * quic_ctx.transport_params.max_udp_payload_size];
+    quicly_decoded_packet_t decoded[PTLS_ELEMENTSOF(datagrams) * 4];
+    size_t num_datagrams, num_decoded;
+    quicly_stream_t *stream;
+
+    test_setup_connected_peers(&client, &server);
+
+    /* server sends stream data that gets lost, arming the loss timer */
+    ok(quicly_open_stream(server, &stream, 0) == 0);
+    ok(quicly_streambuf_egress_write(stream, "a", 1) == 0);
+    num_datagrams = PTLS_ELEMENTSOF(datagrams);
+    ok(quicly_send(server, &destaddr, &srcaddr, datagrams, &num_datagrams, buf, sizeof(buf)) == 0);
+    ok(num_datagrams == 1);
+    ok(server->path_spaces[0]->loss.alarm_at != INT64_MAX);
+
+    /* when the loss timer fires, a packet from a new client address arrives, scheduling a PATH_CHALLENGE on a backup path */
+    quic_now = server->path_spaces[0]->loss.alarm_at;
+    ok(quicly_open_stream(client, &stream, 0) == 0);
+    ok(quicly_streambuf_egress_write(stream, "a", 1) == 0);
+    num_datagrams = PTLS_ELEMENTSOF(datagrams);
+    ok(quicly_send(client, &destaddr, &srcaddr, datagrams, &num_datagrams, buf, sizeof(buf)) == 0);
+    ok(num_datagrams == 1);
+    num_decoded = decode_packets(decoded, datagrams, num_datagrams);
+    for (size_t i = 0; i != num_decoded; ++i)
+        ok(quicly_receive(server, NULL, (void *)&newaddr, decoded + i) == 0);
+    ok(server->path_spaces[0]->addrs[1] != NULL);
+    ok(server->path_spaces[0]->loss.alarm_at <= quic_now);
+    int8_t pto_count = server->path_spaces[0]->loss.pto_count;
+
+    /* server sends a PATH_CHALLENGE on the backup path, without consuming the loss timer */
+    num_datagrams = PTLS_ELEMENTSOF(datagrams);
+    ok(quicly_send(server, &destaddr, &srcaddr, datagrams, &num_datagrams, buf, sizeof(buf)) == 0);
+    ok(num_datagrams == 1);
+    ok(compare_socket_address(&destaddr.sa, (void *)&newaddr) == 0);
+    ok(server->path_spaces[0]->loss.pto_count == pto_count);
+    ok(server->path_spaces[0]->loss.alarm_at <= quic_now);
+
+    /* then, sends the PTO probe on the primary path */
+    num_datagrams = PTLS_ELEMENTSOF(datagrams);
+    ok(quicly_send(server, &destaddr, &srcaddr, datagrams, &num_datagrams, buf, sizeof(buf)) == 0);
+    ok(num_datagrams != 0);
+    ok(compare_socket_address(&destaddr.sa, &fake_address.sa) == 0);
+    ok(server->path_spaces[0]->loss.pto_count != pto_count);
+    ok(quic_now < server->path_spaces[0]->loss.alarm_at);
+
+    quicly_free(client);
+    quicly_free(server);
+}
+
 static size_t test_stats_foreach_next_off;
 
 static void test_stats_foreach_field(size_t off, size_t size)
@@ -4516,9 +4645,8 @@ static void test_multipath_state_isolation(void)
     ok(ret == QUICLY_ERROR_PACKET_IGNORED);
     ok(get_path(client, 0) == path_zero);
     ok(client->path_spaces[0]->packet_number == path_zero_pn);
-    ok(client->egress.path_cids_blocked.sender == QUICLY_SENDER_STATE_SEND);
-    ok(client->egress.path_cids_blocked.path_id == 1);
-    ok(client->egress.path_cids_blocked.sequence == 0);
+    ok(client->path_spaces[1]->path_cids_blocked.sender == QUICLY_SENDER_STATE_SEND);
+    ok(client->path_spaces[1]->path_cids_blocked.sequence == 0);
 
     uint8_t status_bytes[16], *status_end = status_bytes;
     status_end = quicly_encodev(status_end, 1);
@@ -4804,7 +4932,8 @@ static void test_multipath_unused_space_close_timeout(void)
                 ++unused;
             }
             ok(unused != 0);
-            double primary = get_sentmap_expiration_time(conn);
+            double primary = quicly_loss_get_sentmap_expiration_time(&conn->path_spaces[0]->loss,
+                                                                     conn->super.remote.transport_params.max_ack_delay);
             ok(get_max_sentmap_expiration_time(conn) == primary);
             /* a bound slow path must still extend close retention. */
             struct st_quicly_conn_path_t bound = {0};
@@ -4832,7 +4961,7 @@ static void test_multipath_unused_space_close_timeout(void)
         ok(decode_packets(&decoded, &datagram, 1) == 1);
         ok(quicly_receive(server, NULL, &fake_address.sa, &decoded) == 0);
         quicly_conn_t *conn = draining ? server : client;
-        int64_t expires_at = ceil(quic_now + quic_now_submillisec + get_sentmap_expiration_time(conn));
+        int64_t expires_at = ceil(quic_now + quic_now_submillisec + get_max_sentmap_expiration_time(conn));
         ok(quicly_get_first_timeout(conn) == expires_at);
         quic_now_submillisec = 0;
         quic_now = expires_at - 1;
@@ -5022,6 +5151,71 @@ static void test_multipath_path_management(void)
     quic_now = orig_now;
 }
 
+static void test_multipath_ack_frequency_after_abandon(void)
+{
+    quicly_conn_t *client, *server;
+    int64_t orig_now = quic_now;
+    quicly_context_t saved = setup_multipath_regression_peers(&client, &server, 0);
+    quic_ctx.ack_frequency = 1024;
+
+    open_multipath_test_path(client);
+    multipath_run(client, server, 30, -1, -1);
+    ok(get_path(client, 1) != NULL && !get_path(client, 1)->probe_only);
+
+    /* sending on a path without loss episodes must still emit a due update from an eligible path */
+    client->path_spaces[0]->cc.num_loss_episodes = QUICLY_FIRST_ACK_FREQUENCY_LOSS_EPISODE;
+    client->path_spaces[0]->cc.cwnd = 9 * client->path_spaces[0]->max_udp_payload_size;
+    client->path_spaces[1]->cc.num_loss_episodes = 0;
+    client->egress.ack_frequency.update_at = 0;
+    uint64_t ack_frequency_before = client->super.stats.num_frames_sent.ack_frequency;
+    quicly_stream_t *stream;
+    const char payload[] = "probe";
+    ok(quicly_open_stream(client, &stream, 0) == 0);
+    ok(quicly_set_stream_path_affinity(stream, 1) == 0);
+    ok(quicly_streambuf_egress_write(stream, payload, sizeof(payload) - 1) == 0);
+    multipath_run(client, server, 10, -1, -1);
+    ok(client->super.stats.num_frames_sent.ack_frequency > ack_frequency_before);
+    ok(server->path_spaces[1]->pn_space->packet_tolerance == 9);
+
+    /* when multiple active paths qualify, use the conservative minimum tolerance */
+    client->path_spaces[1]->cc.num_loss_episodes = QUICLY_FIRST_ACK_FREQUENCY_LOSS_EPISODE;
+    client->path_spaces[1]->cc.cwnd = 6 * client->path_spaces[1]->max_udp_payload_size;
+    client->egress.ack_frequency.update_at = 0;
+    ack_frequency_before = client->super.stats.num_frames_sent.ack_frequency;
+    ok(quicly_streambuf_egress_write(stream, payload, sizeof(payload) - 1) == 0);
+    multipath_run(client, server, 10, -1, -1);
+    ok(client->super.stats.num_frames_sent.ack_frequency > ack_frequency_before);
+    ok(server->path_spaces[0]->pn_space->packet_tolerance == 6);
+    ok(server->path_spaces[1]->pn_space->packet_tolerance == 6);
+
+    ok(quicly_abandon_path(client, 0, QUICLY_PATH_ABANDON_ERROR_APPLICATION) == 0);
+    multipath_run(client, server, 10, -1, -1);
+    ok(get_path(client, 0)->abandoned);
+    ok(get_path(server, 0)->abandoned);
+
+    /* a due connection-wide ACK policy update must use the surviving path */
+    client->path_spaces[1]->cc.num_loss_episodes = QUICLY_FIRST_ACK_FREQUENCY_LOSS_EPISODE;
+    client->path_spaces[1]->cc.cwnd = 8 * client->path_spaces[1]->max_udp_payload_size;
+    client->egress.ack_frequency.update_at = 0;
+    ack_frequency_before = client->super.stats.num_frames_sent.ack_frequency;
+    ok(quicly_open_stream(client, &stream, 0) == 0);
+    ok(quicly_streambuf_egress_write(stream, payload, sizeof(payload) - 1) == 0);
+    multipath_run(client, server, 10, -1, -1);
+
+    quicly_stream_t *received = quicly_get_stream(server, stream->stream_id);
+    ok(received != NULL);
+    if (received != NULL) {
+        ptls_iovec_t data = quicly_streambuf_ingress_get(received);
+        ok(data.len == sizeof(payload) - 1 && memcmp(data.base, payload, data.len) == 0);
+    }
+    ok(client->super.stats.num_frames_sent.ack_frequency > ack_frequency_before);
+    ok(server->path_spaces[1]->pn_space->packet_tolerance == 8);
+    ok(server->path_spaces[1]->pn_space->reordering_threshold == QUICLY_LOSS_DEFAULT_PACKET_THRESHOLD);
+
+    free_multipath_regression_peers(client, server, saved);
+    quic_now = orig_now;
+}
+
 static void deliver_multipath_cid(quicly_conn_t *src, quicly_conn_t *dst, size_t send_path, uint32_t path_id, uint64_t sequence,
                                   int legacy, const uint8_t token[16])
 {
@@ -5099,7 +5293,10 @@ static void test_multipath_resource_limit(void)
     ok(quicly_get_state(client) == QUICLY_STATE_CONNECTED);
     ok(find_path_space_by_id(client, QUICLY_LOCAL_ACTIVE_CONNECTION_ID_LIMIT) == NULL);
     ok(path_id_is_abandoned(client, QUICLY_LOCAL_ACTIVE_CONNECTION_ID_LIMIT));
-    ok(client->rejected_path_abandon[QUICLY_LOCAL_ACTIVE_CONNECTION_ID_LIMIT] == QUICLY_SENDER_STATE_SEND);
+    ok(client->retired_path_abandon != NULL);
+    ok(client->retired_path_abandon->path_id == QUICLY_LOCAL_ACTIVE_CONNECTION_ID_LIMIT);
+    ok(client->retired_path_abandon->error_code == QUICLY_PATH_ABANDON_ERROR_RESOURCE_LIMIT);
+    ok(client->retired_path_abandon->sender == QUICLY_SENDER_STATE_SEND);
 
     /* drop the first rejection and check retransmission through the actual sentmap callback */
     quicly_address_t dest, src;
@@ -5109,7 +5306,7 @@ static void test_multipath_resource_limit(void)
     uint64_t first_pn = client->path_spaces[0]->packet_number;
     ok(quicly_send(client, &dest, &src, datagrams, &num_datagrams, buf, sizeof(buf)) == 0);
     ok(num_datagrams != 0);
-    ok(client->rejected_path_abandon[QUICLY_LOCAL_ACTIVE_CONNECTION_ID_LIMIT] == QUICLY_SENDER_STATE_UNACKED);
+    ok(client->retired_path_abandon != NULL && client->retired_path_abandon->sender == QUICLY_SENDER_STATE_UNACKED);
     quicly_sentmap_iter_t iter;
     quicly_sentmap_t *map = &client->path_spaces[0]->loss.sentmap;
     quicly_sentmap_init_iter(map, &iter);
@@ -5121,15 +5318,16 @@ static void test_multipath_resource_limit(void)
             quicly_sentmap_skip(&iter);
         }
     }
-    ok(client->rejected_path_abandon[QUICLY_LOCAL_ACTIVE_CONNECTION_ID_LIMIT] == QUICLY_SENDER_STATE_SEND);
+    ok(client->retired_path_abandon != NULL && client->retired_path_abandon->sender == QUICLY_SENDER_STATE_SEND);
     exchange_until_idle(client, server);
-    ok(client->rejected_path_abandon[QUICLY_LOCAL_ACTIVE_CONNECTION_ID_LIMIT] == QUICLY_SENDER_STATE_ACKED);
-    ok(server->rejected_path_abandon[QUICLY_LOCAL_ACTIVE_CONNECTION_ID_LIMIT] == QUICLY_SENDER_STATE_ACKED);
+    ok(client->retired_path_abandon == NULL);
+    ok(server->retired_path_abandon == NULL);
+    ok(path_id_is_abandoned(server, QUICLY_LOCAL_ACTIVE_CONNECTION_ID_LIMIT));
     ok(client->super.stats.num_frames_sent.path_abandon >= 2);
     ok(quicly_get_state(client) == QUICLY_STATE_CONNECTED);
     ok(quicly_get_state(server) == QUICLY_STATE_CONNECTED);
     deliver_multipath_cid(server, client, 0, QUICLY_LOCAL_ACTIVE_CONNECTION_ID_LIMIT, 0, 0, token);
-    ok(client->rejected_path_abandon[QUICLY_LOCAL_ACTIVE_CONNECTION_ID_LIMIT] == QUICLY_SENDER_STATE_ACKED);
+    ok(client->retired_path_abandon == NULL);
     ok(find_path_space_by_id(client, QUICLY_LOCAL_ACTIVE_CONNECTION_ID_LIMIT) == NULL);
 
     /* exceeding the advertised limit is still a protocol error */
@@ -6384,7 +6582,7 @@ static void test_version_negotiation_restart(int reset_streams)
     static const uint32_t versions[] = {QUICLY_PROTOCOL_VERSION_1, 0};
     size_t len = quicly_send_version_negotiation(
         &ctx, ptls_iovec_init(client->super.local.long_header_src_cid.cid, client->super.local.long_header_src_cid.len),
-        ptls_iovec_init(client->super.remote.cid_set.cids[0].cid.cid, client->super.remote.cid_set.cids[0].cid.len), versions, buf);
+        ptls_iovec_init(client->path_spaces[0]->remote_cid_set.cids[0].cid.cid, client->path_spaces[0]->remote_cid_set.cids[0].cid.len), versions, buf);
     size_t off = 0;
     ok(quicly_decode_packet(&ctx, decoded, buf, len, &off) == len);
     ok(quicly_receive(client, NULL, &fake_address.sa, decoded) == 0);
@@ -6455,7 +6653,7 @@ static void test_version_negotiation_original_version_downgrade(void)
     /* inject spoofed VN offering only draft-29 while original version is v1 */
     size_t len = quicly_send_version_negotiation(
         &ctx, ptls_iovec_init(client->super.local.long_header_src_cid.cid, client->super.local.long_header_src_cid.len),
-        ptls_iovec_init(client->super.remote.cid_set.cids[0].cid.cid, client->super.remote.cid_set.cids[0].cid.len), vn_versions,
+        ptls_iovec_init(client->path_spaces[0]->remote_cid_set.cids[0].cid.cid, client->path_spaces[0]->remote_cid_set.cids[0].cid.len), vn_versions,
         buf);
     size_t off = 0;
     ok(quicly_decode_packet(&ctx, decoded, buf, len, &off) == len);
@@ -6506,7 +6704,7 @@ static void test_version_negotiation(void)
     vn_packet.cid.dest.encrypted =
         ptls_iovec_init(vn_conn->super.local.long_header_src_cid.cid, vn_conn->super.local.long_header_src_cid.len);
     vn_packet.cid.src =
-        ptls_iovec_init(vn_conn->super.remote.cid_set.cids[0].cid.cid, vn_conn->super.remote.cid_set.cids[0].cid.len);
+        ptls_iovec_init(vn_conn->path_spaces[0]->remote_cid_set.cids[0].cid.cid, vn_conn->path_spaces[0]->remote_cid_set.cids[0].cid.len);
     lock_now(vn_conn, 0);
 
     /* Both connection IDs must echo the client's Initial. */
@@ -6816,6 +7014,7 @@ int main(int argc, char **argv)
         subtest("multipath-lifecycle-cleanup", test_multipath_lifecycle_cleanup);
         subtest("multipath-abandon-retention", test_multipath_abandon_retention);
         subtest("multipath-abandon-late-ack", test_multipath_abandon_late_ack);
+        subtest("multipath-ack-frequency-after-abandon", test_multipath_ack_frequency_after_abandon);
         goto Exit;
     }
 
@@ -6866,6 +7065,7 @@ int main(int argc, char **argv)
     subtest("jumpstart", test_jumpstart);
     subtest("ack-for-unsent-pn", test_ack_for_unsent_pn);
     subtest("datagram-frame-amplification-limit", test_datagram_frame_amplification_limit);
+    subtest("datagram-frame-max-size", test_datagram_frame_max_size);
     subtest("frames-for-unopened-local-stream", test_frames_for_unopened_local_stream);
     subtest("frames-opening-peer-stream", test_frames_opening_peer_stream);
     subtest("ack-frequency", test_ack_frequency);
@@ -6887,6 +7087,7 @@ int main(int argc, char **argv)
     subtest("flexicast-receive-error", test_flexicast_receive_error);
 
     subtest("retransmit", test_retransmit);
+    subtest("send-resumption-token-without-generator", test_send_resumption_token_without_generator);
     subtest("retransmit-max-stream-data-lower-window", test_retransmit_max_stream_data_lower_window);
     subtest("stream-credit-growth", test_stream_credit_growth);
     subtest("data-credit-growth", test_data_credit_growth);
@@ -6918,6 +7119,7 @@ int main(int argc, char **argv)
     subtest("state-exhaustion", test_state_exhaustion);
     subtest("amplification-blocked-handshake-timeout", test_amplification_blocked_handshake_timeout);
     subtest("migration-during-handshake", test_migration_during_handshake);
+    subtest("pto-with-backup-path-probe", test_pto_with_backup_path_probe);
     subtest("multipath-negotiation-violation", test_multipath_negotiation_violation);
     subtest("multipath-status-violation", test_multipath_status_violation);
     subtest("multipath-negotiation-success", test_multipath_negotiation_success);
@@ -6929,6 +7131,7 @@ int main(int argc, char **argv)
     subtest("multipath-unused-space-close-timeout", test_multipath_unused_space_close_timeout);
     subtest("multipath-active-use", test_multipath_active_use);
     subtest("multipath-path-management", test_multipath_path_management);
+    subtest("multipath-ack-frequency-after-abandon", test_multipath_ack_frequency_after_abandon);
     subtest("multipath-abandoned-cids", test_multipath_abandoned_cids);
     subtest("multipath-resource-limit", test_multipath_resource_limit);
     subtest("multipath-disable-migration", test_multipath_disable_migration);

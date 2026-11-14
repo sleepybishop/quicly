@@ -3,6 +3,8 @@ static void test_bbr_native(void)
 {
     quicly_context_t saved = quic_ctx;
     int64_t saved_now = quic_now;
+    quic_ctx.transport_params.max_datagram_frame_size = UINT16_MAX;
+    quic_ctx.receive_datagram_frame = &receive_datagram_frame;
     quic_ctx.egress[0].cc.init_cc = &quicly_cc_bbr_init;
     quic_ctx.egress[0].cc.initcwnd_packets = 100;
     quic_ctx.egress[0].pacing = 1;
@@ -387,7 +389,7 @@ static void test_bbr_persistent_expiration(void)
             check_bbr_persistent_congestion(&ps);
             ok(ps.cc.state.bbr.persistent_pending == (scenario == 0));
         } else if (scenario < 4) {
-            /* Both handshake modes retain the newly detected loss batch for persistent-congestion tracking. */
+            /* the second cleanup pass while initial/handshake remain active must not erase a newly detected loss batch */
             for (uint64_t pn = 0; pn != 40; ++pn)
                 bbr_record_test_packet(&ps, pn, pn == 0 ? 0 : 1000 + pn, 1000, 0);
             conn.stash.now_double = 2000;
