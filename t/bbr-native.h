@@ -3,6 +3,8 @@ static void test_bbr_native(void)
 {
     quicly_context_t saved = quic_ctx;
     int64_t saved_now = quic_now;
+    quic_ctx.transport_params.max_datagram_frame_size = UINT16_MAX;
+    quic_ctx.receive_datagram_frame = &receive_datagram_frame;
     quic_ctx.egress[0].cc.init_cc = &quicly_cc_bbr_init;
     quic_ctx.egress[0].cc.initcwnd_packets = 100;
     quic_ctx.egress[0].pacing = 1;
