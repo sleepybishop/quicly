@@ -113,10 +113,21 @@ static void test_multipath_remote_cid(void)
     ok(set2.retired.count == 1);
     ok(set2.retired.cids[0] == 1);
     ok(set1.retired.count == 0);
+
+    /* retransmitted seq 0 after out-of-order retirement must be ignored, not rejected as CONNECTION_ID_LIMIT */
+    quicly_remote_cid_set_t set3;
+    quicly_remote_cid_init_set(&set3, NULL, quic_ctx.tls->random_bytes);
+    for (int i = 1; i < 4; i++)
+        ok(quicly_remote_cid_register(&set3, i, cids[i], CID_LEN, srts[i], 0) == 0);
+    ok(quicly_remote_cid_unregister(&set3, 0) == 0);
+    ok(quicly_remote_cid_unregister(&set3, 3) == 0);
+    ok(quicly_remote_cid_register(&set3, 4, cids[4], CID_LEN, srts[4], 0) == 0);
+    ok(quicly_remote_cid_register(&set3, 0, cids[0], CID_LEN, srts[0], 0) == 0);
 }
 
 void test_received_cid(void)
 {
+    PTLS_BUILD_ASSERT(QUICLY_LOCAL_ACTIVE_CONNECTION_ID_LIMIT >= 4);
     quicly_remote_cid_set_t set;
 
 #define TEST_SET(largest_expected, ...)                                                                                            \
@@ -151,12 +162,10 @@ void test_received_cid(void)
     subtest("multipath-remote-cid", test_multipath_remote_cid);
 
     quicly_remote_cid_init_set(&set, NULL, quic_ctx.tls->random_bytes);
+    /* keep this four-CID fixture independent of the configured storage capacity */
     set._largest_sequence_expected = 3;
-    {
-        size_t i;
-        for (i = 4; i < PTLS_ELEMENTSOF(set.cids); i++)
-            set.cids[i].sequence = UINT64_MAX;
-    }
+    for (size_t i = 4; i < PTLS_ELEMENTSOF(set.cids); ++i)
+        set.cids[i].sequence = UINT64_MAX;
 
     /* fill CIDs */
     for (int i = 1; i < 4; i++) {
@@ -188,9 +197,7 @@ void test_received_cid(void)
     ok(set.cids[1].state == QUICLY_REMOTE_CID_AVAILABLE && "we have CID to send error");
 
     /* ignore already retired CID */
-    set._largest_sequence_expected = 16;
     ok(quicly_remote_cid_register(&set, 0, cids[0], CID_LEN, srts[0], 0) == 0);
-    set._largest_sequence_expected = 4;
     TEST_RETIRED(0);
 
     /* register 5th CID */

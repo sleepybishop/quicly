@@ -347,8 +347,6 @@ static void test_ack_aggregation(void)
     quicly_flexicast_flow_free(source);
 }
 
-#include "flexicast-adaptive-regressions.inc"
-#include "flexicast-adaptive-context.inc"
 #include "flexicast-cc-trace.inc"
 
 static void test_builtin_controllers(void)
@@ -421,8 +419,6 @@ static void test_builtin_controllers(void)
     ok(output.rate_reduction_events == 2);
     ok(output.loss_reduction_events == 1 && output.timeout_reduction_events == 1);
     quicly_flexicast_cc_free(cc);
-
-    test_adaptive_regressions();
 }
 
 static void test_scalable_members(void)
@@ -491,31 +487,11 @@ static void test_scalable_members(void)
     }
     ok(all_ok && complete);
     quicly_flexicast_flow_free(flow);
-
-    /* adaptive controller uses dynamic capacity and hash-based lookup */
-    quicly_flexicast_cc_config_t cc_config = config.cc_config;
-    quicly_flexicast_cc_t *cc = NULL;
-    quicly_flexicast_cc_output_t output;
-    cc_config.maximum_members = member_count;
-    ok(quicly_flexicast_cc_create(&cc, &quicly_flexicast_cc_type_adaptive, &cc_config, 100) == 0);
-    for (size_t i = 0; i != member_count; ++i)
-        quicly_flexicast_cc_on_member_added(cc, first_member_id + i, 100);
-    quicly_flexicast_feedback_t feedback = {.member_id = first_member_id + member_count - 1,
-                                            .epoch = 1,
-                                            .acked_packets = 1,
-                                            .minimum_rtt_msec = 20,
-                                            .latest_rtt_msec = 20,
-                                            .smoothed_rtt_msec = 20,
-                                            .now = 120};
-    quicly_flexicast_cc_on_feedback(cc, &feedback);
-    quicly_flexicast_cc_get_output(cc, &output);
-    ok(output.limiting_member_id == feedback.member_id && output.reason == QUICLY_FLEXICAST_CC_REASON_ACK);
-    quicly_flexicast_cc_free(cc);
 }
 
 static void test_member_churn(void)
 {
-    quicly_flexicast_cc_type_t *types[] = {&quicly_flexicast_cc_type_multicast, &quicly_flexicast_cc_type_adaptive};
+    quicly_flexicast_cc_type_t *types[] = {&quicly_flexicast_cc_type_multicast};
     quicly_flexicast_cc_config_t config = {
         .maximum_members = 2, .startup_rate_bytes_per_second = 100000, .maximum_datagram_size = 1200};
     for (size_t t = 0; t != PTLS_ELEMENTSOF(types); ++t) {
@@ -562,7 +538,7 @@ static void test_member_churn(void)
 
 static void test_controller_boundaries(void)
 {
-    quicly_flexicast_cc_type_t *types[] = {&quicly_flexicast_cc_type_multicast, &quicly_flexicast_cc_type_adaptive};
+    quicly_flexicast_cc_type_t *types[] = {&quicly_flexicast_cc_type_multicast};
     for (size_t t = 0; t != PTLS_ELEMENTSOF(types); ++t) {
         quicly_flexicast_cc_config_t config = {.maximum_datagram_size = 1200, .startup_rate_bytes_per_second = UINT64_MAX};
         quicly_flexicast_cc_t *cc;
@@ -1046,6 +1022,171 @@ static void test_feedback_backpressure_and_ecn(void)
 
 #include "flexicast-provenance.inc"
 
+static void test_sparse_control_and_member_lifecycle(void)
+{
+    uint8_t secret[32] = {0x33}, packet[1300];
+    size_t size, acked, lost, completed, pending, num_ranges;
+    uint64_t pn, received_pn, history_lb, ecn_counts[3];
+    int64_t largest_at;
+    const quicly_range_t *ranges;
+    ptls_iovec_t payload;
+    quicly_flexicast_member_stats_t stats;
+
+    /* test receive state borrowing and history_lower_bound updates */
+    quicly_flexicast_flow_t *tx = create_flow_at(2000, secret, 50);
+    quicly_flexicast_flow_t *rx = create_flow_at(2000, secret, 50);
+    ok(quicly_flexicast_attach_at(tx, 1, 100) == QUICLY_FLEXICAST_OK);
+    ok(quicly_flexicast_get_receive_state(rx, &ranges, &num_ranges, &history_lb, &largest_at, ecn_counts) == QUICLY_FLEXICAST_OK);
+    ok(num_ranges == 0 && history_lb == 50 && largest_at == 0);
+    for (size_t i = 0; i != 132; ++i) {
+        regression_send(tx, packet, sizeof(packet), &size, &pn, 100 + (int64_t)i);
+        if (i % 2 == 0)
+            ok(quicly_flexicast_receive_datagram_ecn_at(rx, packet, size, &payload, &received_pn, 200 + (int64_t)i, 3) == 0);
+    }
+    ok(quicly_flexicast_get_receive_state(rx, &ranges, &num_ranges, &history_lb, &largest_at, ecn_counts) == QUICLY_FLEXICAST_OK);
+    ok(num_ranges == 66 && history_lb == 50 && largest_at == 330 && ecn_counts[2] == 66);
+    quicly_flexicast_ack_sent(rx);
+    ok(quicly_flexicast_get_receive_state(rx, &ranges, &num_ranges, &history_lb, &largest_at, ecn_counts) == QUICLY_FLEXICAST_OK);
+    ok(num_ranges == QUICLY_MAX_ACK_BLOCKS && history_lb == ranges[0].start && history_lb > 50);
+    quicly_flexicast_flow_free(rx);
+    quicly_flexicast_flow_free(tx);
+
+    /* test ack_frame_ex flags, deferred loss commit, and detach full-window cleanup */
+    quicly_flexicast_flow_t *flow = create_cc_flow(2001, secret);
+    ok(quicly_flexicast_attach_at(flow, 1, 100) == QUICLY_FLEXICAST_OK);
+    ok(quicly_flexicast_attach_at(flow, 2, 100) == QUICLY_FLEXICAST_OK);
+    for (int i = 0; i != 6; ++i)
+        regression_send(flow, packet, sizeof(packet), &size, &pn, 100 + i * 10);
+
+    quicly_ack_frame_t ack = {.largest_acknowledged = 5, .smallest_acknowledged = 5, .ack_block_lengths = {1}};
+    ok(quicly_flexicast_ack_frame_ex(flow, 1, &ack, &acked, &lost, &completed, 200, 0x80u) == QUICLY_FLEXICAST_ERROR_INVALID);
+    ok(quicly_flexicast_ack_frame_ex(flow, 1, &ack, &acked, &lost, &completed, 200,
+                                     QUICLY_FLEXICAST_ACK_OMIT_RTT | QUICLY_FLEXICAST_ACK_OMIT_DELIVERY_RATE |
+                                         QUICLY_FLEXICAST_ACK_DEFER_LOSS) == QUICLY_FLEXICAST_OK);
+    ok(acked == 1 && lost == 0 && completed == 0);
+    ok(quicly_flexicast_get_member_stats(flow, 1, &stats) == QUICLY_FLEXICAST_OK);
+    ok(stats.latest_rtt_msec == 0 && test_last_feedback.latest_rtt_msec == 0 && test_last_feedback.delivery_rate_sample_epoch == 0);
+
+    /* commit loss only from pn 1..2, leaving pn 0 unresolved below coverage */
+    ok(quicly_flexicast_commit_ack_loss(flow, 1, 1, 5, &lost, &completed, 205) == QUICLY_FLEXICAST_OK);
+    ok(lost == 2 && completed == 0);
+    ok(quicly_flexicast_ack(flow, 2, 0, &(int){0}) == QUICLY_FLEXICAST_OK);
+    ok(quicly_flexicast_get_pending_members(flow, 0, &pending) == QUICLY_FLEXICAST_OK && pending == 1);
+    ok(quicly_flexicast_detach_at(flow, 1, 206) == QUICLY_FLEXICAST_OK);
+    ok(quicly_flexicast_get_pending_members(flow, 0, &pending) == QUICLY_FLEXICAST_ERROR_NOT_FOUND);
+
+    /* test suspend, resume, reset_member_path, and note_member_feedback_at */
+    regression_ack(flow, 2, 5, 5, 0, 210);
+    ok(quicly_flexicast_get_member_stats(flow, 2, &stats) == QUICLY_FLEXICAST_OK && stats.latest_rtt_msec > 0);
+    uint64_t epoch_before = stats.feedback_epoch;
+    ok(quicly_flexicast_note_member_feedback_at(flow, 2, 210) == QUICLY_FLEXICAST_OK);
+    ok(quicly_flexicast_get_member_stats(flow, 2, &stats) == QUICLY_FLEXICAST_OK && stats.feedback_epoch == epoch_before);
+    ok(quicly_flexicast_note_member_feedback_at(flow, 2, 220) == QUICLY_FLEXICAST_OK);
+    ok(quicly_flexicast_get_member_stats(flow, 2, &stats) == QUICLY_FLEXICAST_OK);
+    ok(stats.feedback_epoch == epoch_before + 1 && stats.last_feedback_at == 220 && test_last_feedback.acked_packets == 0);
+
+    regression_send(flow, packet, sizeof(packet), &size, &pn, 225); /* pn 6 sent before suspend/reset */
+    ok(quicly_flexicast_suspend_at(flow, 2, 230) == QUICLY_FLEXICAST_OK);
+    ok(quicly_flexicast_num_members(flow) == 0);
+    ok(quicly_flexicast_note_member_feedback_at(flow, 2, 235) == QUICLY_FLEXICAST_ERROR_NOT_FOUND);
+    ack = (quicly_ack_frame_t){.largest_acknowledged = 4, .smallest_acknowledged = 4, .ack_block_lengths = {1}};
+    ok(quicly_flexicast_ack_frame_at(flow, 2, &ack, &acked, &lost, &completed, 235) == QUICLY_FLEXICAST_ERROR_NOT_FOUND);
+    ok(quicly_flexicast_ack_frame_ex(flow, 2, &ack, &acked, &lost, &completed, 235, QUICLY_FLEXICAST_ACK_DEFER_LOSS) ==
+       QUICLY_FLEXICAST_OK);
+    ok(acked == 1);
+
+    /* resume resets path baselines and suppresses old-route samples below path_sample_floor */
+    ok(quicly_flexicast_resume_at(flow, 2, 240) == QUICLY_FLEXICAST_OK);
+    ok(quicly_flexicast_num_members(flow) == 1);
+    ok(quicly_flexicast_get_member_stats(flow, 2, &stats) == QUICLY_FLEXICAST_OK && stats.latest_rtt_msec == 0);
+    regression_ack(flow, 2, 6, 6, 0, 250);
+    ok(quicly_flexicast_get_member_stats(flow, 2, &stats) == QUICLY_FLEXICAST_OK);
+    ok(stats.latest_rtt_msec == 0 && test_last_feedback.latest_rtt_msec == 0);
+    regression_send(flow, packet, sizeof(packet), &size, &pn, 260); /* pn 7 on new route */
+    regression_ack(flow, 2, 7, 7, 0, 275);
+    ok(quicly_flexicast_get_member_stats(flow, 2, &stats) == QUICLY_FLEXICAST_OK && stats.latest_rtt_msec == 15);
+
+    quicly_flexicast_flow_free(flow);
+}
+
+static void test_sparse_control_regressions(void)
+{
+    uint8_t secret[32] = {0x44}, packet[1300];
+    size_t size, acked, lost, completed, pending;
+    uint64_t pn;
+    quicly_flexicast_member_stats_t stats;
+    quicly_flexicast_send_context_t ctx = provenance_context(500000, 1, 0);
+
+    /* deferred loss + commit_ack_loss preserves in-progress delivery-rate buckets */
+    quicly_flexicast_flow_t *flow = create_cc_flow(2002, secret);
+    ok(quicly_flexicast_attach_at(flow, 1, 100) == QUICLY_FLEXICAST_OK);
+    for (int step = 0; step != 3; ++step) {
+        for (int j = 0; j != 4; ++j)
+            provenance_send(flow, 100 + step * 50 + j * 5, &ctx, &size);
+        uint64_t first = (uint64_t)step * 4, last = first + 3;
+        quicly_ack_frame_t ack = {.largest_acknowledged = last, .smallest_acknowledged = first, .ack_block_lengths = {4}};
+        ok(quicly_flexicast_ack_frame_ex(flow, 1, &ack, &acked, &lost, &completed, 130 + step * 50,
+                                         QUICLY_FLEXICAST_ACK_DEFER_LOSS) == QUICLY_FLEXICAST_OK);
+        /* duplicate OMIT_DELIVERY_RATE frame does not wipe the active bucket */
+        ok(quicly_flexicast_ack_frame_ex(flow, 1, &ack, &acked, &lost, &completed, 131 + step * 50,
+                                         QUICLY_FLEXICAST_ACK_OMIT_DELIVERY_RATE | QUICLY_FLEXICAST_ACK_DEFER_LOSS) ==
+           QUICLY_FLEXICAST_OK);
+        ok(quicly_flexicast_commit_ack_loss(flow, 1, 0, last, &lost, &completed, 132 + step * 50) == QUICLY_FLEXICAST_OK);
+        ok(lost == 0);
+    }
+    ok(quicly_flexicast_get_member_stats(flow, 1, &stats) == QUICLY_FLEXICAST_OK);
+    ok(stats.delivery_rate_bytes_per_second > 0 && test_last_feedback.delivery_rate_sample_epoch == 1);
+
+    /* reset_member_path hides stale sample epochs until fresh samples complete and isolates old-route packets */
+    uint64_t old_rate_epoch = test_last_feedback.delivery_rate_sample_epoch;
+    uint64_t old_rtt_epoch = test_last_feedback.rtt_sample_epoch;
+    uint64_t old_pn_lost = provenance_send(flow, 300, &ctx, &size); /* pn 12: lost on old route */
+    uint64_t old_pn_late = provenance_send(flow, 305, &ctx, &size); /* pn 13: delayed on old route */
+    ok(quicly_flexicast_reset_member_path(flow, 1, 310) == QUICLY_FLEXICAST_OK);
+
+    /* untracked new-route packet before bucket completion reports zero rate/RTT sample epochs */
+    uint64_t new_pn0 = provenance_send(flow, 320, &ctx, &size); /* pn 14 */
+    ok(quicly_flexicast_mark_submitted(flow, 0, new_pn0, 0) == QUICLY_FLEXICAST_OK);
+    regression_ack(flow, 1, new_pn0, new_pn0, 0, 330);
+    ok(test_last_feedback.delivery_rate_sample_epoch == 0 && test_last_feedback.rtt_sample_epoch == 0);
+
+    /* establish clean new-route clock (retiring old_pn_lost without CC loss) and span ACK across old_pn_late + new_pn2 */
+    uint64_t new_pn1 = provenance_send(flow, 340, &ctx, &size); /* pn 15 retires pn 12 */
+    quicly_ack_frame_t ack1 = {.largest_acknowledged = new_pn1, .smallest_acknowledged = new_pn1, .ack_block_lengths = {1}};
+    ok(quicly_flexicast_ack_frame_at(flow, 1, &ack1, &acked, &lost, &completed, 350) == QUICLY_FLEXICAST_OK);
+    ok(acked == 1 && lost == 1 && test_last_feedback.lost_packets == 0);
+    ok(quicly_flexicast_get_pending_members(flow, old_pn_lost, &pending) == QUICLY_FLEXICAST_ERROR_NOT_FOUND);
+    ok(test_last_feedback.rtt_sample_epoch == old_rtt_epoch + 1);
+    uint64_t new_pn2 = provenance_send(flow, 360, &ctx, &size); /* pn 16 */
+    quicly_ack_frame_t span = {
+        .largest_acknowledged = new_pn2, .smallest_acknowledged = old_pn_late, .ack_block_lengths = {new_pn2 - old_pn_late + 1}};
+    ok(quicly_flexicast_ack_frame_at(flow, 1, &span, &acked, &lost, &completed, 370) == QUICLY_FLEXICAST_OK);
+    ok(acked == 2 && lost == 0 && test_last_feedback.delivery_rate_sample_epoch == old_rate_epoch + 1);
+
+    uint64_t new_pn3 = provenance_send(flow, 380, &ctx, &size); /* pn 17 closes the [350..370] bucket */
+    regression_ack(flow, 1, new_pn3, new_pn3, 0, 390);
+    ok(test_last_feedback.delivery_rate_sample_epoch == old_rate_epoch + 2);
+    ok(test_last_feedback.delivery_sample_bytes == size);
+    ok(test_last_feedback.delivery_sample_sent_at_start == 340);
+    ok((test_last_feedback.delivery_sample_flags & QUICLY_FLEXICAST_SAMPLE_VALID) != 0);
+    quicly_flexicast_flow_free(flow);
+
+    /* suspend_at followed by attach_at preserves loss_cursor so pre-suspend packets retire cleanly */
+    flow = create_cc_flow(2003, secret);
+    ok(quicly_flexicast_attach_at(flow, 1, 100) == QUICLY_FLEXICAST_OK);
+    ok(quicly_flexicast_attach_at(flow, 2, 100) == QUICLY_FLEXICAST_OK);
+    regression_send(flow, packet, sizeof(packet), &size, &pn, 100); /* pn 0 pending on 1 and 2 */
+    ok(quicly_flexicast_ack(flow, 2, 0, &(int){0}) == QUICLY_FLEXICAST_OK);
+    ok(quicly_flexicast_suspend_at(flow, 1, 110) == QUICLY_FLEXICAST_OK);
+    for (int i = 0; i != 3; ++i)
+        regression_send(flow, packet, sizeof(packet), &size, &pn, 120 + i);
+    ok(quicly_flexicast_attach_at(flow, 1, 130) == QUICLY_FLEXICAST_OK);
+    regression_send(flow, packet, sizeof(packet), &size, &pn, 140); /* pn 4 */
+    regression_ack(flow, 1, 4, 4, 0, 150);
+    ok(quicly_flexicast_get_pending_members(flow, 0, &pending) == QUICLY_FLEXICAST_ERROR_NOT_FOUND);
+    quicly_flexicast_flow_free(flow);
+}
+
 void test_flexicast(void)
 {
     static const uint64_t flow_id = UINT64_C(0x1020304050607080);
@@ -1061,7 +1202,6 @@ void test_flexicast(void)
     test_congestion_feedback();
     test_ack_aggregation();
     test_builtin_controllers();
-    test_adaptive_context();
     test_cc_trace();
     test_scalable_members();
     test_member_churn();
@@ -1078,6 +1218,8 @@ void test_flexicast(void)
     test_submission_timestamp_bound();
     test_feedback_backpressure_and_ecn();
     test_feedback_provenance();
+    test_sparse_control_and_member_lifecycle();
+    test_sparse_control_regressions();
 
     memset(secret, 0x5a, ptls_openssl_aes128gcmsha256.hash->digest_size);
     memset(wrong_secret, 0xa5, ptls_openssl_aes128gcmsha256.hash->digest_size);

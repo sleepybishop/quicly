@@ -375,7 +375,7 @@ static quicly_error_t default_stream_scheduler_do_send(quicly_stream_scheduler_t
         if (quicly_stream_can_send(stream, 1))
             link_stream(sched, stream, conn_is_blocked);
 
-        /* on_send_emit can reset other streams and unlink their nodes, so restart from the stable list head. */
+        /* restart from head as on_send_emit may unlink other streams */
         node = sched->active.next;
     }
 

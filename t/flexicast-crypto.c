@@ -172,12 +172,16 @@ static void test_crypto_limit_configuration(void)
         config.traffic_secret.len = suites[i]->hash->digest_size;
         config.max_packets_per_key = UINT64_C(1) << 23;
         config.max_authentication_failures = UINT64_C(1) << 52;
+        config.max_decryption_attempts = UINT64_C(1) << 52;
         ok(quicly_flexicast_flow_create(&flow, &config) == QUICLY_FLEXICAST_OK);
         quicly_flexicast_flow_free(flow);
         ++config.max_packets_per_key;
         ok(quicly_flexicast_flow_create(&flow, &config) == QUICLY_FLEXICAST_ERROR_INVALID);
         --config.max_packets_per_key;
         ++config.max_authentication_failures;
+        ok(quicly_flexicast_flow_create(&flow, &config) == QUICLY_FLEXICAST_ERROR_INVALID);
+        --config.max_authentication_failures;
+        ++config.max_decryption_attempts;
         ok(quicly_flexicast_flow_create(&flow, &config) == QUICLY_FLEXICAST_ERROR_INVALID);
     }
 #if PTLS_OPENSSL_HAVE_CHACHA20_POLY1305
@@ -273,6 +277,74 @@ static void test_rekey_setup_failure(void)
     quicly_flexicast_flow_free(flow);
 }
 
+static void test_decryption_budget_and_receive_floor(void)
+{
+    uint8_t secrets[2][32] = {{11}, {22}}, packet[128], copy[128], data[16] = {0};
+    quicly_flexicast_config_t tx_cfg = crypto_config(secrets[0]);
+    quicly_flexicast_config_t rx_cfg = crypto_config(secrets[0]);
+    quicly_flexicast_flow_t *tx, *rx;
+    quicly_flexicast_crypto_usage_t usage;
+    const quicly_range_t *ranges;
+    size_t size, num_ranges;
+    uint64_t pn, received_pn, floor_bound, ecn_counts[3];
+    int64_t largest_at;
+    ptls_iovec_t received;
+
+    tx_cfg.first_packet_number = 70000;
+    rx_cfg.first_packet_number = 10;
+    rx_cfg.max_decryption_attempts = 4;
+    rx_cfg.max_authentication_failures = 4;
+    ok(quicly_flexicast_flow_create(&tx, &tx_cfg) == QUICLY_FLEXICAST_OK);
+    ok(quicly_flexicast_flow_create(&rx, &rx_cfg) == QUICLY_FLEXICAST_OK);
+    ok(quicly_flexicast_attach(tx, 1) == QUICLY_FLEXICAST_OK);
+
+    ok(quicly_flexicast_get_crypto_usage(NULL, &usage) == QUICLY_FLEXICAST_ERROR_INVALID);
+    ok(quicly_flexicast_get_crypto_usage(rx, NULL) == QUICLY_FLEXICAST_ERROR_INVALID);
+    ok(quicly_flexicast_get_crypto_usage(rx, &usage) == QUICLY_FLEXICAST_OK);
+    ok(usage.decryption_attempts == 0 && usage.max_decryption_attempts == 4);
+    ok(quicly_flexicast_set_decryption_attempts(rx, 1) == QUICLY_FLEXICAST_OK);
+    ok(quicly_flexicast_set_decryption_attempts(rx, 0) == QUICLY_FLEXICAST_ERROR_INVALID);
+    ok(quicly_flexicast_set_decryption_attempts(rx, 5) == QUICLY_FLEXICAST_ERROR_INVALID);
+
+    /* validate and install receive floor across a 16-bit PN boundary */
+    ok(quicly_flexicast_check_receive_floor(rx, 9) == QUICLY_FLEXICAST_ERROR_INVALID);
+    ok(quicly_flexicast_check_receive_floor(rx, PTLS_QUICINT_MAX + 1) == QUICLY_FLEXICAST_ERROR_INVALID);
+    ok(quicly_flexicast_install_receive_floor(rx, 70001) == QUICLY_FLEXICAST_OK);
+    ok(quicly_flexicast_check_receive_floor(rx, 70000) == QUICLY_FLEXICAST_ERROR_INVALID);
+    ok(quicly_flexicast_get_receive_state(rx, &ranges, &num_ranges, &floor_bound, &largest_at, ecn_counts) == QUICLY_FLEXICAST_OK);
+    ok(num_ranges == 0 && floor_bound == 70001);
+    ok(quicly_flexicast_flow_rekey(rx, ptls_iovec_init(secrets[1], 32), 70000, 1) == QUICLY_FLEXICAST_ERROR_INVALID);
+
+    /* packet 70000 is below floor: decrypted and replay-rejected while charging attempts */
+    ok(quicly_flexicast_send_datagram(tx, ptls_iovec_init(data, sizeof(data)), packet, sizeof(packet), &size, &pn) ==
+       QUICLY_FLEXICAST_OK);
+    ok(pn == 70000);
+    memcpy(copy, packet, size);
+    ok(quicly_flexicast_receive_datagram(rx, copy, size, &received, &received_pn) == QUICLY_FLEXICAST_ERROR_REPLAY);
+    ok(quicly_flexicast_get_crypto_usage(rx, &usage) == QUICLY_FLEXICAST_OK && usage.decryption_attempts == 2);
+
+    /* packet 70001 succeeds and locks out further floor installation */
+    ok(quicly_flexicast_send_datagram(tx, ptls_iovec_init(data, sizeof(data)), packet, sizeof(packet), &size, &pn) ==
+       QUICLY_FLEXICAST_OK);
+    memcpy(copy, packet, size);
+    ok(quicly_flexicast_receive_datagram(rx, copy, size, &received, &received_pn) == QUICLY_FLEXICAST_OK && received_pn == 70001);
+    ok(quicly_flexicast_install_receive_floor(rx, 70002) == QUICLY_FLEXICAST_ERROR_INVALID);
+
+    /* replay of 70001 consumes the 4th and final decryption attempt for secrets[0] */
+    memcpy(copy, packet, size);
+    ok(quicly_flexicast_receive_datagram(rx, copy, size, &received, &received_pn) == QUICLY_FLEXICAST_ERROR_REPLAY);
+    memcpy(copy, packet, size);
+    ok(quicly_flexicast_receive_datagram(rx, copy, size, &received, &received_pn) == QUICLY_FLEXICAST_ERROR_AEAD_LIMIT_REACHED);
+
+    /* rekeying to a fresh secret works, while reinstalling exhausted secrets[0] is rejected */
+    ok(quicly_flexicast_flow_rekey(rx, ptls_iovec_init(secrets[1], 32), 70002, 2) == QUICLY_FLEXICAST_OK);
+    ok(quicly_flexicast_get_crypto_usage(rx, &usage) == QUICLY_FLEXICAST_OK && usage.decryption_attempts == 0);
+    ok(quicly_flexicast_flow_rekey(rx, ptls_iovec_init(secrets[0], 32), 70003, 3) == QUICLY_FLEXICAST_ERROR_AEAD_LIMIT_REACHED);
+
+    quicly_flexicast_flow_free(rx);
+    quicly_flexicast_flow_free(tx);
+}
+
 void test_flexicast_crypto(void)
 {
     test_encryption_budget_history();
@@ -281,4 +353,5 @@ void test_flexicast_crypto(void)
     test_authenticated_epoch_floor();
     test_crypto_limit_configuration();
     test_rekey_setup_failure();
+    test_decryption_budget_and_receive_floor();
 }

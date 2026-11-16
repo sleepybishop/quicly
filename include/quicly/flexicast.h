@@ -60,6 +60,8 @@ typedef struct st_quicly_flexicast_config_t {
     uint64_t max_authentication_failures;
     /* maximum outgoing protected UDP payload in [1200, 65507]; zero selects 1200 */
     size_t max_packet_size;
+    /* counts every ingress AEAD call including successes and replays; zero selects suite integrity limit */
+    uint64_t max_decryption_attempts;
 } quicly_flexicast_config_t;
 
 typedef struct st_quicly_flexicast_member_stats_t {
@@ -78,6 +80,20 @@ typedef struct st_quicly_flexicast_member_stats_t {
     uint32_t smoothed_rtt_msec;
     int64_t last_feedback_at;
 } quicly_flexicast_member_stats_t;
+
+typedef struct st_quicly_flexicast_crypto_usage_t {
+    uint64_t encrypted_packets, max_packets_per_key;
+    uint64_t decryption_attempts, max_decryption_attempts;
+    /* cumulative failure count across the entire flow */
+    uint64_t authentication_failures, max_authentication_failures;
+} quicly_flexicast_crypto_usage_t;
+/* current key encryption/decryption usage plus flow-wide failed checks */
+int quicly_flexicast_get_crypto_usage(const quicly_flexicast_flow_t *flow, quicly_flexicast_crypto_usage_t *usage);
+/* advances decryption attempt count for inspection, testing, or bootstrap */
+int quicly_flexicast_set_decryption_attempts(quicly_flexicast_flow_t *flow, uint64_t attempts);
+/* exclusive DATA lower bound before any DATA receive in this key epoch; never resets AEAD usage */
+int quicly_flexicast_check_receive_floor(const quicly_flexicast_flow_t *flow, uint64_t next_unallocated);
+int quicly_flexicast_install_receive_floor(quicly_flexicast_flow_t *flow, uint64_t next_unallocated);
 
 int quicly_flexicast_flow_create(quicly_flexicast_flow_t **flow, const quicly_flexicast_config_t *config);
 /* replaces traffic keys and advances the packet-number epoch while retaining CC and member stats */
@@ -143,6 +159,25 @@ int quicly_flexicast_send_pending_ack(quicly_flexicast_flow_t *flow, quicly_conn
 int quicly_flexicast_encode_pending_ack(quicly_flexicast_flow_t *flow, uint8_t *dst, size_t capacity, int64_t now,
                                         size_t *encoded_size);
 void quicly_flexicast_ack_sent(quicly_flexicast_flow_t *flow);
+
+/* local sparse-control helpers that do not alter wire encodings */
+#define QUICLY_FLEXICAST_ACK_OMIT_RTT 1u
+#define QUICLY_FLEXICAST_ACK_OMIT_DELIVERY_RATE 2u
+#define QUICLY_FLEXICAST_ACK_DEFER_LOSS 4u
+/* caller verifies origin, session, epoch, and complete-snapshot coverage */
+int quicly_flexicast_ack_frame_ex(quicly_flexicast_flow_t *flow, uint64_t member_id, const quicly_ack_frame_t *frame,
+                                  size_t *num_acked, size_t *num_lost, size_t *num_completed, int64_t now, unsigned flags);
+/* commits loss within inclusive bounds after all positive snapshot ranges are applied */
+int quicly_flexicast_commit_ack_loss(quicly_flexicast_flow_t *flow, uint64_t member_id, uint64_t coverage_lower_bound,
+                                     uint64_t largest_received, size_t *num_lost, size_t *num_completed, int64_t now);
+int quicly_flexicast_suspend_at(quicly_flexicast_flow_t *flow, uint64_t member_id, int64_t now);
+int quicly_flexicast_resume_at(quicly_flexicast_flow_t *flow, uint64_t member_id, int64_t now);
+int quicly_flexicast_reset_member_path(quicly_flexicast_flow_t *flow, uint64_t member_id, int64_t now);
+/* refreshes active member liveness without packet credit or new rate/RTT samples */
+int quicly_flexicast_note_member_feedback_at(quicly_flexicast_flow_t *flow, uint64_t member_id, int64_t now);
+/* borrows receive ranges until the next mutating flow operation without consuming ACK state */
+int quicly_flexicast_get_receive_state(const quicly_flexicast_flow_t *flow, const quicly_range_t **ranges, size_t *num_ranges,
+                                       uint64_t *history_lower_bound, int64_t *largest_received_at, uint64_t ecn_counts[3]);
 
 /* records single-packet feedback from a member and retires older packets past the loss threshold */
 int quicly_flexicast_ack(quicly_flexicast_flow_t *flow, uint64_t member_id, uint64_t packet_number, int *complete);

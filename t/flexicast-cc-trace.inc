@@ -40,7 +40,7 @@ static void test_cc_trace(void)
         .startup_rate_bytes_per_second = 100000, .minimum_rate_bytes_per_second = 2000,
         .maximum_rate_bytes_per_second = 1000000, .maximum_datagram_size = 1200,
         .feedback_timeout_msec = 1000};
-    quicly_flexicast_cc_type_t *types[] = {&quicly_flexicast_cc_type_adaptive, &quicly_flexicast_cc_type_multicast};
+    quicly_flexicast_cc_type_t *types[] = {&quicly_flexicast_cc_type_multicast};
     for (size_t type = 0; type != sizeof(types) / sizeof(types[0]); ++type) {
         quicly_flexicast_cc_t *plain = NULL, *traced = NULL;
         quicly_flexicast_cc_output_t plain_output, traced_output;
@@ -64,7 +64,7 @@ static void test_cc_trace(void)
         for (size_t i = 0; i != 3; ++i) {
             ok(events[i].sequence == 42 + i);
             ok(events[i].now == 100 + (int64_t)(41 + i) * 1000);
-            ok(events[i].state_before.available == (type == 0));
+            ok(events[i].state_before.available == 0);
         }
         ok(events[0].type == QUICLY_FLEXICAST_CC_TRACE_MEMBER_REMOVED);
         ok(events[1].type == QUICLY_FLEXICAST_CC_TRACE_MEMBER_ADDED);
@@ -76,12 +76,6 @@ static void test_cc_trace(void)
         ok(events[0].type == QUICLY_FLEXICAST_CC_TRACE_FEEDBACK && events[0].feedback.epoch == 45);
         ok(events[1].type == QUICLY_FLEXICAST_CC_TRACE_TIMEOUT);
         ok(events[2].type == QUICLY_FLEXICAST_CC_TRACE_EPOCH_RESET);
-        if (type == 0) {
-            ok(events[0].state_after.growth_blocked_until > events[0].now);
-            ok(events[0].rate_before == events[0].rate_after && events[0].reason == QUICLY_FLEXICAST_CC_REASON_RTT);
-            ok(events[0].state_after.last_delivery_sample_epoch == 45);
-            ok(events[2].state_before.last_delivery_sample_epoch == 0); /* reset has no selected member */
-        }
         ok(quicly_flexicast_cc_read_trace(traced, events, 7, &overwritten) == 0 && overwritten == 41);
         quicly_flexicast_cc_disable_trace(traced);
         trace_test_event(plain, 48);

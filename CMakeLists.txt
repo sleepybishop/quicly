@@ -96,8 +96,7 @@ IF (BUILD_FLEXICAST)
     SET(FLEXICAST_LIBRARY_FILES
         lib/flexicast.c
         lib/flexicast_cc.c
-        lib/flexicast_cc_multicast.c
-        lib/flexicast_cc_adaptive.c)
+        lib/flexicast_cc_multicast.c)
     LIST(APPEND UNITTEST_SOURCE_FILES
         t/flexicast.c
         t/flexicast-cc-regression.c

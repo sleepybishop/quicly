@@ -67,7 +67,7 @@ static uint8_t *encode_ack_frame_core(uint8_t *dst, uint8_t *dst_end, uint8_t fr
         for (size_t i = 0; i < 3; ++i)
             p = quicly_encodev(p, ecn_counts[i]);
         size_t len = p - buf;
-        if (dst_end - dst < len)
+        if ((size_t)(dst_end - dst) < len)
             return NULL;
         memcpy(dst, buf, len);
         dst += len;
@@ -151,6 +151,14 @@ quicly_error_t quicly_decode_ack_frame(const uint8_t **src, const uint8_t *end, 
     return 0;
 Error:
     return QUICLY_TRANSPORT_ERROR_FRAME_ENCODING;
+}
+
+quicly_error_t quicly_decode_path_ack_frame(const uint8_t **src, const uint8_t *end, uint64_t *path_id, quicly_ack_frame_t *frame,
+                                            int is_ack_ecn)
+{
+    if ((*path_id = quicly_decodev(src, end)) == UINT64_MAX)
+        return QUICLY_TRANSPORT_ERROR_FRAME_ENCODING;
+    return quicly_decode_ack_frame(src, end, frame, is_ack_ecn);
 }
 
 static size_t encode_close_frame(uint8_t *const base, uint64_t error_code, uint64_t offending_frame_type, const char *reason_phrase)

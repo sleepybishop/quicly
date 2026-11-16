@@ -98,132 +98,6 @@ static void test_multicast_feedback_epochs(void)
     quicly_flexicast_cc_free(cc);
 }
 
-static void test_adaptive_rate_limit(void)
-{
-    quicly_flexicast_cc_config_t config = regression_config();
-    quicly_flexicast_cc_t *cc;
-    quicly_flexicast_cc_output_t output;
-    ok(quicly_flexicast_cc_create(&cc, &quicly_flexicast_cc_type_adaptive, &config, 100) == 0);
-    quicly_flexicast_cc_on_member_added(cc, 1, 100);
-    quicly_flexicast_cc_hints_t hints = {.aggregate_rate_limit_bytes_per_second = 12000};
-    quicly_flexicast_cc_set_hints(cc, &hints, 100);
-    quicly_flexicast_feedback_t feedback = {.member_id = 1, .epoch = 1, .acked_packets = 1, .now = 200};
-    quicly_flexicast_cc_on_feedback(cc, &feedback);
-    quicly_flexicast_cc_get_output(cc, &output);
-    ok(output.rate_bytes_per_second == 12000);
-    ok(output.rate_limit_reduction_events == 1 && output.ack_growth_events == 0);
-    int bounded = 1;
-    for (unsigned i = 0; i != 24; ++i) {
-        quicly_flexicast_cc_on_timeout(cc, output.next_timeout);
-        quicly_flexicast_cc_get_output(cc, &output);
-        bounded &= output.rate_bytes_per_second <= 12000;
-    }
-    ok(bounded); /* floor recovery also honors the ongoing aggregate ceiling */
-    quicly_flexicast_cc_free(cc);
-}
-
-static void test_adaptive_hint_epochs(void)
-{
-    quicly_flexicast_cc_config_t config = regression_config();
-    quicly_flexicast_cc_t *cc;
-    quicly_flexicast_cc_output_t output;
-    ok(quicly_flexicast_cc_create(&cc, &quicly_flexicast_cc_type_adaptive, &config, 100) == 0);
-    quicly_flexicast_cc_on_member_added(cc, 1, 100);
-    quicly_flexicast_feedback_t feedback = {.member_id = 1, .epoch = 1, .acked_packets = 1, .now = 110};
-    quicly_flexicast_cc_on_feedback(cc, &feedback);
-    quicly_flexicast_cc_hints_t hints = {
-        .aggregate_rate_limit_bytes_per_second = 10000, .external_load_epoch = 10, .external_load_queued_bytes = 4800};
-    quicly_flexicast_cc_set_hints(cc, &hints, 120);
-    quicly_flexicast_cc_get_output(cc, &output);
-    ok(output.rate_bytes_per_second == 10000);
-    hints.aggregate_rate_limit_bytes_per_second = 0;
-    quicly_flexicast_cc_set_hints(cc, &hints, 121);
-    quicly_flexicast_cc_get_output(cc, &output);
-    ok(output.rate_bytes_per_second == 10000); /* the same measurement cannot trigger another recovery increase */
-    hints.external_load_epoch = 11;
-    quicly_flexicast_cc_set_hints(cc, &hints, 122);
-    quicly_flexicast_cc_get_output(cc, &output);
-    ok(output.rate_bytes_per_second == 10000);
-    /* older clean measurements do not clear the current load episode */
-    for (uint64_t epoch = 1; epoch != 4; ++epoch) {
-        hints = (quicly_flexicast_cc_hints_t){.external_load_epoch = epoch};
-        quicly_flexicast_cc_set_hints(cc, &hints, 130 + (int64_t)epoch);
-    }
-    feedback.epoch = 2;
-    feedback.delivery_rate_bytes_per_second = 10000;
-    feedback.now = 200;
-    quicly_flexicast_cc_on_feedback(cc, &feedback);
-    quicly_flexicast_cc_get_output(cc, &output);
-    ok(output.rate_bytes_per_second == 10000);
-    ok((output.reason & QUICLY_FLEXICAST_CC_REASON_GROWTH_FROZEN) != 0);
-    for (uint64_t epoch = 12; epoch != 15; ++epoch) {
-        hints = (quicly_flexicast_cc_hints_t){.external_load_epoch = epoch};
-        quicly_flexicast_cc_set_hints(cc, &hints, 210 + (int64_t)epoch);
-    }
-    feedback.epoch = 3;
-    feedback.now = 250;
-    quicly_flexicast_cc_on_feedback(cc, &feedback);
-    quicly_flexicast_cc_get_output(cc, &output);
-    ok(output.rate_bytes_per_second > 10000);
-    quicly_flexicast_cc_free(cc);
-}
-
-static void test_adaptive_sender_growth(void)
-{
-    const struct {
-        uint32_t active_senders;
-        uint64_t increase[2];
-    } cases[] = {{0, {125000, 125000000}},
-                 {1, {125000, 125000000}},
-                 {4, {62500, 62500000}},
-                 {9, {41666, 41666666}},
-                 {16, {31250, 31250000}},
-                 {18446744, {1200, 29103}},
-                 {18446745, {1200, 29103}},
-                 {UINT32_MAX, {1200, 1907}}};
-    const uint64_t rates[] = {1000000, 1000000000};
-
-    /* exercise both the datagram floor and proportional growth around the old scaled-sender overflow */
-    for (size_t i = 0; i != PTLS_ELEMENTSOF(cases); ++i) {
-        for (size_t j = 0; j != PTLS_ELEMENTSOF(rates); ++j) {
-            quicly_flexicast_cc_config_t config = regression_config();
-            quicly_flexicast_cc_t *cc;
-            quicly_flexicast_cc_output_t output;
-            config.startup_rate_bytes_per_second = rates[j];
-            config.maximum_rate_bytes_per_second = 0;
-            ok(quicly_flexicast_cc_create(&cc, &quicly_flexicast_cc_type_adaptive, &config, 0) == 0);
-            quicly_flexicast_cc_on_member_added(cc, 1, 0);
-            quicly_flexicast_cc_hints_t hints = {.active_senders = cases[i].active_senders};
-            quicly_flexicast_cc_set_hints(cc, &hints, 0);
-            quicly_flexicast_feedback_t feedback = {.member_id = 1, .epoch = 1, .acked_packets = 1, .now = 100};
-            quicly_flexicast_cc_on_feedback(cc, &feedback);
-            quicly_flexicast_cc_get_output(cc, &output);
-            ok(output.rate_bytes_per_second == rates[j] + cases[i].increase[j]);
-            ok(output.ack_growth_events == 1);
-            quicly_flexicast_cc_free(cc);
-        }
-    }
-}
-
-static void test_adaptive_maximum_rate_recovery(void)
-{
-    quicly_flexicast_cc_config_t config = regression_config();
-    quicly_flexicast_cc_t *cc;
-    quicly_flexicast_cc_output_t output;
-    config.startup_rate_bytes_per_second = UINT64_MAX;
-    config.minimum_rate_bytes_per_second = UINT64_MAX / 2;
-    config.maximum_rate_bytes_per_second = 0;
-    ok(quicly_flexicast_cc_create(&cc, &quicly_flexicast_cc_type_adaptive, &config, 0) == 0);
-    quicly_flexicast_cc_on_member_added(cc, 1, 0);
-    quicly_flexicast_cc_get_output(cc, &output);
-    for (unsigned i = 0; i != 3; ++i) {
-        quicly_flexicast_cc_on_timeout(cc, output.next_timeout);
-        quicly_flexicast_cc_get_output(cc, &output);
-    }
-    ok(output.rate_bytes_per_second == UINT64_MAX / 2);
-    quicly_flexicast_cc_free(cc);
-}
-
 static void test_member_map_collisions(void)
 {
     flexicast_member_map_t map = {0};
@@ -268,7 +142,7 @@ static quicly_flexicast_flow_t *create_regression_flow(quicly_flexicast_cc_type_
 
 static void test_rekey_inactive_members(void)
 {
-    quicly_flexicast_cc_type_t *types[] = {&quicly_flexicast_cc_type_multicast, &quicly_flexicast_cc_type_adaptive};
+    quicly_flexicast_cc_type_t *types[] = {&quicly_flexicast_cc_type_multicast};
     for (size_t t = 0; t != sizeof(types) / sizeof(types[0]); ++t) {
         quicly_flexicast_flow_t *flow = create_regression_flow(types[t]);
         uint8_t packet[128], next_secret[PTLS_MAX_DIGEST_SIZE] = {1};
@@ -328,7 +202,7 @@ static void test_rekey_inactive_members(void)
 
 static void test_duplicate_ack_delivery_clock(void)
 {
-    quicly_flexicast_cc_type_t *types[] = {&quicly_flexicast_cc_type_multicast, &quicly_flexicast_cc_type_adaptive};
+    quicly_flexicast_cc_type_t *types[] = {&quicly_flexicast_cc_type_multicast};
     for (size_t t = 0; t != sizeof(types) / sizeof(types[0]); ++t) {
         uint64_t delivery_rate = 0;
         for (unsigned replay = 0; replay != 2; ++replay) {
@@ -386,10 +260,6 @@ void test_flexicast_cc_regressions(void)
 {
     subtest("multicast-zero-time", test_multicast_zero_time);
     subtest("multicast-feedback-epochs", test_multicast_feedback_epochs);
-    subtest("adaptive-rate-limit", test_adaptive_rate_limit);
-    subtest("adaptive-hint-epochs", test_adaptive_hint_epochs);
-    subtest("adaptive-sender-growth", test_adaptive_sender_growth);
-    subtest("adaptive-maximum-rate-recovery", test_adaptive_maximum_rate_recovery);
     subtest("member-map-collisions", test_member_map_collisions);
     subtest("rekey-inactive-members", test_rekey_inactive_members);
     subtest("duplicate-ack-delivery-clock", test_duplicate_ack_delivery_clock);

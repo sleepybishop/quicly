@@ -240,7 +240,6 @@ size_t quicly_flexicast_cc_read_trace(quicly_flexicast_cc_t *cc, quicly_flexicas
                                       uint64_t *overwritten);
 
 extern quicly_flexicast_cc_type_t quicly_flexicast_cc_type_multicast;
-extern quicly_flexicast_cc_type_t quicly_flexicast_cc_type_adaptive;
 
 #ifdef __cplusplus
 }

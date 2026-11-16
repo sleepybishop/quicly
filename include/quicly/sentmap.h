@@ -122,8 +122,7 @@ struct st_quicly_sent_ack_additional_t {
 
 /**
  * Describes what is inside a packet or frame being sent. Within the sentmap, each packet-level entry (identified by .acked ==
- * quicly_sentmap__type_packet) is followed by a number of frame-level entries. Size of `quicly_sent_t` is kept as 256 bits (64-bit
- * * 4).
+ * quicly_sentmap__type_packet) is followed by a number of frame-level entries. PMTUD metadata requires up to five 64-bit words per entry.
  */
 struct st_quicly_sent_t {
     quicly_sent_acked_cb acked;
@@ -132,19 +131,20 @@ struct st_quicly_sent_t {
         quicly_bbr_packet_times_t bbr_times;
         quicly_bbr_packet_meta_t bbr_meta;
         /**
-         * ACK frame. Represents up to 8 ack ranges. If not full, `additional` list is terminated by .gap = 0.
+         * ACK frame. Represents up to 6 ack ranges. If not full, `additional` list is terminated by .gap = 0.
          */
         struct {
             uint64_t start;
-            uint32_t path_id;
             union {
                 struct {
                     uint64_t start_length;
-                    struct st_quicly_sent_ack_additional_t additional[4];
+                    uint32_t path_id;
+                    struct st_quicly_sent_ack_additional_t additional[2];
                 } ranges64;
                 struct {
+                    uint32_t path_id;
                     uint8_t start_length;
-                    struct st_quicly_sent_ack_additional_t additional[7];
+                    struct st_quicly_sent_ack_additional_t additional[5];
                 } ranges8;
             };
         } ack;
@@ -193,6 +193,9 @@ struct st_quicly_sent_t {
             uint32_t path_id;
             uint64_t sequence;
         } path_status;
+        struct {
+            uint64_t max_path_id;
+        } max_path_id;
         struct {
             uint64_t max_path_id;
         } paths_blocked;
@@ -341,6 +344,7 @@ quicly_error_t quicly_sentmap__type_packet(quicly_sentmap_t *map, const quicly_s
 
 inline void quicly_sentmap_init(quicly_sentmap_t *map)
 {
+    PTLS_BUILD_ASSERT(sizeof(struct st_quicly_sent_t) <= 40);
     *map = (quicly_sentmap_t){NULL};
 }
 
