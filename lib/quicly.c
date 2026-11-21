@@ -906,9 +906,11 @@ static inline int is_flexicast_ack_path(const quicly_conn_t *conn, uint64_t path
 
 static quicly_error_t ensure_retired_flexicast_ack_capacity(quicly_conn_t *conn, uint64_t candidate_id)
 {
-    size_t non_merging = conn->egress.flexicast_control.num_bindings == 0 && retired_ack_path_merges(conn, candidate_id)
-                             ? 0
-                             : conn->egress.flexicast_control.num_bindings + 1;
+    size_t non_merging = retired_ack_path_merges(conn, candidate_id) ? 0 : 1;
+    for (const quicly_flexicast_ack_binding_t *b = conn->egress.flexicast_control.bindings; b != NULL; b = b->next) {
+        if (!retired_ack_path_merges(conn, b->ack_path_id))
+            ++non_merging;
+    }
     size_t needed = conn->egress.flexicast_control.num_retired_ranges + non_merging;
     if (needed > QUICLY_MAX_FLEXICAST_RETIRED_ACK_RANGES)
         return QUICLY_ERROR_STATE_EXHAUSTION;

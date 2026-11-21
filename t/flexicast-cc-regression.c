@@ -590,6 +590,35 @@ static void test_reordered_pending_and_remainder(void)
     quicly_flexicast_cc_get_output(cc, &output);
     ok(output.rate_bytes_per_second == 220005);
     quicly_flexicast_cc_free_multicast(cc);
+
+    /* delayed submission (group member_id 0 and per-member 1) updates deadline and clears pre-submission probes */
+    quicly_flexicast_cc_config_t sub_cc_cfg = {.startup_rate_bytes_per_second = 100000, .feedback_timeout_msec = 100};
+    quicly_flexicast_send_context_t sub_ctx = {
+        .pacing_rate_bytes_per_second = 100000, .physical_fanout = 1, .flags = QUICLY_FLEXICAST_SAMPLE_VALID};
+    for (int per_member = 0; per_member != 2; ++per_member) {
+        cc = quicly_flexicast_cc_new_multicast(&sub_cc_cfg, 0);
+        ok(cc != NULL);
+        cfg.cc = cc;
+        ok(quicly_flexicast_flow_create(&flow, &cfg) == QUICLY_FLEXICAST_OK);
+        ok(quicly_flexicast_attach(flow, 1, 0) == QUICLY_FLEXICAST_OK);
+        ok(quicly_flexicast_send_datagram(flow, ptls_iovec_init(&payload, 1), packet, sizeof(packet), &size, &pn0, 10) ==
+           QUICLY_FLEXICAST_OK);
+        quicly_flexicast_cc_on_flow_timeout(flow, 110);
+        quicly_flexicast_cc_on_flow_timeout(flow, 210);
+        ok(quicly_flexicast_mark_submitted(flow, per_member ? 1 : 0, pn0, 1010, &sub_ctx) == QUICLY_FLEXICAST_OK);
+        quicly_flexicast_cc_get_flow_output(flow, &output);
+        ok(output.next_timeout == 1110 && output.rate_bytes_per_second == 100000);
+        quicly_flexicast_cc_on_flow_timeout(flow, 1010);
+        quicly_flexicast_cc_on_flow_timeout(flow, 1110);
+        quicly_flexicast_cc_on_flow_timeout(flow, 1210);
+        quicly_flexicast_cc_get_flow_output(flow, &output);
+        ok(output.rate_bytes_per_second == 100000);
+        quicly_flexicast_cc_on_flow_timeout(flow, 1310);
+        quicly_flexicast_cc_get_flow_output(flow, &output);
+        ok(output.rate_bytes_per_second == 50000);
+        quicly_flexicast_flow_free(flow);
+        quicly_flexicast_cc_free_multicast(cc);
+    }
 }
 
 void test_flexicast_cc_regressions(void)

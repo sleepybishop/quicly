@@ -380,6 +380,21 @@ static void test_flexicast_control_queue(void)
         ok(quicly_flexicast_unbind_ack_path(&conn, &seq_fid) == 0);
     }
     ok(conn.egress.flexicast_control.num_retired_ranges == 3); /* [100, 101), [1000, 6000), [PTLS_QUICINT_MAX, ...) */
+    /* at 4096 disjoint retired ranges, concurrent gap-bridging bindings both succeed and coalesce to 4094 on unbind */
+    for (size_t i = 0; conn.egress.flexicast_control.num_retired_ranges < QUICLY_MAX_FLEXICAST_RETIRED_ACK_RANGES; ++i) {
+        uint64_t pid = 10000 + i * 2;
+        quicly_flexicast_flow_id_t dis_fid = make_fc_id_u64(pid);
+        ok(quicly_flexicast_bind_ack_path(&conn, pid, &dis_fid) == 0);
+        ok(quicly_flexicast_unbind_ack_path(&conn, &dis_fid) == 0);
+    }
+    ok(conn.egress.flexicast_control.num_retired_ranges == QUICLY_MAX_FLEXICAST_RETIRED_ACK_RANGES);
+    quicly_flexicast_flow_id_t bridge1 = make_fc_id_u64(10001), bridge2 = make_fc_id_u64(10003), non_merge = make_fc_id_u64(999999);
+    ok(quicly_flexicast_bind_ack_path(&conn, 10001, &bridge1) == 0);
+    ok(quicly_flexicast_bind_ack_path(&conn, 10003, &bridge2) == 0);
+    ok(quicly_flexicast_bind_ack_path(&conn, 999999, &non_merge) == QUICLY_ERROR_STATE_EXHAUSTION);
+    ok(quicly_flexicast_unbind_ack_path(&conn, &bridge1) == 0);
+    ok(quicly_flexicast_unbind_ack_path(&conn, &bridge2) == 0);
+    ok(conn.egress.flexicast_control.num_retired_ranges == QUICLY_MAX_FLEXICAST_RETIRED_ACK_RANGES - 2);
     free(conn.egress.flexicast_control.retired_ranges);
 }
 

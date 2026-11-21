@@ -74,6 +74,11 @@ typedef struct st_quicly_flexicast_feedback_t {
     uint32_t applied_ack_delay_msec;
     uint32_t rtt_sample_flags;
     int64_t now;
+    /* post-retirement pending packet state for this member when pending_valid is non-zero */
+    uint64_t oldest_pending_pn;
+    int64_t oldest_pending_sent_at;
+    uint8_t pending_valid;
+    uint8_t has_pending;
 } quicly_flexicast_feedback_t;
 
 #define QUICLY_FLEXICAST_CC_REASON_NONE 0U
@@ -242,7 +247,7 @@ static inline void quicly_flexicast_cc_on_packet_sent(quicly_flexicast_cc_t *cc,
 static inline void quicly_flexicast_cc_on_member_pending_updated(quicly_flexicast_cc_t *cc, uint64_t member_id, int has_pending,
                                                                  uint64_t oldest_pending_pn, int64_t oldest_sent_at, int64_t now)
 {
-    if (cc == NULL || member_id == 0)
+    if (cc == NULL)
         return;
     if (cc->type->on_member_pending_updated != NULL) {
         cc->type->on_member_pending_updated(cc, member_id, has_pending, oldest_pending_pn, oldest_sent_at, now);

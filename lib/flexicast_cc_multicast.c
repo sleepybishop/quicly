@@ -44,6 +44,8 @@ typedef struct st_multicast_state_t {
     int64_t max_event_at;
     int64_t sent_at_ring[MULTICAST_SENT_RING_SIZE];
     int has_sent_packets;
+    int any_unanswered_probes;
+    int any_override_sent_at;
     flexicast_member_map_t member_map;
 } multicast_state_t;
 
@@ -279,6 +281,14 @@ static void heap_update(multicast_state_t *state, multicast_heap_type_t type, mu
     heap_sift_down(state, type, index, state->num_members);
 }
 
+static void timeout_heap_rebuild(multicast_state_t *state)
+{
+    for (size_t i = state->num_members / 2; i > 0;) {
+        --i;
+        heap_sift_down(state, MULTICAST_HEAP_TIMEOUT, i, state->num_members);
+    }
+}
+
 static void heap_remove(multicast_state_t *state, multicast_heap_type_t type, multicast_member_t *member)
 {
     size_t *heap = heap_storage(state, type), index = *member_heap_index(member, type);
@@ -428,6 +438,8 @@ static void multicast_on_epoch_reset(quicly_flexicast_cc_t *cc, int64_t now)
 {
     multicast_state_t *state = (multicast_state_t *)cc;
     state->has_sent_packets = 0;
+    state->any_unanswered_probes = 0;
+    state->any_override_sent_at = 0;
     state->first_sent_pn = 0;
     state->next_expected_pn = 0;
     state->first_send_at = 0;
@@ -476,30 +488,81 @@ static void multicast_on_packet_sent(quicly_flexicast_cc_t *cc, uint64_t packet_
         update_output(state, now, state->super.output.reason);
 }
 
+static void apply_member_pending_state(multicast_state_t *state, multicast_member_t *member, int has_pending,
+                                       uint64_t oldest_pending_pn, int64_t oldest_sent_at)
+{
+    if (!has_pending) {
+        member->next_unacked_pn = state->next_expected_pn;
+        member->oldest_override_sent_at = INT64_MIN;
+        member->unanswered_feedback_probes = 0;
+        return;
+    }
+    int64_t prev_sent_at = member_pkt_sent_at(state, member);
+    if (oldest_pending_pn != member->next_unacked_pn || (oldest_sent_at > 0 && oldest_sent_at > prev_sent_at)) {
+        member->unanswered_feedback_probes = 0;
+        if (oldest_sent_at > 0 && member->last_timeout_probe < oldest_sent_at)
+            member->last_timeout_probe = oldest_sent_at;
+    }
+    member->next_unacked_pn = oldest_pending_pn;
+    if (oldest_sent_at > 0) {
+        note_event_time(state, oldest_sent_at);
+        member->oldest_override_sent_at = oldest_sent_at;
+        state->any_override_sent_at = 1;
+    } else {
+        member->oldest_override_sent_at = INT64_MIN;
+    }
+}
+
 static void multicast_on_member_pending_updated(quicly_flexicast_cc_t *cc, uint64_t member_id, int has_pending,
                                                 uint64_t oldest_pending_pn, int64_t oldest_sent_at, int64_t now)
 {
     multicast_state_t *state = (multicast_state_t *)cc;
+    if (member_id == 0) {
+        if (!state->has_sent_packets || oldest_pending_pn >= state->next_expected_pn)
+            return;
+        int64_t prev_max_event_at = state->max_event_at;
+        if (now != INT64_MIN)
+            note_event_time(state, now);
+        if (has_pending && oldest_sent_at > 0) {
+            note_event_time(state, oldest_sent_at);
+            int in_ring = oldest_pending_pn >= state->first_sent_pn &&
+                          state->next_expected_pn - oldest_pending_pn <= MULTICAST_SENT_RING_SIZE;
+            int64_t prev_ring_at =
+                oldest_pending_pn == state->first_sent_pn
+                    ? state->first_send_at
+                    : (in_ring ? state->sent_at_ring[oldest_pending_pn % MULTICAST_SENT_RING_SIZE] : state->first_send_at);
+            if (oldest_pending_pn == state->first_sent_pn)
+                state->first_send_at = oldest_sent_at;
+            if (in_ring)
+                state->sent_at_ring[oldest_pending_pn % MULTICAST_SENT_RING_SIZE] = oldest_sent_at;
+            if (state->any_unanswered_probes && oldest_sent_at > prev_ring_at) {
+                int still_probing = 0;
+                for (size_t i = 0; i != state->num_members; ++i) {
+                    multicast_member_t *m = state->members + i;
+                    if (m->active && m->next_unacked_pn == oldest_pending_pn && m->oldest_override_sent_at == INT64_MIN) {
+                        m->unanswered_feedback_probes = 0;
+                        if (m->last_timeout_probe < oldest_sent_at)
+                            m->last_timeout_probe = oldest_sent_at;
+                    }
+                    if (m->active && m->unanswered_feedback_probes != 0)
+                        still_probing = 1;
+                }
+                state->any_unanswered_probes = still_probing;
+            }
+            if (oldest_sent_at != prev_ring_at &&
+                (oldest_pending_pn + 1 != state->next_expected_pn || prev_max_event_at > prev_ring_at ||
+                 oldest_sent_at < prev_ring_at || state->any_override_sent_at))
+                timeout_heap_rebuild(state);
+        }
+        update_output(state, now != INT64_MIN && now > state->max_event_at ? now : state->max_event_at, state->super.output.reason);
+        return;
+    }
     multicast_member_t *member = find_member(state, member_id);
     if (member == NULL)
         return;
     if (now != INT64_MIN)
         note_event_time(state, now);
-    if (!has_pending) {
-        member->next_unacked_pn = state->next_expected_pn;
-        member->oldest_override_sent_at = INT64_MIN;
-        member->unanswered_feedback_probes = 0;
-    } else {
-        if (oldest_pending_pn != member->next_unacked_pn)
-            member->unanswered_feedback_probes = 0;
-        member->next_unacked_pn = oldest_pending_pn;
-        if (oldest_sent_at > 0) {
-            note_event_time(state, oldest_sent_at);
-            member->oldest_override_sent_at = oldest_sent_at;
-        } else {
-            member->oldest_override_sent_at = INT64_MIN;
-        }
-    }
+    apply_member_pending_state(state, member, has_pending, oldest_pending_pn, oldest_sent_at);
     heap_update(state, MULTICAST_HEAP_TIMEOUT, member);
     update_output(state, now != INT64_MIN && now > state->max_event_at ? now : state->max_event_at, state->super.output.reason);
 }
@@ -523,7 +586,11 @@ static void multicast_on_feedback(quicly_flexicast_cc_t *cc, const quicly_flexic
     }
     if (feedback->epoch != 0)
         member->last_feedback_epoch = feedback->epoch;
-    if (cc->bound_flow == NULL && (feedback->acked_packets != 0 || feedback->lost_packets != 0 || feedback->ecn_ce_count != 0)) {
+    if (feedback->pending_valid) {
+        apply_member_pending_state(state, member, feedback->has_pending, feedback->oldest_pending_pn,
+                                   feedback->oldest_pending_sent_at);
+    } else if (cc->bound_flow == NULL &&
+               (feedback->acked_packets != 0 || feedback->lost_packets != 0 || feedback->ecn_ce_count != 0)) {
         uint64_t next_pn = feedback->largest_acknowledged < UINT64_MAX ? feedback->largest_acknowledged + 1 : UINT64_MAX;
         if (next_pn > member->next_unacked_pn)
             member->next_unacked_pn = next_pn;
@@ -603,6 +670,7 @@ static void multicast_on_timeout(quicly_flexicast_cc_t *cc, int64_t now)
         if (deadline == INT64_MAX || deadline > now)
             break;
         member->last_timeout_probe = now;
+        state->any_unanswered_probes = 1;
         if (++member->unanswered_feedback_probes >= 3) {
             member->rate = quicly_flexicast_cc_clamp_rate(&state->super.config, member->rate / 2);
             member->growth_remainder = 0;

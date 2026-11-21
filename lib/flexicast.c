@@ -6,17 +6,20 @@
 
 #define FLEXICAST_NO_SLOT UINT32_MAX
 #define MAX_SUBMISSION_TIMESTAMPS 4096
-#define FLEXICAST_LIM_INLINE_CAPACITY 8U
+#define FLEXICAST_LIM_INLINE_CAPACITY 4U
+#define FLEXICAST_LIM_MAX_CAPACITY 1024U
 
-typedef struct st_flexicast_lim_entry_t {
-    int64_t at;
+typedef struct st_flexicast_lim_span_t {
+    int64_t start;
+    int64_t end;
+    uint64_t last_pn;
     uint32_t flags;
-} flexicast_lim_entry_t;
+} flexicast_lim_span_t;
 
 typedef struct st_flexicast_lim_ring_t {
-    flexicast_lim_entry_t inline_entries[FLEXICAST_LIM_INLINE_CAPACITY];
-    flexicast_lim_entry_t *ext_entries;
-    int64_t max_at;
+    flexicast_lim_span_t inline_entries[FLEXICAST_LIM_INLINE_CAPACITY];
+    flexicast_lim_span_t *ext_entries;
+    int64_t max_end;
     uint16_t capacity;
     uint16_t head;
     uint16_t count;
@@ -66,8 +69,7 @@ typedef struct st_quicly_flexicast_member_t {
     uint64_t suspended_at_pn;
     uint64_t excluded_packets;
     uint64_t retired_packets;
-    uint64_t current_route_lost_packets;
-    uint64_t old_lost_unacked;
+    quicly_ranges_t ecn_unreported_retired;
     flexicast_lim_ring_t limitations;
     flexicast_delivery_sample_t rate_sample;
     flexicast_delivery_sample_t published_rate_sample;
@@ -245,7 +247,7 @@ static size_t submission_hash(uint64_t packet_number, uint32_t member_slot_plus_
 
 static flexicast_submission_t *find_submission(quicly_flexicast_flow_t *flow, uint64_t packet_number, size_t member_slot)
 {
-    if (flow->submission_capacity == 0)
+    if (flow->num_submissions == 0)
         return NULL;
     uint32_t key = (uint32_t)member_slot + 1;
     size_t slot = submission_hash(packet_number, key) & (flow->submission_capacity - 1);
@@ -347,12 +349,40 @@ static uint64_t member_pending_packets(const quicly_flexicast_flow_t *flow, cons
     return total_assigned > member->retired_packets ? total_assigned - member->retired_packets : 0;
 }
 
-static void lim_ring_reset(flexicast_lim_ring_t *ring)
+static void dispose_ecn_unreported(quicly_ranges_t *ranges)
 {
-    ring->max_at = 0;
-    ring->head = 0;
-    ring->count = 0;
-    ring->non_monotone = 0;
+    if (ranges->ranges != NULL)
+        quicly_ranges_clear(ranges);
+    *ranges = (quicly_ranges_t){0};
+}
+
+static void record_ecn_unreported_retirement(quicly_flexicast_member_t *member, uint64_t start_pn, uint64_t end_pn)
+{
+    if (start_pn >= end_pn)
+        return;
+    if (member->ecn_unreported_retired.ranges == NULL)
+        quicly_ranges_init(&member->ecn_unreported_retired);
+    (void)quicly_ranges_add(&member->ecn_unreported_retired, start_pn, end_pn);
+    if (member->ecn_unreported_retired.num_ranges > 64) {
+        quicly_ranges_drop_by_range_indices(&member->ecn_unreported_retired, 0, member->ecn_unreported_retired.num_ranges - 64);
+    }
+}
+
+static uint64_t count_ecn_unreported_overlap(const quicly_ranges_t *retired, uint64_t lo, uint64_t hi_excl)
+{
+    uint64_t count = 0;
+    if (lo >= hi_excl)
+        return 0;
+    for (size_t i = 0; i != retired->num_ranges; ++i) {
+        if (retired->ranges[i].end <= lo)
+            continue;
+        if (retired->ranges[i].start >= hi_excl)
+            break;
+        uint64_t s = retired->ranges[i].start > lo ? retired->ranges[i].start : lo;
+        uint64_t e = retired->ranges[i].end < hi_excl ? retired->ranges[i].end : hi_excl;
+        count += e - s;
+    }
+    return count;
 }
 
 static void lim_ring_dispose(flexicast_lim_ring_t *ring)
@@ -361,24 +391,64 @@ static void lim_ring_dispose(flexicast_lim_ring_t *ring)
     *ring = (flexicast_lim_ring_t){0};
 }
 
-static void lim_ring_record(flexicast_lim_ring_t *ring, int64_t now, uint32_t flags)
+static void lim_ring_prune(flexicast_lim_ring_t *ring, int64_t floor_at)
+{
+    if (ring->count == 0 || ring->non_monotone || floor_at <= 0)
+        return;
+    size_t cap = ring->capacity != 0 ? ring->capacity : FLEXICAST_LIM_INLINE_CAPACITY;
+    flexicast_lim_span_t *entries = ring->ext_entries != NULL ? ring->ext_entries : ring->inline_entries;
+    size_t oldest = (ring->head + cap - ring->count) & (cap - 1);
+    while (ring->count != 0 && entries[oldest].end < floor_at) {
+        --ring->count;
+        oldest = (oldest + 1) & (cap - 1);
+    }
+    if (ring->count == 0) {
+        ring->head = 0;
+        ring->max_end = 0;
+    }
+    if (ring->ext_entries != NULL && ring->count <= FLEXICAST_LIM_INLINE_CAPACITY) {
+        for (size_t i = 0; i != ring->count; ++i)
+            ring->inline_entries[i] = entries[(oldest + i) & (cap - 1)];
+        free(ring->ext_entries);
+        ring->ext_entries = NULL;
+        ring->capacity = 0;
+        ring->head = ring->count & (FLEXICAST_LIM_INLINE_CAPACITY - 1);
+    }
+}
+
+static void lim_ring_record(flexicast_lim_ring_t *ring, uint64_t pn, int64_t now, uint32_t flags, int64_t floor_at)
 {
     size_t cap = ring->capacity != 0 ? ring->capacity : FLEXICAST_LIM_INLINE_CAPACITY;
-    flexicast_lim_entry_t *entries = ring->ext_entries != NULL ? ring->ext_entries : ring->inline_entries;
+    flexicast_lim_span_t *entries = ring->ext_entries != NULL ? ring->ext_entries : ring->inline_entries;
     if (ring->count != 0) {
-        size_t prev = (ring->head + cap - 1) & (cap - 1);
-        if (entries[prev].at == now) {
-            entries[prev].flags |= flags;
+        size_t prev_idx = (ring->head + cap - 1) & (cap - 1);
+        flexicast_lim_span_t *prev = entries + prev_idx;
+        if (prev->end == now) {
+            prev->flags |= flags;
+            if (pn > prev->last_pn)
+                prev->last_pn = pn;
             return;
         }
-        if (now < entries[prev].at)
+        if (now < prev->end) {
             ring->non_monotone = 1;
+        } else if (!ring->non_monotone && pn == prev->last_pn + 1 && prev->flags == flags) {
+            prev->end = now;
+            prev->last_pn = pn;
+            if (now > ring->max_end)
+                ring->max_end = now;
+            return;
+        }
     }
-    if (ring->count == cap && cap < QUICLY_FLEXICAST_SENT_WINDOW) {
+    if (ring->count == cap) {
+        lim_ring_prune(ring, floor_at);
+        cap = ring->capacity != 0 ? ring->capacity : FLEXICAST_LIM_INLINE_CAPACITY;
+        entries = ring->ext_entries != NULL ? ring->ext_entries : ring->inline_entries;
+    }
+    if (ring->count == cap && cap < FLEXICAST_LIM_MAX_CAPACITY) {
         size_t new_cap = cap * 2;
-        if (new_cap > QUICLY_FLEXICAST_SENT_WINDOW)
-            new_cap = QUICLY_FLEXICAST_SENT_WINDOW;
-        flexicast_lim_entry_t *grown = malloc(new_cap * sizeof(*grown));
+        if (new_cap > FLEXICAST_LIM_MAX_CAPACITY)
+            new_cap = FLEXICAST_LIM_MAX_CAPACITY;
+        flexicast_lim_span_t *grown = malloc(new_cap * sizeof(*grown));
         if (grown != NULL) {
             size_t oldest = (ring->head + cap - ring->count) & (cap - 1);
             for (size_t i = 0; i != ring->count; ++i)
@@ -391,31 +461,31 @@ static void lim_ring_record(flexicast_lim_ring_t *ring, int64_t now, uint32_t fl
             entries = grown;
         }
     }
-    entries[ring->head] = (flexicast_lim_entry_t){.at = now, .flags = flags};
+    entries[ring->head] = (flexicast_lim_span_t){.start = now, .end = now, .last_pn = pn, .flags = flags};
     ring->head = (uint16_t)((ring->head + 1) & (cap - 1));
     if (ring->count < cap)
         ++ring->count;
-    if (now > ring->max_at)
-        ring->max_at = now;
+    if (now > ring->max_end)
+        ring->max_end = now;
 }
 
 static uint32_t lim_ring_query(const flexicast_lim_ring_t *ring, int64_t start, int64_t end, uint32_t flags)
 {
     const uint32_t both = QUICLY_FLEXICAST_SAMPLE_APP_LIMITED | QUICLY_FLEXICAST_SAMPLE_HOST_LIMITED;
-    if (ring->count == 0 || ring->max_at < start || (flags & both) == both)
+    if (ring->count == 0 || ring->max_end < start || (flags & both) == both)
         return flags;
     size_t cap = ring->capacity != 0 ? ring->capacity : FLEXICAST_LIM_INLINE_CAPACITY;
-    const flexicast_lim_entry_t *entries = ring->ext_entries != NULL ? ring->ext_entries : ring->inline_entries;
+    const flexicast_lim_span_t *entries = ring->ext_entries != NULL ? ring->ext_entries : ring->inline_entries;
     for (size_t i = 0; i < ring->count && (flags & both) != both; ++i) {
         size_t slot = (ring->head + cap - 1 - i) & (cap - 1);
-        int64_t at = entries[slot].at;
-        if (at < start) {
+        const flexicast_lim_span_t *sp = entries + slot;
+        if (sp->end < start) {
             if (!ring->non_monotone)
                 break;
             continue;
         }
-        if (at <= end)
-            flags |= entries[slot].flags;
+        if (sp->start <= end)
+            flags |= sp->flags;
     }
     return flags;
 }
@@ -433,8 +503,10 @@ static void set_member_active(quicly_flexicast_flow_t *flow, size_t member_index
 static void free_sender_state(quicly_flexicast_flow_t *flow)
 {
     if (flow->members != NULL) {
-        for (size_t i = 0; i != flow->member_slot_watermark; ++i)
+        for (size_t i = 0; i != flow->member_slot_watermark; ++i) {
+            dispose_ecn_unreported(&flow->members[i].ecn_unreported_retired);
             lim_ring_dispose(&flow->members[i].limitations);
+        }
     }
     lim_ring_dispose(&flow->limitations);
     flexicast_member_map_dispose(&flow->member_map);
@@ -727,7 +799,7 @@ int quicly_flexicast_flow_rekey(quicly_flexicast_flow_t *flow, ptls_iovec_t traf
     memset(flow->received.ecn_counts, 0, sizeof(flow->received.ecn_counts));
     flow->received.ack_pending_since = 0;
     flow->received.largest_received_at = 0;
-    lim_ring_reset(&flow->limitations);
+    lim_ring_dispose(&flow->limitations);
     if (flow->sent != NULL) {
         memset(flow->sent, 0, QUICLY_FLEXICAST_SENT_WINDOW * sizeof(*flow->sent));
         if (flow->submissions != NULL && flow->num_submissions != 0)
@@ -751,9 +823,8 @@ int quicly_flexicast_flow_rekey(quicly_flexicast_flow_t *flow, ptls_iovec_t traf
             flow->members[i].suspended_at_pn = first_packet_number;
             flow->members[i].excluded_packets = 0;
             flow->members[i].retired_packets = 0;
-            flow->members[i].current_route_lost_packets = 0;
-            flow->members[i].old_lost_unacked = 0;
-            lim_ring_reset(&flow->members[i].limitations);
+            dispose_ecn_unreported(&flow->members[i].ecn_unreported_retired);
+            lim_ring_dispose(&flow->members[i].limitations);
             flow->members[i].stats.largest_acknowledged = 0;
             flow->members[i].stats.last_feedback_at = 0;
             flow->members[i].rate_sample = (flexicast_delivery_sample_t){0};
@@ -852,14 +923,15 @@ static void clear_member_pending_slots(quicly_flexicast_flow_t *flow, size_t mem
     }
 }
 
-static void sync_member_cc_pending(quicly_flexicast_flow_t *flow, size_t member_index, int64_t now)
+static void compute_member_cc_pending(quicly_flexicast_flow_t *flow, size_t member_index, int *has_pending, uint64_t *oldest_pn,
+                                      int64_t *oldest_sent_at)
 {
     quicly_flexicast_member_t *member = flow->members + member_index;
-    if (!member->active || flow->cc == NULL)
-        return;
+    *has_pending = 0;
+    *oldest_pn = 0;
+    *oldest_sent_at = 0;
     if (member_pending_packets(flow, member) == 0) {
         member->cc_pending_cursor = flow->next_packet_number;
-        quicly_flexicast_cc_on_member_pending_updated(flow->cc, member->stats.member_id, 0, 0, 0, now);
         return;
     }
     uint64_t cursor = member->cc_pending_cursor;
@@ -873,14 +945,26 @@ static void sync_member_cc_pending(quicly_flexicast_flow_t *flow, size_t member_
         if (sent->pending_count != 0 && sent->packet_number == cursor && sent_has_member(flow, sent, member_index)) {
             member->cc_pending_cursor = cursor;
             flexicast_submission_t *sub = find_submission(flow, cursor, member_index);
-            int64_t sent_at = sub != NULL ? sub->submitted_at : sent->rtt_untracked ? 0 : sent->sent_at;
-            quicly_flexicast_cc_on_member_pending_updated(flow->cc, member->stats.member_id, 1, cursor, sent_at, now);
+            *has_pending = 1;
+            *oldest_pn = cursor;
+            *oldest_sent_at = sub != NULL ? sub->submitted_at : sent->rtt_untracked ? 0 : sent->sent_at;
             return;
         }
         ++cursor;
     }
     member->cc_pending_cursor = flow->next_packet_number;
-    quicly_flexicast_cc_on_member_pending_updated(flow->cc, member->stats.member_id, 0, 0, 0, now);
+}
+
+static void sync_member_cc_pending(quicly_flexicast_flow_t *flow, size_t member_index, int64_t now)
+{
+    quicly_flexicast_member_t *member = flow->members + member_index;
+    int has_pending;
+    uint64_t oldest_pn;
+    int64_t oldest_sent_at;
+    if (!member->active || flow->cc == NULL)
+        return;
+    compute_member_cc_pending(flow, member_index, &has_pending, &oldest_pn, &oldest_sent_at);
+    quicly_flexicast_cc_on_member_pending_updated(flow->cc, member->stats.member_id, has_pending, oldest_pn, oldest_sent_at, now);
 }
 
 int quicly_flexicast_attach(quicly_flexicast_flow_t *flow, uint64_t member_id, int64_t now)
@@ -922,6 +1006,7 @@ int quicly_flexicast_attach(quicly_flexicast_flow_t *flow, uint64_t member_id, i
         quicly_flexicast_cc_on_member_removed(flow->cc, old_id, now);
         flexicast_member_map_remove(&flow->member_map, old_id);
         clear_member_pending_slots(flow, reclaimed, old_cursor);
+        dispose_ecn_unreported(&flow->members[reclaimed].ecn_unreported_retired);
         lim_ring_dispose(&flow->members[reclaimed].limitations);
         memset(&flow->members[reclaimed], 0, sizeof(flow->members[reclaimed]));
         flow->members[reclaimed].prev_inactive = flow->members[reclaimed].next_inactive = FLEXICAST_NO_SLOT;
@@ -942,8 +1027,6 @@ int quicly_flexicast_attach(quicly_flexicast_flow_t *flow, uint64_t member_id, i
     flow->members[index].suspended_at_pn = flow->next_packet_number;
     flow->members[index].excluded_packets = flow->next_packet_number - flow->first_packet_number;
     flow->members[index].retired_packets = 0;
-    flow->members[index].current_route_lost_packets = 0;
-    flow->members[index].old_lost_unacked = 0;
     flow->members[index].active = 1;
     flexicast_member_map_set(&flow->member_map, member_id, (size_t)index);
     set_member_active(flow, (size_t)index, 1);
@@ -969,6 +1052,7 @@ int quicly_flexicast_detach(quicly_flexicast_flow_t *flow, uint64_t member_id, i
     old_cursor = flow->members[member_index].loss_cursor;
     flexicast_member_map_remove(&flow->member_map, member_id);
     clear_member_pending_slots(flow, (size_t)member_index, old_cursor);
+    dispose_ecn_unreported(&flow->members[member_index].ecn_unreported_retired);
     lim_ring_dispose(&flow->members[member_index].limitations);
     memset(&flow->members[member_index], 0, sizeof(flow->members[member_index]));
     flow->members[member_index].prev_inactive = flow->members[member_index].next_inactive = FLEXICAST_NO_SLOT;
@@ -1025,10 +1109,7 @@ static void retire_inactive_slot_obligations(quicly_flexicast_flow_t *flow, quic
                 if (sent_clear_member(flow, sent, slot) && m->stats.member_id != 0) {
                     ++m->stats.lost_packets;
                     m->stats.lost_bytes += sent->packet_size;
-                    if (sent->packet_number >= m->path_sample_floor)
-                        ++m->current_route_lost_packets;
-                    else
-                        ++m->old_lost_unacked;
+                    record_ecn_unreported_retirement(m, sent->packet_number, sent->packet_number + 1);
                     if (m->loss_cursor <= sent->packet_number)
                         m->loss_cursor = sent->packet_number + 1;
                 }
@@ -1107,6 +1188,36 @@ static int same_send_context(const quicly_flexicast_send_context_t *a, const qui
            a->flags == b->flags;
 }
 
+static int64_t member_lim_retention_floor(quicly_flexicast_flow_t *flow, size_t member_index, int64_t now)
+{
+    quicly_flexicast_member_t *member = flow->members + member_index;
+    int64_t floor_at = now;
+    if (member->rate_sample.acked_at_end != 0 && member->rate_sample.sent_at_start > 0 &&
+        member->rate_sample.sent_at_start < floor_at)
+        floor_at = member->rate_sample.sent_at_start;
+    if (member_pending_packets(flow, member) <= 1)
+        return floor_at;
+    uint64_t cursor = member->cc_pending_cursor;
+    uint64_t win_start = sent_window_start(flow);
+    if (win_start < member->path_sample_floor)
+        win_start = member->path_sample_floor;
+    if (cursor < win_start)
+        cursor = win_start;
+    while (cursor < flow->next_packet_number) {
+        const quicly_flexicast_sent_t *s = flow->sent + cursor % QUICLY_FLEXICAST_SENT_WINDOW;
+        if (s->pending_count != 0 && s->packet_number == cursor && sent_has_member(flow, s, member_index)) {
+            member->cc_pending_cursor = cursor;
+            flexicast_submission_t *sub = find_submission(flow, cursor, member_index);
+            int64_t s_at = sub != NULL ? sub->submitted_at : s->rtt_untracked ? 0 : s->sent_at;
+            if (s_at <= 0)
+                return 0;
+            return s_at < floor_at ? s_at : floor_at;
+        }
+        ++cursor;
+    }
+    return floor_at;
+}
+
 int quicly_flexicast_mark_submitted(quicly_flexicast_flow_t *flow, uint64_t member_id, uint64_t packet_number, int64_t now,
                                     const quicly_flexicast_send_context_t *context)
 {
@@ -1121,10 +1232,7 @@ int quicly_flexicast_mark_submitted(quicly_flexicast_flow_t *flow, uint64_t memb
     if (member_id != 0 && (member_index < 0 || !sent_has_member(flow, sent, (size_t)member_index)))
         return QUICLY_FLEXICAST_ERROR_NOT_FOUND;
     quicly_flexicast_send_context_t normalized = context != NULL ? *context : (quicly_flexicast_send_context_t){0};
-    /* record limitation timestamps per member (or flow-wide for member_id 0) */
     uint32_t lim_flags = normalized.flags & (QUICLY_FLEXICAST_SAMPLE_APP_LIMITED | QUICLY_FLEXICAST_SAMPLE_HOST_LIMITED);
-    if (lim_flags != 0 && now > 0)
-        lim_ring_record(member_id != 0 ? &flow->members[member_index].limitations : &flow->limitations, now, lim_flags);
     if (normalized.pacing_rate_bytes_per_second == 0 || normalized.physical_fanout == 0 || now <= 0)
         normalized.flags &= ~QUICLY_FLEXICAST_SAMPLE_VALID;
     if (member_id == 0 || !sent->has_submission) {
@@ -1139,8 +1247,30 @@ int quicly_flexicast_mark_submitted(quicly_flexicast_flow_t *flow, uint64_t memb
             !save_submission(flow, packet_number, (size_t)member_index, now, &normalized))
             sent->rtt_untracked = 1;
     }
-    if (member_index >= 0 && packet_number == flow->members[member_index].cc_pending_cursor)
-        sync_member_cc_pending(flow, (size_t)member_index, now);
+    /* record limitation spans and latch directly onto any overlapping open sample */
+    if (lim_flags != 0 && now > 0) {
+        if (member_index >= 0) {
+            flexicast_delivery_sample_t *bucket = &flow->members[member_index].rate_sample;
+            if (bucket->bytes != 0 && bucket->timestamps_valid && now >= bucket->sent_at_start && now <= bucket->sent_at_end)
+                bucket->context.flags |= lim_flags;
+            int64_t floor_at = member_lim_retention_floor(flow, (size_t)member_index, now);
+            lim_ring_record(&flow->members[member_index].limitations, packet_number, now, lim_flags, floor_at);
+        } else {
+            lim_ring_record(&flow->limitations, packet_number, now, lim_flags, 0);
+        }
+    }
+    if (member_id == 0) {
+        quicly_flexicast_cc_on_member_pending_updated(flow->cc, 0, now > 0, packet_number, now > 0 ? now : 0, now);
+    } else {
+        uint64_t min_cur = flow->members[member_index].cc_pending_cursor;
+        uint64_t win_start = sent_window_start(flow);
+        if (min_cur < win_start)
+            min_cur = win_start;
+        if (min_cur < flow->members[member_index].path_sample_floor)
+            min_cur = flow->members[member_index].path_sample_floor;
+        if (packet_number == min_cur)
+            sync_member_cc_pending(flow, (size_t)member_index, now);
+    }
     return QUICLY_FLEXICAST_OK;
 }
 
@@ -1597,6 +1727,18 @@ static int acknowledge_packet(quicly_flexicast_flow_t *flow, int member_index, u
     return 1;
 }
 
+static void latch_bucket_limitations(const quicly_flexicast_flow_t *flow, const quicly_flexicast_member_t *member,
+                                     flexicast_delivery_sample_t *bucket)
+{
+    if (bucket->bytes != 0 && bucket->timestamps_valid && bucket->sent_at_start > 0 &&
+        bucket->sent_at_end >= bucket->sent_at_start) {
+        bucket->context.flags =
+            lim_ring_query(&flow->limitations, bucket->sent_at_start, bucket->sent_at_end, bucket->context.flags);
+        bucket->context.flags =
+            lim_ring_query(&member->limitations, bucket->sent_at_start, bucket->sent_at_end, bucket->context.flags);
+    }
+}
+
 static void sample_delivery_rate(quicly_flexicast_flow_t *flow, quicly_flexicast_member_t *member,
                                  const flexicast_delivery_sample_t *observation, int64_t now)
 {
@@ -1627,13 +1769,7 @@ static void sample_delivery_rate(quicly_flexicast_flow_t *flow, quicly_flexicast
             uint64_t bytes = bucket->bytes;
             uint64_t sample = bytes > UINT64_MAX / 1000 ? UINT64_MAX : bytes * 1000 / elapsed;
             bucket->rate = sample;
-            /* mark intervals only when a recorded limitation falls within [sent_at_start, sent_at_end] */
-            if (bucket->timestamps_valid && bucket->sent_at_start > 0 && bucket->sent_at_end >= bucket->sent_at_start) {
-                bucket->context.flags =
-                    lim_ring_query(&flow->limitations, bucket->sent_at_start, bucket->sent_at_end, bucket->context.flags);
-                bucket->context.flags =
-                    lim_ring_query(&member->limitations, bucket->sent_at_start, bucket->sent_at_end, bucket->context.flags);
-            }
+            latch_bucket_limitations(flow, member, bucket);
             member->published_rate_sample = *bucket;
             quicly_flexicast_member_stats_t *stats = &member->stats;
             if (stats->delivery_rate_bytes_per_second == 0)
@@ -1650,6 +1786,8 @@ static void sample_delivery_rate(quicly_flexicast_flow_t *flow, quicly_flexicast
                                                 .sent_at_start = sent_at,
                                                 .timestamps_valid = sent_at > 0,
                                                 .end_timestamp_valid = 1};
+        if (member->limitations.ext_entries != NULL && sent_at > 0 && member_pending_packets(flow, member) == 0)
+            lim_ring_prune(&member->limitations, sent_at);
     }
     merge_send_context(&bucket->context, &observation->context, bucket->bytes == 0);
     bucket->timestamps_valid = bucket->timestamps_valid && observation->timestamps_valid;
@@ -1660,6 +1798,7 @@ static void sample_delivery_rate(quicly_flexicast_flow_t *flow, quicly_flexicast
     if (observation->sent_at_end > bucket->sent_at_end)
         bucket->sent_at_end = observation->sent_at_end;
     bucket->bytes = UINT64_MAX - bucket->bytes < observation->bytes ? UINT64_MAX : bucket->bytes + observation->bytes;
+    latch_bucket_limitations(flow, member, bucket);
 }
 
 static void finish_feedback(quicly_flexicast_flow_t *flow, int member_index, quicly_flexicast_feedback_t *feedback,
@@ -1714,9 +1853,16 @@ static void finish_feedback(quicly_flexicast_flow_t *flow, int member_index, qui
         feedback->applied_ack_delay_msec = member->applied_ack_delay_msec;
         feedback->rtt_sample_flags = member->rtt_sample_flags;
     }
-    if (member->active) {
+    if (member->active && flow->cc != NULL) {
+        int has_pending;
+        uint64_t oldest_pn;
+        int64_t oldest_sent_at;
+        compute_member_cc_pending(flow, (size_t)member_index, &has_pending, &oldest_pn, &oldest_sent_at);
+        feedback->pending_valid = 1;
+        feedback->has_pending = (uint8_t)has_pending;
+        feedback->oldest_pending_pn = oldest_pn;
+        feedback->oldest_pending_sent_at = oldest_sent_at;
         quicly_flexicast_cc_on_feedback(flow->cc, feedback);
-        sync_member_cc_pending(flow, (size_t)member_index, feedback->now);
     }
 }
 
@@ -1731,12 +1877,10 @@ static size_t retire_loss_range(quicly_flexicast_flow_t *flow, int member_index,
             ++retired;
             ++flow->members[member_index].stats.lost_packets;
             flow->members[member_index].stats.lost_bytes += sent->packet_size;
+            record_ecn_unreported_retirement(&flow->members[member_index], packet_number, packet_number + 1);
             if (packet_number >= flow->members[member_index].path_sample_floor) {
-                ++flow->members[member_index].current_route_lost_packets;
                 ++feedback->lost_packets;
                 feedback->lost_bytes += sent->packet_size;
-            } else {
-                ++flow->members[member_index].old_lost_unacked;
             }
             if (sent->pending_count == 0)
                 ++*num_completed;
@@ -1788,6 +1932,8 @@ int quicly_flexicast_ack_packet(quicly_flexicast_flow_t *flow, uint64_t member_i
                          ? QUICLY_FLEXICAST_ACK_OMIT_RTT | QUICLY_FLEXICAST_ACK_OMIT_DELIVERY_RATE
                          : 0;
     (void)acknowledge_packet(flow, member_index, packet_number, now, &feedback, &observation, &num_completed, flags, &total_acked);
+    if (total_acked != 0)
+        record_ecn_unreported_retirement(&flow->members[member_index], packet_number, packet_number + 1);
     *complete = num_completed != 0;
     retired_lost = retire_lost_packets(flow, member_index, packet_number, &feedback, &num_completed);
     if (packet_number > flow->members[member_index].stats.largest_acknowledged)
@@ -1877,28 +2023,26 @@ int quicly_flexicast_ack_frame(quicly_flexicast_flow_t *flow, uint64_t member_id
     if (frame->largest_acknowledged < flow->members[member_index].path_sample_floor)
         flags |= QUICLY_FLEXICAST_ACK_OMIT_RTT | QUICLY_FLEXICAST_ACK_OMIT_DELIVERY_RATE;
     feedback.ack_delay_msec = clamp_msec(frame->ack_delay);
-    uint64_t spurious_old_limit = flow->members[member_index].loss_cursor < flow->members[member_index].path_sample_floor
-                                      ? flow->members[member_index].loss_cursor
-                                      : flow->members[member_index].path_sample_floor;
-    uint64_t spurious_old_in_frame = 0;
+    uint64_t spurious_old = 0;
+    int has_unreported_retired = flow->members[member_index].ecn_unreported_retired.num_ranges != 0;
+    uint64_t old_floor_excl = flow->members[member_index].path_sample_floor;
     largest = frame->largest_acknowledged;
     for (uint64_t i = 0; i <= frame->num_gaps; ++i) {
         uint64_t smallest = largest - (frame->ack_block_lengths[i] - 1);
-        if (flow->members[member_index].old_lost_unacked != 0 && smallest < spurious_old_limit &&
-            largest >= flow->first_packet_number) {
+        if (has_unreported_retired && largest >= flow->first_packet_number) {
             uint64_t lo = smallest < flow->first_packet_number ? flow->first_packet_number : smallest;
-            uint64_t hi = largest < spurious_old_limit ? largest : spurious_old_limit - 1;
-            if (lo <= hi)
-                spurious_old_in_frame += hi - lo + 1;
+            uint64_t hi_excl = largest + 1;
+            if (lo < old_floor_excl) {
+                uint64_t old_hi = hi_excl < old_floor_excl ? hi_excl : old_floor_excl;
+                spurious_old += count_ecn_unreported_overlap(&flow->members[member_index].ecn_unreported_retired, lo, old_hi);
+            }
+            (void)quicly_ranges_subtract(&flow->members[member_index].ecn_unreported_retired, lo, hi_excl);
+            has_unreported_retired = flow->members[member_index].ecn_unreported_retired.num_ranges != 0;
         }
         acknowledge_range(flow, member_index, smallest, largest, now, &feedback, &observation, &completed, flags, &total_acked);
         if (i != frame->num_gaps)
             largest = smallest - frame->gaps[i] - 1;
     }
-    uint64_t spurious_old = spurious_old_in_frame < flow->members[member_index].old_lost_unacked
-                                ? spurious_old_in_frame
-                                : flow->members[member_index].old_lost_unacked;
-    flow->members[member_index].old_lost_unacked -= spurious_old;
     if (!(flags & QUICLY_FLEXICAST_ACK_DEFER_LOSS))
         retired_lost = retire_lost_packets(flow, member_index, frame->largest_acknowledged, &feedback, &completed);
     if (frame->largest_acknowledged > flow->members[member_index].stats.largest_acknowledged)
@@ -1951,6 +2095,7 @@ int quicly_flexicast_abandon_datagram(quicly_flexicast_flow_t *flow, uint64_t me
     if (!sent_has_member(flow, sent, (size_t)member_index))
         return QUICLY_FLEXICAST_ERROR_REPLAY;
     (void)sent_clear_member(flow, sent, (size_t)member_index);
+    record_ecn_unreported_retirement(&flow->members[member_index], packet_number, packet_number + 1);
     *complete = sent->pending_count == 0;
     if (flow->members[member_index].active)
         sync_member_cc_pending(flow, (size_t)member_index, INT64_MIN);
@@ -2013,8 +2158,6 @@ int quicly_flexicast_reset_member_path(quicly_flexicast_flow_t *flow, uint64_t m
     if (flow == NULL || (index = find_known_member(flow, member_id)) < 0)
         return QUICLY_FLEXICAST_ERROR_NOT_FOUND;
     quicly_flexicast_member_t *member = flow->members + index;
-    member->old_lost_unacked += member->current_route_lost_packets;
-    member->current_route_lost_packets = 0;
     member->path_sample_floor = flow->next_packet_number;
     member->cc_pending_cursor = flow->next_packet_number;
     member->stats.latest_rtt_msec = member->stats.minimum_rtt_msec = member->stats.smoothed_rtt_msec = 0;
