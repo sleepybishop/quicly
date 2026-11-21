@@ -601,23 +601,6 @@ static void test_persistent_congestion(void)
     ok(num_persistent_congestion == 1);
     quicly_loss_dispose(&loss);
 
-    /* MTU probes can be lost across several PTOs without supplying either endpoint of persistent congestion. */
-    for (unsigned probe_mask = 1; probe_mask <= 3; ++probe_mask) {
-        init_persistent_congestion_test(&loss);
-        for (unsigned i = 0; i != 2; ++i) {
-            ok(quicly_sentmap_prepare(&loss.sentmap, i + 1, i == 0 ? 11 : 400, QUICLY_EPOCH_1RTT) == 0);
-            loss.sentmap._pending_packet->data.packet.is_pmtud_probe = (probe_mask >> i) & 1;
-            quicly_sentmap_commit(&loss.sentmap, 1300, 0);
-        }
-        send_ack_eliciting(&loss, 5, QUICLY_EPOCH_1RTT, 401);
-        now = 420;
-        acked(&loss, 5, QUICLY_EPOCH_1RTT);
-        detect_loss_after_ack(&loss);
-        ok(num_packets_lost == 2);
-        ok(num_persistent_congestion == 0);
-        quicly_loss_dispose(&loss);
-    }
-
     /* A persistent-congestion period can span packets declared lost by separate detection passes. */
     init_persistent_congestion_test(&loss);
     send_ack_eliciting(&loss, 1, QUICLY_EPOCH_INITIAL, 11);

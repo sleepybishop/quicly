@@ -222,6 +222,7 @@ static void test_ack_encode_capacity(void)
     quicly_ranges_clear(&ranges);
 }
 
+#if QUICLY_HAVE_FLEXICAST
 static quicly_flexicast_flow_id_t make_fc_flow_id(size_t len)
 {
     quicly_flexicast_flow_id_t flow_id = {0};
@@ -355,6 +356,7 @@ static void test_flexicast_frames(void)
            QUICLY_TRANSPORT_ERROR_FRAME_ENCODING);
     }
 }
+#endif
 
 static void test_mozquic(void)
 {
@@ -482,6 +484,8 @@ void test_frame(void)
     subtest("ack-encode", test_ack_encode);
     subtest("ack-encode-capacity", test_ack_encode_capacity);
     subtest("multipath-frames", test_multipath_frames);
+#if QUICLY_HAVE_FLEXICAST
     subtest("flexicast-frames", test_flexicast_frames);
+#endif
     subtest("mozquic", test_mozquic);
 }

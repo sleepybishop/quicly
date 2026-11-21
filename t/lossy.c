@@ -493,7 +493,7 @@ static void test_bidirectional(void)
         subtest("75%", loss_core);
         time_spent[i] = quic_now - 1;
     }
-    /* Per-epoch PTO and fractional RTT affect recovery under bidirectional loss. */
+    /* Finer ACK-delay reporting and fractional RTT/PTO calculations change the recovery timing distribution. */
     subtest("bidi-stats-75%", loss_check_stats, time_spent, 21, 208569, 241000, 35553, 61000, 650165);
 
     for (i = 0; i != 100; ++i) {

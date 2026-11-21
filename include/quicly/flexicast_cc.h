@@ -1,6 +1,11 @@
 #ifndef quicly_flexicast_cc_h
 #define quicly_flexicast_cc_h
 
+#include "quicly/constants.h"
+#if !QUICLY_HAVE_FLEXICAST
+#error "flexicast support is disabled in this build"
+#endif
+
 #ifdef __cplusplus
 extern "C" {
 #endif
@@ -69,6 +74,11 @@ typedef struct st_quicly_flexicast_feedback_t {
     uint32_t applied_ack_delay_msec;
     uint32_t rtt_sample_flags;
     int64_t now;
+    /* post-retirement pending packet state for this member when pending_valid is non-zero */
+    uint64_t oldest_pending_pn;
+    int64_t oldest_pending_sent_at;
+    uint8_t pending_valid;
+    uint8_t has_pending;
 } quicly_flexicast_feedback_t;
 
 #define QUICLY_FLEXICAST_CC_REASON_NONE 0U
@@ -89,22 +99,26 @@ typedef struct st_quicly_flexicast_cc_output_t {
 
 struct st_quicly_flexicast_cc_type_t {
     const char *name;
-    void (*on_member_added)(quicly_flexicast_cc_t *cc, uint64_t member_id, int64_t now);
+    int (*on_member_added)(quicly_flexicast_cc_t *cc, uint64_t member_id, int64_t now);
     void (*on_member_removed)(quicly_flexicast_cc_t *cc, uint64_t member_id, int64_t now);
     void (*on_member_suspended)(quicly_flexicast_cc_t *cc, uint64_t member_id, int64_t now);
     void (*on_epoch_reset)(quicly_flexicast_cc_t *cc, int64_t now);
+    void (*on_packet_sent)(quicly_flexicast_cc_t *cc, uint64_t packet_number, size_t packet_size, int64_t now);
     void (*on_feedback)(quicly_flexicast_cc_t *cc, const quicly_flexicast_feedback_t *feedback);
     void (*on_timeout)(quicly_flexicast_cc_t *cc, int64_t now);
+    void (*on_member_pending_updated)(quicly_flexicast_cc_t *cc, uint64_t member_id, int has_pending, uint64_t oldest_pending_pn,
+                                      int64_t oldest_sent_at, int64_t now);
 };
 
 struct st_quicly_flexicast_cc_t {
     quicly_flexicast_cc_type_t *type;
+    /* flow instance currently attached to this controller; NULL when unbound */
+    void *bound_flow;
     quicly_flexicast_cc_config_t config;
     quicly_flexicast_cc_output_t output;
 };
 
-extern quicly_flexicast_cc_type_t quicly_flexicast_cc_type_multicast;
-
+/* creates a built-in multicast congestion controller; destroy with quicly_flexicast_cc_free_multicast */
 quicly_flexicast_cc_t *quicly_flexicast_cc_new_multicast(const quicly_flexicast_cc_config_t *config, int64_t now);
 void quicly_flexicast_cc_free_multicast(quicly_flexicast_cc_t *cc);
 
@@ -165,16 +179,19 @@ static inline int quicly_flexicast_cc_init(quicly_flexicast_cc_t *cc, quicly_fle
     return 0;
 }
 
-static inline void quicly_flexicast_cc_on_member_added(quicly_flexicast_cc_t *cc, uint64_t member_id, int64_t now)
+static inline int quicly_flexicast_cc_on_member_added(quicly_flexicast_cc_t *cc, uint64_t member_id, int64_t now)
 {
-    if (cc == NULL || member_id == 0)
-        return;
+    if (cc == NULL)
+        return 0;
+    if (member_id == 0)
+        return -1;
     if (cc->type->on_member_added != NULL) {
-        cc->type->on_member_added(cc, member_id, now);
+        int ret = cc->type->on_member_added(cc, member_id, now);
         quicly_flexicast_cc_normalize_output(cc);
-    } else {
-        cc->output.reason = QUICLY_FLEXICAST_CC_REASON_NONE;
+        return ret;
     }
+    cc->output.reason = QUICLY_FLEXICAST_CC_REASON_NONE;
+    return 0;
 }
 
 static inline void quicly_flexicast_cc_on_member_removed(quicly_flexicast_cc_t *cc, uint64_t member_id, int64_t now)
@@ -213,6 +230,28 @@ static inline void quicly_flexicast_cc_on_epoch_reset(quicly_flexicast_cc_t *cc,
         quicly_flexicast_cc_normalize_output(cc);
     } else {
         cc->output.reason = QUICLY_FLEXICAST_CC_REASON_NONE;
+    }
+}
+
+static inline void quicly_flexicast_cc_on_packet_sent(quicly_flexicast_cc_t *cc, uint64_t packet_number, size_t packet_size,
+                                                      int64_t now)
+{
+    if (cc == NULL)
+        return;
+    if (cc->type->on_packet_sent != NULL) {
+        cc->type->on_packet_sent(cc, packet_number, packet_size, now);
+        quicly_flexicast_cc_normalize_output(cc);
+    }
+}
+
+static inline void quicly_flexicast_cc_on_member_pending_updated(quicly_flexicast_cc_t *cc, uint64_t member_id, int has_pending,
+                                                                 uint64_t oldest_pending_pn, int64_t oldest_sent_at, int64_t now)
+{
+    if (cc == NULL)
+        return;
+    if (cc->type->on_member_pending_updated != NULL) {
+        cc->type->on_member_pending_updated(cc, member_id, has_pending, oldest_pending_pn, oldest_sent_at, now);
+        quicly_flexicast_cc_normalize_output(cc);
     }
 }
 

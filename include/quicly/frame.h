@@ -1103,6 +1103,25 @@ typedef struct st_quicly_flexicast_flow_id_t {
     uint8_t bytes[QUICLY_FLEXICAST_MAX_FLOW_ID_SIZE];
 } quicly_flexicast_flow_id_t;
 
+static inline int quicly_flexicast_flow_id_is_valid(const quicly_flexicast_flow_id_t *flow_id)
+{
+    return flow_id != NULL && flow_id->len >= 1 && flow_id->len <= QUICLY_FLEXICAST_MAX_FLOW_ID_SIZE;
+}
+
+static inline int quicly_flexicast_flow_id_equal(const quicly_flexicast_flow_id_t *a, const quicly_flexicast_flow_id_t *b)
+{
+    return a != NULL && b != NULL && a->len == b->len && memcmp(a->bytes, b->bytes, a->len) == 0;
+}
+
+static inline quicly_flexicast_flow_id_t quicly_flexicast_flow_id_init(const void *bytes, uint8_t len)
+{
+    quicly_flexicast_flow_id_t id = {0};
+    assert(bytes != NULL && len >= 1 && len <= QUICLY_FLEXICAST_MAX_FLOW_ID_SIZE);
+    id.len = len;
+    memcpy(id.bytes, bytes, len);
+    return id;
+}
+
 typedef struct st_quicly_flexicast_announce_frame_t {
     quicly_flexicast_flow_id_t flow_id;
     uint64_t sequence;
@@ -1140,6 +1159,7 @@ typedef struct st_quicly_flexicast_frame_t {
 #define QUICLY_FLEXICAST_STATE_LEAVE 2
 #define QUICLY_FLEXICAST_STATE_LISTEN 3
 
+#if QUICLY_HAVE_FLEXICAST
 size_t quicly_fc_announce_frame_capacity(const quicly_flexicast_announce_frame_t *frame);
 uint8_t *quicly_encode_fc_announce_frame(uint8_t *dst, const quicly_flexicast_announce_frame_t *frame);
 quicly_error_t quicly_decode_fc_announce_frame(const uint8_t **src, const uint8_t *end,
@@ -1152,6 +1172,7 @@ quicly_error_t quicly_decode_fc_state_frame(const uint8_t **src, const uint8_t *
 size_t quicly_fc_key_frame_capacity(const quicly_flexicast_key_frame_t *frame);
 uint8_t *quicly_encode_fc_key_frame(uint8_t *dst, const quicly_flexicast_key_frame_t *frame);
 quicly_error_t quicly_decode_fc_key_frame(const uint8_t **src, const uint8_t *end, quicly_flexicast_key_frame_t *frame);
+#endif
 
 #ifdef __cplusplus
 }

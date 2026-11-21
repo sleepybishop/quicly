@@ -200,14 +200,10 @@ uint8_t *quicly_encode_close_frame(uint8_t *const base, uint64_t error_code, uin
     return base + encode_close_frame(base, error_code, offending_frame_type, reason_phrase);
 }
 
-static int valid_fc_flow_id(const quicly_flexicast_flow_id_t *flow_id)
-{
-    return flow_id != NULL && flow_id->len >= 1 && flow_id->len <= QUICLY_FLEXICAST_MAX_FLOW_ID_SIZE;
-}
-
+#if QUICLY_HAVE_FLEXICAST
 static size_t fc_frame_prefix_capacity(uint64_t frame_type, const quicly_flexicast_flow_id_t *flow_id, uint64_t sequence)
 {
-    if (!valid_fc_flow_id(flow_id) || sequence > PTLS_QUICINT_MAX)
+    if (!quicly_flexicast_flow_id_is_valid(flow_id) || sequence > PTLS_QUICINT_MAX)
         return 0;
     return quicly_encodev_capacity(frame_type) + 1 + flow_id->len + quicly_encodev_capacity(sequence);
 }
@@ -228,7 +224,7 @@ static quicly_error_t decode_fc_frame_prefix(const uint8_t **src, const uint8_t 
     if (*src == end)
         return QUICLY_TRANSPORT_ERROR_FRAME_ENCODING;
     flow_id->len = *(*src)++;
-    if (!valid_fc_flow_id(flow_id) || (size_t)(end - *src) < flow_id->len)
+    if (!quicly_flexicast_flow_id_is_valid(flow_id) || (size_t)(end - *src) < flow_id->len)
         return QUICLY_TRANSPORT_ERROR_FRAME_ENCODING;
     memcpy(flow_id->bytes, *src, flow_id->len);
     *src += flow_id->len;
@@ -370,3 +366,4 @@ quicly_error_t quicly_decode_fc_key_frame(const uint8_t **src, const uint8_t *en
     frame->algorithm = quicly_decode64(src);
     return 0;
 }
+#endif

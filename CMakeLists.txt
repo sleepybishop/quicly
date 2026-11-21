@@ -15,7 +15,7 @@ IF (OPENSSL_FOUND AND (OPENSSL_VERSION VERSION_LESS "1.0.2"))
     MESSAGE(FATAL "OpenSSL 1.0.2 or above is missing")
 ENDIF ()
 
-CHECK_DTRACE(${CMAKE_SOURCE_DIR}/deps/picotls/picotls-probes.d)
+CHECK_DTRACE(${CMAKE_CURRENT_SOURCE_DIR}/deps/picotls/picotls-probes.d)
 OPTION(WITH_DTRACE "use USDT (userspace Dtrace probes)" ${HAVE_DTRACE})
 IF (WITH_DTRACE)
     MESSAGE(STATUS "Enabling USDT support")
@@ -101,12 +101,14 @@ IF (BUILD_FLEXICAST)
         t/flexicast-cc-regression.c
         t/flexicast-crypto.c
         t/flexicast-packet.c)
+ELSE ()
+    SET(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -DQUICLY_HAVE_FLEXICAST=0")
 ENDIF ()
 
 IF (WITH_DTRACE)
     SET(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -DPICOTLS_USE_DTRACE=1 -DQUICLY_USE_DTRACE=1")
-    DEFINE_DTRACE_DEPENDENCIES(${CMAKE_SOURCE_DIR}/deps/picotls/picotls-probes.d picotls)
-    DEFINE_DTRACE_DEPENDENCIES(${CMAKE_SOURCE_DIR}/quicly-probes.d quicly)
+    DEFINE_DTRACE_DEPENDENCIES(${CMAKE_CURRENT_SOURCE_DIR}/deps/picotls/picotls-probes.d picotls)
+    DEFINE_DTRACE_DEPENDENCIES(${CMAKE_CURRENT_SOURCE_DIR}/quicly-probes.d quicly)
     LIST(APPEND PICOTLS_OPENSSL_FILES ${CMAKE_CURRENT_BINARY_DIR}/picotls-probes.h)
     LIST(APPEND QUICLY_LIBRARY_FILES ${CMAKE_CURRENT_BINARY_DIR}/quicly-probes.h)
     LIST(APPEND UNITTEST_SOURCE_FILES ${CMAKE_CURRENT_BINARY_DIR}/quicly-probes.h)
@@ -119,16 +121,24 @@ ENDIF ()
 
 ADD_CUSTOM_COMMAND(
     OUTPUT quicly-tracer.h
-    COMMAND ${PROJECT_SOURCE_DIR}/misc/probe2trace.pl -a tracer < ${PROJECT_SOURCE_DIR}/quicly-probes.d > ${CMAKE_CURRENT_BINARY_DIR}/quicly-tracer.h
-    DEPENDS quicly-probes.d misc/probe2trace.pl
+    COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/misc/probe2trace.pl -a tracer < ${CMAKE_CURRENT_SOURCE_DIR}/quicly-probes.d > ${CMAKE_CURRENT_BINARY_DIR}/quicly-tracer.h
+    DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/quicly-probes.d ${CMAKE_CURRENT_SOURCE_DIR}/misc/probe2trace.pl
     VERBATIM)
 
 ADD_LIBRARY(quicly ${QUICLY_LIBRARY_FILES})
-TARGET_LINK_LIBRARIES(quicly LINK_PUBLIC m)
+TARGET_INCLUDE_DIRECTORIES(quicly PUBLIC
+    ${CMAKE_CURRENT_SOURCE_DIR}/include
+    ${CMAKE_CURRENT_SOURCE_DIR}/deps/picotls/include)
+IF (BUILD_FLEXICAST)
+    TARGET_COMPILE_DEFINITIONS(quicly PUBLIC QUICLY_HAVE_FLEXICAST=1)
+ELSE ()
+    TARGET_COMPILE_DEFINITIONS(quicly PUBLIC QUICLY_HAVE_FLEXICAST=0)
+ENDIF ()
+TARGET_LINK_LIBRARIES(quicly PUBLIC m)
 
 IF (BUILD_FLEXICAST)
     ADD_LIBRARY(quicly-flexicast ${FLEXICAST_LIBRARY_FILES})
-    TARGET_LINK_LIBRARIES(quicly-flexicast quicly)
+    TARGET_LINK_LIBRARIES(quicly-flexicast PUBLIC quicly)
 ENDIF ()
 
 SET(CLI_FILES ${PICOTLS_OPENSSL_FILES} ${QUICLY_LIBRARY_FILES} src/cli.c)
@@ -146,12 +156,6 @@ IF (BUILD_FLEXICAST)
     TARGET_LINK_LIBRARIES(test.t quicly-flexicast quicly ${OPENSSL_CRYPTO_LIBRARIES} ${CMAKE_DL_LIBS})
 ELSE ()
     TARGET_LINK_LIBRARIES(test.t quicly ${OPENSSL_CRYPTO_LIBRARIES} ${CMAKE_DL_LIBS})
-ENDIF ()
-
-IF (BUILD_FLEXICAST)
-    ADD_EXECUTABLE(flexicast-test.t ${PICOTLS_OPENSSL_FILES} deps/picotest/picotest.c t/flexicast.c t/flexicast-cc-regression.c
-        t/flexicast-crypto.c t/flexicast-packet.c t/flexicast-main.c)
-    TARGET_LINK_LIBRARIES(flexicast-test.t quicly-flexicast quicly ${OPENSSL_CRYPTO_LIBRARIES} ${CMAKE_DL_LIBS})
 ENDIF ()
 
 ADD_EXECUTABLE(simulator ${PICOTLS_OPENSSL_FILES} ${QUICLY_LIBRARY_FILES} t/simulator.c)
@@ -174,15 +178,13 @@ ADD_EXECUTABLE(http09 EXCLUDE_FROM_ALL t/http09.c ${PICOTLS_OPENSSL_FILES})
 TARGET_LINK_LIBRARIES(http09 ${OPENSSL_CRYPTO_LIBRARIES} ${CMAKE_DL_LIBS})
 
 SET(CHECK_DEPENDS cli udpfw test.t)
-IF (BUILD_FLEXICAST)
-    LIST(APPEND CHECK_DEPENDS flexicast-test.t)
-ENDIF ()
 
 ADD_CUSTOM_TARGET(check
     sh -c
         "PERL5LIB='${CMAKE_CURRENT_SOURCE_DIR}'\${PERL5LIB:+:\$PERL5LIB} \
          BINARY_DIR='${CMAKE_CURRENT_BINARY_DIR}' \
          WITH_DTRACE=${WITH_DTRACE} \
+         BUILD_FLEXICAST=${BUILD_FLEXICAST} \
          exec prove --exec 'sh -c' -v ${CMAKE_CURRENT_BINARY_DIR}/*.t t/*.t"
     WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}
     DEPENDS ${CHECK_DEPENDS}
