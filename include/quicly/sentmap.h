@@ -187,12 +187,10 @@ struct st_quicly_sent_t {
             uint32_t path_id;
             uint64_t sequence;
         } retire_connection_id;
-#if QUICLY_HAVE_FLEXICAST
         struct {
             uint64_t id;
             uint64_t generation;
         } flexicast_control;
-#endif
     } data;
 };
 

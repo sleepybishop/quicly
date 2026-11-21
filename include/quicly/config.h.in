@@ -1,6 +1,0 @@
-#ifndef quicly_config_h
-#define quicly_config_h
-
-#cmakedefine01 QUICLY_HAVE_FLEXICAST
-
-#endif

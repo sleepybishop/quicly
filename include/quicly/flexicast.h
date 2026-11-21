@@ -1,12 +1,11 @@
 #ifndef quicly_flexicast_h
 #define quicly_flexicast_h
 
-#include "quicly/config.h"
+#include "quicly.h"
 #if !QUICLY_HAVE_FLEXICAST
 #error "flexicast support is disabled in this build"
 #endif
 
-#include "quicly.h"
 #include "quicly/flexicast_cc.h"
 
 #ifdef __cplusplus

@@ -1170,12 +1170,11 @@ static void test_sparse_control_regressions(void)
     ok(quicly_flexicast_attach(flow, 7, 130) == QUICLY_FLEXICAST_OK && quicly_flexicast_num_members(flow) == 1);
     quicly_flexicast_flow_free(flow);
 
-    /* in-place ack_delay updates support live changes, 0 ms immediate ACK, and >UINT32_MAX clamping */
+    /* in-place ack_delay updates support live changes, 0 ms immediate ACK, and >UINT32_MAX clamping across all uint64_t */
     quicly_flexicast_flow_t *tx_delay = create_flow(2010, secret), *rx_delay = create_flow(2010, secret);
     ptls_iovec_t rx_payload;
     uint64_t rx_pn;
     ok(quicly_flexicast_set_ack_delay(NULL, 10) == QUICLY_FLEXICAST_ERROR_INVALID);
-    ok(quicly_flexicast_set_ack_delay(rx_delay, PTLS_QUICINT_MAX + 1) == QUICLY_FLEXICAST_ERROR_INVALID);
     ok(quicly_flexicast_attach(tx_delay, 1, 100) == QUICLY_FLEXICAST_OK);
     regression_send(tx_delay, packet, sizeof(packet), &size, &pn, 100);
     ok(quicly_flexicast_receive_datagram(rx_delay, packet, size, &rx_payload, &rx_pn, 0, 100) == QUICLY_FLEXICAST_OK);
@@ -1191,6 +1190,10 @@ static void test_sparse_control_regressions(void)
     ok(quicly_flexicast_receive_datagram(rx_delay, packet, size, &rx_payload, &rx_pn, 0, 120) == QUICLY_FLEXICAST_OK);
     ok(quicly_flexicast_get_ack_deadline(rx_delay) == 120 && quicly_flexicast_ack_is_due(rx_delay, 120));
     ok(quicly_flexicast_set_ack_delay(rx_delay, (uint64_t)UINT32_MAX + 500) == QUICLY_FLEXICAST_OK);
+    ok(quicly_flexicast_get_ack_deadline(rx_delay) == 120 + (int64_t)UINT32_MAX);
+    ok(quicly_flexicast_set_ack_delay(rx_delay, PTLS_QUICINT_MAX + 1) == QUICLY_FLEXICAST_OK);
+    ok(quicly_flexicast_get_ack_deadline(rx_delay) == 120 + (int64_t)UINT32_MAX);
+    ok(quicly_flexicast_set_ack_delay(rx_delay, UINT64_MAX) == QUICLY_FLEXICAST_OK);
     ok(quicly_flexicast_get_ack_deadline(rx_delay) == 120 + (int64_t)UINT32_MAX);
     quicly_flexicast_flow_free(rx_delay);
     quicly_flexicast_flow_free(tx_delay);
@@ -1213,6 +1216,64 @@ static void test_sparse_control_regressions(void)
     ok(test_last_feedback.delivery_rate_sample_epoch == 2);
     ok((test_last_feedback.delivery_sample_flags & QUICLY_FLEXICAST_SAMPLE_APP_LIMITED) != 0);
     quicly_flexicast_flow_free(flow);
+
+    /* per-member limitation history preserves member 1's APP_LIMITED evidence across 2049 recipients */
+    test_flexicast_cc_t many_cc = {0};
+    quicly_flexicast_cc_config_t many_cc_cfg = {.maximum_members = 2049};
+    ok(quicly_flexicast_cc_init(&many_cc.super, &test_cc_type, &many_cc_cfg) == 0);
+    quicly_flexicast_config_t many_cfg = {.flow_id = make_test_flow_id(2012),
+                                          .cipher_suite = &ptls_openssl_aes128gcmsha256,
+                                          .crypto_engine = &quicly_default_crypto_engine,
+                                          .traffic_secret = ptls_iovec_init(secret, ptls_openssl_aes128gcmsha256.hash->digest_size),
+                                          .max_members = 2049,
+                                          .cc = &many_cc.super,
+                                          .now = 100};
+    ok(quicly_flexicast_flow_create(&flow, &many_cfg) == QUICLY_FLEXICAST_OK);
+    for (uint64_t mid = 1; mid <= 2049; ++mid)
+        ok(quicly_flexicast_attach(flow, mid, 100) == QUICLY_FLEXICAST_OK);
+    regression_send(flow, packet, sizeof(packet), &size, &pn, 100); /* pn 0 */
+    ok(quicly_flexicast_mark_submitted(flow, 1, 0, 100, &ctx) == QUICLY_FLEXICAST_OK);
+    regression_ack(flow, 1, 0, 0, 0, 110);
+    regression_send(flow, packet, sizeof(packet), &size, &pn, 120); /* pn 1: lost APP_LIMITED for member 1 + 2048 others */
+    for (uint64_t mid = 1; mid <= 2049; ++mid)
+        ok(quicly_flexicast_mark_submitted(flow, mid, 1, 120 + (int64_t)(mid > 1), &app_limited) == QUICLY_FLEXICAST_OK);
+    regression_send(flow, packet, sizeof(packet), &size, &pn, 140); /* pn 2 */
+    ok(quicly_flexicast_mark_submitted(flow, 1, 2, 140, &ctx) == QUICLY_FLEXICAST_OK);
+    regression_ack(flow, 1, 2, 2, 0, 150);                          /* bucket spans [100, 140], containing lost pn 1 at 120 */
+    regression_send(flow, packet, sizeof(packet), &size, &pn, 160); /* pn 3 */
+    ok(quicly_flexicast_mark_submitted(flow, 1, 3, 160, &ctx) == QUICLY_FLEXICAST_OK);
+    regression_ack(flow, 1, 3, 3, 0, 170); /* closes [100, 140] */
+    ok(test_last_feedback.delivery_rate_sample_epoch == 1);
+    ok((test_last_feedback.delivery_sample_flags & QUICLY_FLEXICAST_SAMPLE_APP_LIMITED) != 0);
+    quicly_flexicast_flow_free(flow);
+
+    /* cumulative ACK_ECN straddling reset_member_path does not penalize the new route unless CE exceeds old-route packets */
+    quicly_flexicast_cc_config_t ecn_cc_cfg = {.startup_rate_bytes_per_second = 100000, .feedback_timeout_msec = 300};
+    quicly_flexicast_cc_t *ecn_cc = quicly_flexicast_cc_new_multicast(&ecn_cc_cfg, 100);
+    ok(ecn_cc != NULL);
+    many_cfg.flow_id = make_test_flow_id(2013);
+    many_cfg.max_members = 4;
+    many_cfg.cc = ecn_cc;
+    ok(quicly_flexicast_flow_create(&flow, &many_cfg) == QUICLY_FLEXICAST_OK);
+    ok(quicly_flexicast_attach(flow, 1, 100) == QUICLY_FLEXICAST_OK);
+    regression_send(flow, packet, sizeof(packet), &size, &pn, 100); /* pn 0 marked on old route */
+    ok(quicly_flexicast_reset_member_path(flow, 1, 110) == QUICLY_FLEXICAST_OK);
+    regression_send(flow, packet, sizeof(packet), &size, &pn, 120); /* pn 1 unmarked on new route */
+    quicly_ack_frame_t straddle_ack = {.largest_acknowledged = 1, .smallest_acknowledged = 0, .ack_block_lengths = {2}};
+    straddle_ack.ecn_counts[2] = 1;
+    ok(quicly_flexicast_ack_frame(flow, 1, &straddle_ack, 0, NULL, NULL, NULL, 130) == QUICLY_FLEXICAST_OK);
+    quicly_flexicast_cc_output_t ecn_out;
+    quicly_flexicast_cc_get_flow_output(flow, &ecn_out);
+    uint64_t rate_after_straddle = ecn_out.rate_bytes_per_second;
+    ok(rate_after_straddle >= 100000 && (ecn_out.reason & QUICLY_FLEXICAST_CC_REASON_ECN) == 0);
+    regression_send(flow, packet, sizeof(packet), &size, &pn, 140); /* pn 2 marked on new route */
+    quicly_ack_frame_t new_ce_ack = {.largest_acknowledged = 2, .smallest_acknowledged = 0, .ack_block_lengths = {3}};
+    new_ce_ack.ecn_counts[2] = 2;
+    ok(quicly_flexicast_ack_frame(flow, 1, &new_ce_ack, 0, NULL, NULL, NULL, 150) == QUICLY_FLEXICAST_OK);
+    quicly_flexicast_cc_get_flow_output(flow, &ecn_out);
+    ok(ecn_out.rate_bytes_per_second < rate_after_straddle && (ecn_out.reason & QUICLY_FLEXICAST_CC_REASON_ECN) != 0);
+    quicly_flexicast_flow_free(flow);
+    quicly_flexicast_cc_free_multicast(ecn_cc);
 }
 
 void test_flexicast(void)

@@ -7,20 +7,12 @@ use Test::More;
 plan skip_all => "c++ not found"
     unless system("which c++ > /dev/null 2>&1") == 0;
 
-my $binary_dir = $ENV{BINARY_DIR} || ".";
-my $src = <<'EOT';
-#include "quicly.h"
-#if QUICLY_HAVE_FLEXICAST
-#include "quicly/flexicast_cc.h"
-#include "quicly/flexicast.h"
-#endif
-EOT
+my $flexicast_off = defined $ENV{BUILD_FLEXICAST} && $ENV{BUILD_FLEXICAST} =~ /^(?:OFF|0|FALSE|NO)$/i;
+my @args = qw(c++ -Iinclude -Ideps/picotls/include --include quicly.h);
+push @args, qw(--include quicly/flexicast_cc.h --include quicly/flexicast.h)
+    unless $flexicast_off;
+push @args, qw(-c -x c++ -Wall /dev/null);
 
-open my $fh, "|-", "c++", "-I$binary_dir/include", "-Iinclude", "-Ideps/picotls/include", "-c", "-x", "c++", "-Wall", "-o", "/dev/null", "-"
-    or die "failed to spawn c++: $!";
-print $fh $src;
-my $ok = close $fh;
-
-ok($ok);
+is system(@args), 0;
 
 done_testing;

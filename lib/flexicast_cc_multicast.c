@@ -13,6 +13,7 @@ typedef struct st_multicast_member_t {
     uint64_t rate;
     uint64_t growth_remainder;
     uint64_t next_unacked_pn;
+    int64_t oldest_override_sent_at;
     uint32_t minimum_rtt;
     uint32_t smoothed_rtt;
     uint64_t last_feedback_epoch;
@@ -76,8 +77,6 @@ static uint64_t proportional_rate_increase(uint64_t delivered, uint64_t gain, ui
         return UINT64_MAX;
     }
     uint64_t base_inc = whole * gain;
-    if (rem_delivered == 0)
-        return base_inc;
 
 #ifdef __SIZEOF_INT128__
     __uint128_t numer = (__uint128_t)rem_delivered * gain + *remainder;
@@ -88,9 +87,9 @@ static uint64_t proportional_rate_increase(uint64_t delivered, uint64_t gain, ui
     uint64_t q = gain / window, r = gain % window;
     uint64_t sub_inc = rem_delivered * q;
     uint64_t prod_q = 0, prod_r = *remainder % window;
-    sub_inc += *remainder / window;
+    sub_inc = increase_rate(sub_inc, *remainder / window);
     uint64_t a = rem_delivered, b = r;
-    while (b != 0) {
+    while (a != 0 && b != 0) {
         if (b & 1) {
             if (window - prod_r <= a) {
                 ++prod_q;
@@ -141,6 +140,8 @@ static int member_awaiting_feedback(const multicast_state_t *state, const multic
 
 static int64_t member_pkt_sent_at(const multicast_state_t *state, const multicast_member_t *member)
 {
+    if (member->oldest_override_sent_at != INT64_MIN)
+        return member->oldest_override_sent_at;
     if (member->next_unacked_pn <= state->first_sent_pn ||
         state->next_expected_pn - member->next_unacked_pn > MULTICAST_SENT_RING_SIZE)
         return state->first_send_at;
@@ -335,6 +336,7 @@ static multicast_member_t *add_member(multicast_state_t *state, uint64_t id, int
             inactive_unlink(state, (uint32_t)(member - state->members));
             member->active = 1;
             member->next_unacked_pn = state->next_expected_pn;
+            member->oldest_override_sent_at = INT64_MIN;
             member->last_feedback = now;
             member->last_timeout_probe = now;
             member->unanswered_feedback_probes = 0;
@@ -355,6 +357,7 @@ static multicast_member_t *add_member(multicast_state_t *state, uint64_t id, int
     member->active = 1;
     member->prev_inactive = member->next_inactive = MULTICAST_NO_SLOT;
     member->next_unacked_pn = state->next_expected_pn;
+    member->oldest_override_sent_at = INT64_MIN;
     member->rate = quicly_flexicast_cc_clamp_rate(&state->super.config, state->super.config.startup_rate_bytes_per_second);
     member->last_feedback = now;
     member->last_timeout_probe = now;
@@ -413,6 +416,7 @@ static void multicast_on_member_suspended(quicly_flexicast_cc_t *cc, uint64_t me
     multicast_member_t *member = find_member(state, member_id);
     if (member != NULL && member->active) {
         member->active = 0;
+        member->oldest_override_sent_at = INT64_MIN;
         inactive_push_back(state, (uint32_t)(member - state->members));
         heap_update(state, MULTICAST_HEAP_RATE, member);
         heap_update(state, MULTICAST_HEAP_TIMEOUT, member);
@@ -431,6 +435,7 @@ static void multicast_on_epoch_reset(quicly_flexicast_cc_t *cc, int64_t now)
     for (size_t i = 0; i != state->num_members; ++i) {
         state->members[i].growth_remainder = 0;
         state->members[i].next_unacked_pn = 0;
+        state->members[i].oldest_override_sent_at = INT64_MIN;
         state->members[i].last_feedback = now;
         state->members[i].last_feedback_epoch = 0;
         state->members[i].last_timeout_probe = now;
@@ -471,23 +476,32 @@ static void multicast_on_packet_sent(quicly_flexicast_cc_t *cc, uint64_t packet_
         update_output(state, now, state->super.output.reason);
 }
 
-static void multicast_on_packet_retired(quicly_flexicast_cc_t *cc, uint64_t member_id, uint64_t packet_number, int member_caught_up,
-                                        int64_t now)
+static void multicast_on_member_pending_updated(quicly_flexicast_cc_t *cc, uint64_t member_id, int has_pending,
+                                                uint64_t oldest_pending_pn, int64_t oldest_sent_at, int64_t now)
 {
     multicast_state_t *state = (multicast_state_t *)cc;
     multicast_member_t *member = find_member(state, member_id);
     if (member == NULL)
         return;
-    uint64_t target = member_caught_up                                                         ? state->next_expected_pn
-                      : packet_number == member->next_unacked_pn && packet_number < UINT64_MAX ? packet_number + 1
-                                                                                               : member->next_unacked_pn;
-    if (target > member->next_unacked_pn) {
-        member->next_unacked_pn = target;
-        if (member->next_unacked_pn >= state->next_expected_pn)
+    if (now != INT64_MIN)
+        note_event_time(state, now);
+    if (!has_pending) {
+        member->next_unacked_pn = state->next_expected_pn;
+        member->oldest_override_sent_at = INT64_MIN;
+        member->unanswered_feedback_probes = 0;
+    } else {
+        if (oldest_pending_pn != member->next_unacked_pn)
             member->unanswered_feedback_probes = 0;
-        heap_update(state, MULTICAST_HEAP_TIMEOUT, member);
-        update_output(state, now, state->super.output.reason);
+        member->next_unacked_pn = oldest_pending_pn;
+        if (oldest_sent_at > 0) {
+            note_event_time(state, oldest_sent_at);
+            member->oldest_override_sent_at = oldest_sent_at;
+        } else {
+            member->oldest_override_sent_at = INT64_MIN;
+        }
     }
+    heap_update(state, MULTICAST_HEAP_TIMEOUT, member);
+    update_output(state, now != INT64_MIN && now > state->max_event_at ? now : state->max_event_at, state->super.output.reason);
 }
 
 static int reduction_epoch_ready(const multicast_state_t *state, int64_t previous, int64_t now)
@@ -509,7 +523,7 @@ static void multicast_on_feedback(quicly_flexicast_cc_t *cc, const quicly_flexic
     }
     if (feedback->epoch != 0)
         member->last_feedback_epoch = feedback->epoch;
-    if (feedback->acked_packets != 0 || feedback->lost_packets != 0 || feedback->ecn_ce_count != 0) {
+    if (cc->bound_flow == NULL && (feedback->acked_packets != 0 || feedback->lost_packets != 0 || feedback->ecn_ce_count != 0)) {
         uint64_t next_pn = feedback->largest_acknowledged < UINT64_MAX ? feedback->largest_acknowledged + 1 : UINT64_MAX;
         if (next_pn > member->next_unacked_pn)
             member->next_unacked_pn = next_pn;
@@ -608,9 +622,9 @@ static quicly_flexicast_cc_type_t quicly_flexicast_cc_type_multicast = {
     .on_member_suspended = multicast_on_member_suspended,
     .on_epoch_reset = multicast_on_epoch_reset,
     .on_packet_sent = multicast_on_packet_sent,
-    .on_packet_retired = multicast_on_packet_retired,
     .on_feedback = multicast_on_feedback,
     .on_timeout = multicast_on_timeout,
+    .on_member_pending_updated = multicast_on_member_pending_updated,
 };
 
 quicly_flexicast_cc_t *quicly_flexicast_cc_new_multicast(const quicly_flexicast_cc_config_t *config, int64_t now)

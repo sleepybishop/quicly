@@ -373,7 +373,14 @@ static void test_flexicast_control_queue(void)
     ok(conn.egress.flexicast_control.count == 0 && conn.egress.flexicast_control.head == NULL);
     sent.data.flexicast_control.generation = 3;
     ok(on_ack_flexicast_control(&path_space.loss.sentmap, &packet, 1, &sent) == 0);
-    free(conn.egress.flexicast_control.retired_ids);
+    /* sequential ack_path_ids coalesce into a single retired range without hitting a 4096 bind cap */
+    for (uint64_t pid = 1000; pid != 1000 + 5000; ++pid) {
+        quicly_flexicast_flow_id_t seq_fid = make_fc_id_u64(pid);
+        ok(quicly_flexicast_bind_ack_path(&conn, pid, &seq_fid) == 0);
+        ok(quicly_flexicast_unbind_ack_path(&conn, &seq_fid) == 0);
+    }
+    ok(conn.egress.flexicast_control.num_retired_ranges == 3); /* [100, 101), [1000, 6000), [PTLS_QUICINT_MAX, ...) */
+    free(conn.egress.flexicast_control.retired_ranges);
 }
 
 static uint64_t test_flexicast_ack_delay;
@@ -484,7 +491,7 @@ static void test_flexicast_control_receive(void)
                                                              .epoch = QUICLY_EPOCH_1RTT};
     conn.super.local.max_path_id = 12;
     ok(handle_path_abandon_frame(&conn, &abandon_state) == QUICLY_TRANSPORT_ERROR_PROTOCOL_VIOLATION);
-    free(conn.egress.flexicast_control.retired_ids);
+    free(conn.egress.flexicast_control.retired_ranges);
 }
 
 struct st_test_flexicast_announce_order_t {

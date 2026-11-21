@@ -153,9 +153,10 @@ typedef int64_t quicly_error_t;
 #define QUICLY_ERROR_INVALID_INITIAL_VERSION 0xff08
 #define QUICLY_ERROR_DECRYPTION_FAILED 0xff09
 
-#include "quicly/config.h"
+#ifndef QUICLY_HAVE_FLEXICAST
+#define QUICLY_HAVE_FLEXICAST 1
+#endif
 
-#if QUICLY_HAVE_FLEXICAST
 typedef enum en_quicly_flexicast_result_t {
     QUICLY_FLEXICAST_OK = 0,
     QUICLY_FLEXICAST_ERROR_INVALID = -1,
@@ -174,7 +175,6 @@ typedef enum en_quicly_flexicast_result_t {
     QUICLY_FLEXICAST_ERROR_KEY_UPDATE_REQUIRED = -14,
     QUICLY_FLEXICAST_ERROR_STATE_EXHAUSTION = -15
 } quicly_flexicast_result_t;
-#endif
 
 typedef int64_t quicly_stream_id_t;
 

@@ -471,6 +471,127 @@ static void test_abandon_and_exclusive_reuse(void)
     quicly_flexicast_cc_free_multicast(cc);
 }
 
+static size_t positional_cc_feedback_calls;
+static size_t positional_cc_timeout_calls;
+
+static void positional_cc_on_feedback(quicly_flexicast_cc_t *cc, const quicly_flexicast_feedback_t *feedback)
+{
+    (void)cc;
+    (void)feedback;
+    ++positional_cc_feedback_calls;
+}
+
+static void positional_cc_on_timeout(quicly_flexicast_cc_t *cc, int64_t now)
+{
+    (void)cc;
+    (void)now;
+    ++positional_cc_timeout_calls;
+}
+
+/* reordered ACKs, out-of-order abandonments, positional CC table init, and window-shrink growth remainder */
+static void test_reordered_pending_and_remainder(void)
+{
+    static const uint8_t fid[4] = {0x77, 0x66, 0x55, 0x44};
+    uint8_t secret[32] = {0x42};
+    quicly_flexicast_cc_config_t default_cc_cfg = {.startup_rate_bytes_per_second = 100000, .feedback_timeout_msec = 300};
+    quicly_flexicast_config_t cfg = {.flow_id = quicly_flexicast_flow_id_init(fid, sizeof(fid)),
+                                     .cipher_suite = &ptls_openssl_aes128gcmsha256,
+                                     .crypto_engine = &quicly_default_crypto_engine,
+                                     .traffic_secret = ptls_iovec_init(secret, sizeof(secret)),
+                                     .now = 0};
+
+    /* reordered ACK of pn 1 while pn 0 stays pending must keep the feedback timer armed */
+    quicly_flexicast_cc_t *cc = quicly_flexicast_cc_new_multicast(&default_cc_cfg, 0);
+    ok(cc != NULL);
+    cfg.cc = cc;
+    quicly_flexicast_flow_t *flow = NULL;
+    ok(quicly_flexicast_flow_create(&flow, &cfg) == QUICLY_FLEXICAST_OK);
+    ok(quicly_flexicast_attach(flow, 1, 0) == QUICLY_FLEXICAST_OK);
+    uint8_t packet[256], payload = 0x55;
+    size_t size = 0;
+    uint64_t pn0 = 0, pn1 = 0, pn2 = 0;
+    int complete = 0;
+    ok(quicly_flexicast_send_datagram(flow, ptls_iovec_init(&payload, 1), packet, sizeof(packet), &size, &pn0, 10) ==
+       QUICLY_FLEXICAST_OK);
+    ok(quicly_flexicast_send_datagram(flow, ptls_iovec_init(&payload, 1), packet, sizeof(packet), &size, &pn1, 20) ==
+       QUICLY_FLEXICAST_OK);
+    ok(quicly_flexicast_ack_packet(flow, 1, pn1, &complete, 25) == QUICLY_FLEXICAST_OK && complete);
+    quicly_flexicast_cc_output_t output;
+    quicly_flexicast_cc_get_flow_output(flow, &output);
+    ok(output.next_timeout == 325);
+    ok(quicly_flexicast_ack_packet(flow, 1, pn0, &complete, 30) == QUICLY_FLEXICAST_OK && complete);
+    quicly_flexicast_cc_get_flow_output(flow, &output);
+    ok(output.next_timeout == INT64_MAX);
+    quicly_flexicast_flow_free(flow);
+    quicly_flexicast_cc_free_multicast(cc);
+
+    /* abandoning an older timed-out packet leaves deadline anchored on the remaining packet sent at 1010 ms */
+    cc = quicly_flexicast_cc_new_multicast(&default_cc_cfg, 0);
+    ok(cc != NULL);
+    cfg.cc = cc;
+    ok(quicly_flexicast_flow_create(&flow, &cfg) == QUICLY_FLEXICAST_OK);
+    ok(quicly_flexicast_attach(flow, 1, 0) == QUICLY_FLEXICAST_OK);
+    ok(quicly_flexicast_send_datagram(flow, ptls_iovec_init(&payload, 1), packet, sizeof(packet), &size, &pn0, 10) ==
+       QUICLY_FLEXICAST_OK);
+    ok(quicly_flexicast_ack_packet(flow, 1, pn0, &complete, 11) == QUICLY_FLEXICAST_OK && complete);
+    quicly_flexicast_cc_get_flow_output(flow, &output);
+    uint64_t rate_before = output.rate_bytes_per_second;
+    ok(quicly_flexicast_send_datagram(flow, ptls_iovec_init(&payload, 1), packet, sizeof(packet), &size, &pn1, 11) ==
+       QUICLY_FLEXICAST_OK);
+    quicly_flexicast_cc_on_flow_timeout(flow, 311);
+    quicly_flexicast_cc_on_flow_timeout(flow, 611);
+    ok(quicly_flexicast_send_datagram(flow, ptls_iovec_init(&payload, 1), packet, sizeof(packet), &size, &pn2, 1010) ==
+       QUICLY_FLEXICAST_OK);
+    ok(quicly_flexicast_abandon_datagram(flow, 1, pn1, &complete) == QUICLY_FLEXICAST_OK && complete);
+    quicly_flexicast_cc_get_flow_output(flow, &output);
+    ok(output.next_timeout == 1310);
+    quicly_flexicast_cc_on_flow_timeout(flow, 1010);
+    quicly_flexicast_cc_get_flow_output(flow, &output);
+    ok(output.rate_bytes_per_second == rate_before && output.next_timeout == 1310);
+    quicly_flexicast_flow_free(flow);
+    quicly_flexicast_cc_free_multicast(cc);
+
+    /* positional 8-field quicly_flexicast_cc_type_t initializer binds on_feedback and on_timeout properly */
+    static quicly_flexicast_cc_type_t positional_type = {
+        "positional", NULL, NULL, NULL, NULL, NULL, positional_cc_on_feedback, positional_cc_on_timeout};
+    quicly_flexicast_cc_t pos_cc = {0};
+    ok(quicly_flexicast_cc_init(&pos_cc, &positional_type, &default_cc_cfg) == 0);
+    positional_cc_feedback_calls = positional_cc_timeout_calls = 0;
+    quicly_flexicast_feedback_t fb = {.member_id = 1, .acked_packets = 1, .now = 10};
+    quicly_flexicast_cc_on_feedback(&pos_cc, &fb);
+    quicly_flexicast_cc_on_timeout(&pos_cc, 20);
+    ok(positional_cc_feedback_calls == 1 && positional_cc_timeout_calls == 1);
+
+    /* shrinking window (via shorter smoothed RTT) converts carried growth_remainder even when delivered % window == 0 */
+    cc = quicly_flexicast_cc_new_multicast(&default_cc_cfg, 0);
+    ok(cc != NULL);
+    ok(quicly_flexicast_cc_on_member_added(cc, 1, 0) == 0);
+    /* step 1: rtt = 100 ms -> window = 10000, gain = 12000; delivered = 4 -> 4 * 12000 = 48000 (+4, rate 100004, rem = 8000) */
+    quicly_flexicast_feedback_t step1 = {.member_id = 1,
+                                         .epoch = 1,
+                                         .acked_packets = 1,
+                                         .acked_bytes = 4,
+                                         .minimum_rtt_msec = 10,
+                                         .smoothed_rtt_msec = 100,
+                                         .now = 100};
+    quicly_flexicast_cc_on_feedback(cc, &step1);
+    quicly_flexicast_cc_get_output(cc, &output);
+    ok(output.rate_bytes_per_second == 100004);
+    /* step 2: rtt = 10 ms -> window = min_window = 4800, gain = 120000; delivered = 4800 (rem_delivered == 0) + rem 8000/4800 = +1
+     */
+    quicly_flexicast_feedback_t step2 = {.member_id = 1,
+                                         .epoch = 2,
+                                         .acked_packets = 1,
+                                         .acked_bytes = 4800,
+                                         .minimum_rtt_msec = 10,
+                                         .smoothed_rtt_msec = 10,
+                                         .now = 110};
+    quicly_flexicast_cc_on_feedback(cc, &step2);
+    quicly_flexicast_cc_get_output(cc, &output);
+    ok(output.rate_bytes_per_second == 220005);
+    quicly_flexicast_cc_free_multicast(cc);
+}
+
 void test_flexicast_cc_regressions(void)
 {
     subtest("multicast-zero-time-and-idle", test_multicast_zero_time_and_idle);
@@ -482,4 +603,5 @@ void test_flexicast_cc_regressions(void)
     subtest("duplicate-ack-delivery-clock", test_duplicate_ack_delivery_clock);
     subtest("suspend-legacy-controller", test_suspend_legacy_controller);
     subtest("abandon-and-exclusive-reuse", test_abandon_and_exclusive_reuse);
+    subtest("reordered-pending-and-remainder", test_reordered_pending_and_remainder);
 }
