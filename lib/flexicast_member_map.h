@@ -26,7 +26,7 @@ static inline size_t flexicast_member_hash(uint64_t id)
 
 static inline int flexicast_member_map_init(flexicast_member_map_t *map, size_t maximum_members)
 {
-    /* at most half full, so every probe reaches an empty entry */
+    /* at most half full so every probe reaches an empty entry */
     for (map->capacity = 2; map->capacity < maximum_members * 2; map->capacity *= 2)
         ;
     return (map->entries = calloc(map->capacity, sizeof(*map->entries))) != NULL ? 0 : -1;
@@ -50,7 +50,7 @@ static inline flexicast_member_entry_t *flexicast_member_map_entry(const flexica
 
 static inline int flexicast_member_map_find(const flexicast_member_map_t *map, uint64_t id)
 {
-    if (id == 0)
+    if (id == 0 || map->entries == NULL)
         return -1;
     const flexicast_member_entry_t *entry = flexicast_member_map_entry(map, id);
     return entry->id != 0 ? (int)entry->slot : -1;
@@ -63,6 +63,8 @@ static inline void flexicast_member_map_set(flexicast_member_map_t *map, uint64_
 
 static inline void flexicast_member_map_remove(flexicast_member_map_t *map, uint64_t id)
 {
+    if (map->entries == NULL)
+        return;
     size_t mask = map->capacity - 1;
     size_t hole = (size_t)(flexicast_member_map_entry(map, id) - map->entries);
     if (map->entries[hole].id == 0)

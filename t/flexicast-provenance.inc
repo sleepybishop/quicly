@@ -1,17 +1,17 @@
 /* native measurement provenance tests */
 static quicly_flexicast_send_context_t provenance_context(uint64_t rate, uint32_t fanout, uint32_t flags)
 {
-    return (quicly_flexicast_send_context_t){.pacing_rate_bytes_per_second = rate, .physical_fanout = fanout,
-                                            .flags = QUICLY_FLEXICAST_SAMPLE_VALID | flags};
+    return (quicly_flexicast_send_context_t){
+        .pacing_rate_bytes_per_second = rate, .physical_fanout = fanout, .flags = QUICLY_FLEXICAST_SAMPLE_VALID | flags};
 }
 
-static uint64_t provenance_send(quicly_flexicast_flow_t *flow, int64_t now,
-                                const quicly_flexicast_send_context_t *context, size_t *size)
+static uint64_t provenance_send(quicly_flexicast_flow_t *flow, int64_t now, const quicly_flexicast_send_context_t *context,
+                                size_t *size)
 {
     uint8_t packet[1300];
     uint64_t pn;
     regression_send(flow, packet, sizeof(packet), size, &pn, now - 1);
-    ok(quicly_flexicast_mark_submitted_with_context(flow, 0, pn, now, context) == 0);
+    ok(quicly_flexicast_mark_submitted(flow, 0, pn, now, context) == 0);
     return pn;
 }
 
@@ -22,8 +22,9 @@ static void test_feedback_provenance(void)
     uint64_t rates[2];
     quicly_flexicast_send_context_t context = provenance_context(1000000, 2, 0);
     for (int split = 0; split != 2; ++split) {
-        quicly_flexicast_flow_t *flow = create_cc_flow(1000, secret);
-        ok(quicly_flexicast_attach_at(flow, 1, 100) == 0);
+        test_flexicast_cc_t cc;
+        quicly_flexicast_flow_t *flow = create_cc_flow(1000, secret, &cc);
+        ok(quicly_flexicast_attach(flow, 1, 100) == 0);
         provenance_send(flow, 100, &context, &size);
         regression_ack(flow, 1, 0, 0, 0, 200);
         quicly_flexicast_send_context_t app = provenance_context(1000000, 2, QUICLY_FLEXICAST_SAMPLE_APP_LIMITED);
@@ -42,18 +43,21 @@ static void test_feedback_provenance(void)
         rates[split] = test_last_feedback.delivery_rate_bytes_per_second;
         ok(rates[split] == size * 2 * 1000 / 111);
         ok(test_last_feedback.delivery_sample_bytes == size * 2);
-        ok(test_last_feedback.delivery_sample_flags == (QUICLY_FLEXICAST_SAMPLE_PRESENT | QUICLY_FLEXICAST_SAMPLE_VALID |
-                                                        QUICLY_FLEXICAST_SAMPLE_APP_LIMITED | QUICLY_FLEXICAST_SAMPLE_HOST_LIMITED));
+        ok(test_last_feedback.delivery_sample_flags ==
+           (QUICLY_FLEXICAST_SAMPLE_VALID | QUICLY_FLEXICAST_SAMPLE_APP_LIMITED | QUICLY_FLEXICAST_SAMPLE_HOST_LIMITED));
         ok(test_last_feedback.delivery_sample_pacing_rate_bytes_per_second == 1000000);
         ok(test_last_feedback.delivery_sample_fanout == 2);
         ok(test_last_feedback.delivery_sample_sent_at_start == 100 && test_last_feedback.delivery_sample_sent_at_end == 211);
         ok(test_last_feedback.delivery_sample_acked_at_start == 200 && test_last_feedback.delivery_sample_acked_at_end == 220);
         ok(test_last_feedback.delivery_rate_sample_epoch == 1);
         uint64_t rtt_epoch = test_last_feedback.rtt_sample_epoch;
-        quicly_ack_frame_t ce = {.largest_acknowledged = 3, .smallest_acknowledged = 3, .ack_block_lengths = {1},
-                                .ecn_counts = {0, 0, 1}, .ack_delay = 25};
+        quicly_ack_frame_t ce = {.largest_acknowledged = 3,
+                                 .smallest_acknowledged = 3,
+                                 .ack_block_lengths = {1},
+                                 .ecn_counts = {0, 0, 1},
+                                 .ack_delay = 25};
         size_t acked, lost, complete;
-        ok(quicly_flexicast_ack_frame_at(flow, 1, &ce, &acked, &lost, &complete, 500) == 0);
+        ok(quicly_flexicast_ack_frame(flow, 1, &ce, 0, &acked, &lost, &complete, 500) == 0);
         ok(acked == 0 && test_last_feedback.ecn_ce_count == 1);
         ok(test_last_feedback.delivery_rate_sample_epoch == 1 && test_last_feedback.delivery_rate_bytes_per_second == rates[split]);
         ok(test_last_feedback.delivery_sample_sent_at_end == 211 && test_last_feedback.delivery_sample_acked_at_end == 220);
@@ -63,7 +67,7 @@ static void test_feedback_provenance(void)
         /* rekey clears publication context independently of retained statistics */
         secret[0]++;
         ok(quicly_flexicast_flow_rekey(flow, ptls_iovec_init(secret, sizeof(secret)), 100, 600) == 0);
-        ok(quicly_flexicast_attach_at(flow, 1, 600) == 0);
+        ok(quicly_flexicast_attach(flow, 1, 600) == 0);
         quicly_flexicast_send_context_t next = provenance_context(25000, 1, 0);
         for (int i = 0; i != 3; ++i) {
             uint64_t pn = provenance_send(flow, 700 + i * 10, &next, &size);
@@ -71,10 +75,10 @@ static void test_feedback_provenance(void)
             ok(test_last_feedback.delivery_rate_sample_epoch == (i == 2 ? 1 : 0));
             if (i != 2) {
                 ok(test_last_feedback.delivery_rate_bytes_per_second == 0);
-                ok(test_last_feedback.delivery_sample_flags == QUICLY_FLEXICAST_SAMPLE_PRESENT);
+                ok(test_last_feedback.delivery_sample_flags == 0);
             }
         }
-        ok(test_last_feedback.delivery_sample_flags == (QUICLY_FLEXICAST_SAMPLE_PRESENT | QUICLY_FLEXICAST_SAMPLE_VALID));
+        ok(test_last_feedback.delivery_sample_flags == QUICLY_FLEXICAST_SAMPLE_VALID);
         ok(test_last_feedback.delivery_sample_pacing_rate_bytes_per_second == 25000 && test_last_feedback.delivery_sample_fanout == 1);
         ok(test_last_feedback.delivery_rate_bytes_per_second == size * 1000 / 10);
         ok(test_last_feedback.rtt_sample_epoch == 3);
@@ -84,8 +88,9 @@ static void test_feedback_provenance(void)
 
     /* mixing rate or fanout within a bucket marks the sample mixed and invalid */
     for (int kind = 0; kind != 3; ++kind) {
-        quicly_flexicast_flow_t *flow = create_cc_flow(1000, secret);
-        ok(quicly_flexicast_attach_at(flow, 1, 100) == 0);
+        test_flexicast_cc_t cc;
+        quicly_flexicast_flow_t *flow = create_cc_flow(1000, secret, &cc);
+        ok(quicly_flexicast_attach(flow, 1, 100) == 0);
         provenance_send(flow, 100, &context, &size);
         regression_ack(flow, 1, 0, 0, 0, 102);
         provenance_send(flow, 110, &context, &size);
@@ -99,14 +104,14 @@ static void test_feedback_provenance(void)
         provenance_send(flow, 121, &context, &size);
         regression_ack(flow, 1, 3, 3, 0, 130);
         ok(test_last_feedback.delivery_rate_sample_epoch == 1);
-        ok(test_last_feedback.delivery_sample_flags & QUICLY_FLEXICAST_SAMPLE_PRESENT);
         ok(!(test_last_feedback.delivery_sample_flags & QUICLY_FLEXICAST_SAMPLE_VALID));
         ok(test_last_feedback.delivery_sample_flags & QUICLY_FLEXICAST_SAMPLE_MIXED);
         quicly_flexicast_flow_free(flow);
     }
 
-    quicly_flexicast_flow_t *flow = create_cc_flow(1000, secret);
-    ok(quicly_flexicast_attach_at(flow, 1, 100) == 0);
+    test_flexicast_cc_t cc;
+    quicly_flexicast_flow_t *flow = create_cc_flow(1000, secret, &cc);
+    ok(quicly_flexicast_attach(flow, 1, 100) == 0);
     provenance_send(flow, 100, &context, &size);
     provenance_send(flow, 110, &context, &size);
     regression_ack(flow, 1, 1, 1, 0, 120);
@@ -116,18 +121,18 @@ static void test_feedback_provenance(void)
     ok(test_last_feedback.rtt_sample_epoch == 1 && test_last_feedback.rtt_sample_at == 120);
     ok(test_last_feedback.latest_rtt_msec == 10 && test_last_feedback.rtt_ack_delay_msec == 0);
     uint64_t pn = provenance_send(flow, 210, &context, &size);
-    ok(quicly_flexicast_mark_submitted(flow, 0, pn, 0) == 0);
+    ok(quicly_flexicast_mark_submitted(flow, 0, pn, 0, NULL) == 0);
     regression_ack(flow, 1, pn, pn, 0, 220);
-    ok(test_last_feedback.rtt_sample_epoch == 1); /* unknown actual send time */
+    ok(test_last_feedback.rtt_sample_epoch == 1);                /* unknown actual send time */
     ok(test_last_feedback.delivery_sample_sent_at_start == 100); /* reordered older packet is in this interval */
     quicly_flexicast_flow_free(flow);
 
-    flow = create_cc_flow(1000, secret);
-    ok(quicly_flexicast_attach_at(flow, 1, 100) == 0);
+    flow = create_cc_flow(1000, secret, &cc);
+    ok(quicly_flexicast_attach(flow, 1, 100) == 0);
     provenance_send(flow, 100, &context, &size);
     regression_ack(flow, 1, 0, 0, 0, 102);
     pn = provenance_send(flow, 110, &context, &size);
-    ok(quicly_flexicast_mark_submitted(flow, 0, pn, 0) == 0);
+    ok(quicly_flexicast_mark_submitted(flow, 0, pn, 0, NULL) == 0);
     regression_ack(flow, 1, pn, pn, 0, 112);
     for (int i = 0; i != 3; ++i) {
         pn = provenance_send(flow, 120 + i * 10, &context, &size);
@@ -138,8 +143,8 @@ static void test_feedback_provenance(void)
     ok(test_last_feedback.delivery_rate_bytes_per_second == size * 1000 / 10);
     quicly_flexicast_flow_free(flow);
 
-    flow = create_cc_flow(1000, secret);
-    ok(quicly_flexicast_attach_at(flow, 1, 100) == 0);
+    flow = create_cc_flow(1000, secret, &cc);
+    ok(quicly_flexicast_attach(flow, 1, 100) == 0);
     provenance_send(flow, 100, &context, &size);
     regression_ack(flow, 1, 0, 0, 0, 102);
     provenance_send(flow, 200, &context, &size);
@@ -158,8 +163,8 @@ static void test_feedback_provenance(void)
     for (int cause = 0; cause != 2; ++cause) {
         uint32_t flag = cause == 0 ? QUICLY_FLEXICAST_SAMPLE_APP_LIMITED : QUICLY_FLEXICAST_SAMPLE_HOST_LIMITED;
         quicly_flexicast_send_context_t limited = provenance_context(1000000, 2, flag);
-        flow = create_cc_flow(1000, secret);
-        ok(quicly_flexicast_attach_at(flow, 1, 100) == 0);
+        flow = create_cc_flow(1000, secret, &cc);
+        ok(quicly_flexicast_attach(flow, 1, 100) == 0);
         provenance_send(flow, 100, &context, &size);
         regression_ack(flow, 1, 0, 0, 0, 110);
         provenance_send(flow, 120, &limited, &size); /* PN 1 is never ACKed */
@@ -179,7 +184,7 @@ static void test_feedback_provenance(void)
         provenance_send(flow, 900, &limited, &size);
         secret[0]++;
         ok(quicly_flexicast_flow_rekey(flow, ptls_iovec_init(secret, sizeof(secret)), 100, 1000) == 0);
-        ok(quicly_flexicast_attach_at(flow, 1, 1000) == 0);
+        ok(quicly_flexicast_attach(flow, 1, 1000) == 0);
         /* restart synthetic clock to verify rekey cleared the old watermark */
         for (int i = 0; i != 3; ++i) {
             pn = provenance_send(flow, 100 + i * 20, &context, &size);
@@ -191,14 +196,14 @@ static void test_feedback_provenance(void)
     }
 
     /* shared submission timestamps and context do not fill the sparse exception table */
-    flow = create_cc_flow(1000, secret);
+    flow = create_cc_flow(1000, secret, &cc);
     for (uint64_t member = 1; member <= 4; ++member)
-        ok(quicly_flexicast_attach_at(flow, member, 100) == 0);
+        ok(quicly_flexicast_attach(flow, member, 100) == 0);
     uint8_t packet[1300];
     for (size_t i = 0; i != QUICLY_FLEXICAST_SENT_WINDOW; ++i) {
         regression_send(flow, packet, sizeof(packet), &size, &pn, 100);
         for (uint64_t member = 1; member <= 4; ++member)
-            ok(quicly_flexicast_mark_submitted_with_context(flow, member, pn, 110, &context) == 0);
+            ok(quicly_flexicast_mark_submitted(flow, member, pn, 110, &context) == 0);
     }
     for (uint64_t member = 1; member <= 4; ++member) {
         regression_ack(flow, member, pn, pn, 0, 120);

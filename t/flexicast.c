@@ -21,189 +21,54 @@ static quicly_flexicast_flow_t *create_flow(uint64_t flow_id, const uint8_t *sec
     return create_flow_at(flow_id, secret, 0);
 }
 
-typedef struct st_test_flexicast_cc_state_t {
+typedef struct st_test_flexicast_cc_t {
+    quicly_flexicast_cc_t super;
     uint64_t feedback_events;
     uint64_t acked_packets;
     uint64_t lost_packets;
-} test_flexicast_cc_state_t;
+} test_flexicast_cc_t;
 
 static quicly_flexicast_feedback_t test_last_feedback;
 
-static int test_cc_init(void *state, const quicly_flexicast_cc_config_t *config, int64_t now, quicly_flexicast_cc_output_t *output)
+static void test_cc_on_feedback(quicly_flexicast_cc_t *_cc, const quicly_flexicast_feedback_t *feedback)
 {
-    (void)state;
-    (void)now;
-    output->rate_bytes_per_second = config->startup_rate_bytes_per_second;
-    return 0;
-}
-
-static void test_cc_on_feedback(void *_state, const quicly_flexicast_feedback_t *feedback, quicly_flexicast_cc_output_t *output)
-{
-    test_flexicast_cc_state_t *state = _state;
+    test_flexicast_cc_t *cc = (test_flexicast_cc_t *)_cc;
     test_last_feedback = *feedback;
-    ++state->feedback_events;
-    state->acked_packets += feedback->acked_packets;
-    state->lost_packets += feedback->lost_packets;
-    output->rate_bytes_per_second = 10000 + state->acked_packets * 100 + state->lost_packets * 10;
-    output->limiting_member_id = feedback->member_id;
-    output->reason = (feedback->acked_packets != 0 ? QUICLY_FLEXICAST_CC_REASON_ACK : 0) |
-                     (feedback->lost_packets != 0 ? QUICLY_FLEXICAST_CC_REASON_LOSS : 0);
+    ++cc->feedback_events;
+    cc->acked_packets += feedback->acked_packets;
+    cc->lost_packets += feedback->lost_packets;
+    cc->super.output.rate_bytes_per_second = 10000 + cc->acked_packets * 100 + cc->lost_packets * 10;
+    cc->super.output.limiting_member_id = feedback->member_id;
+    cc->super.output.reason = (feedback->acked_packets != 0 ? QUICLY_FLEXICAST_CC_REASON_ACK : 0) |
+                              (feedback->lost_packets != 0 ? QUICLY_FLEXICAST_CC_REASON_LOSS : 0);
 }
 
 static quicly_flexicast_cc_type_t test_cc_type = {
     .name = "test",
-    .state_size = sizeof(test_flexicast_cc_state_t),
-    .init = test_cc_init,
     .on_feedback = test_cc_on_feedback,
 };
 
-static quicly_flexicast_flow_t *create_cc_flow(uint64_t flow_id, const uint8_t *secret)
+static quicly_flexicast_flow_t *create_cc_flow(uint64_t flow_id, const uint8_t *secret, test_flexicast_cc_t *cc)
 {
     quicly_flexicast_flow_t *flow = NULL;
+    quicly_flexicast_cc_config_t cc_config = {.startup_rate_bytes_per_second = 10000,
+                                              .minimum_rate_bytes_per_second = 100,
+                                              .maximum_rate_bytes_per_second = 1000000,
+                                              .maximum_datagram_size = 1400};
+    memset(cc, 0, sizeof(*cc));
+    ok(quicly_flexicast_cc_init(&cc->super, &test_cc_type, &cc_config) == 0);
     quicly_flexicast_config_t config = {
         .flow_id = flow_id,
         .cipher_suite = &ptls_openssl_aes128gcmsha256,
         .crypto_engine = &quicly_default_crypto_engine,
         .traffic_secret = ptls_iovec_init(secret, ptls_openssl_aes128gcmsha256.hash->digest_size),
-        .cc_type = &test_cc_type,
-        .cc_config = {.startup_rate_bytes_per_second = 10000,
-                      .minimum_rate_bytes_per_second = 100,
-                      .maximum_rate_bytes_per_second = 1000000,
-                      .maximum_datagram_size = 1400,
-                      .packet_reordering_threshold = 3},
+        .cc = &cc->super,
+        .packet_reordering_threshold = 3,
         .now = 100,
     };
     ok(quicly_flexicast_flow_create(&flow, &config) == QUICLY_FLEXICAST_OK);
     ok(flow != NULL);
     return flow;
-}
-
-static quicly_flexicast_flow_id_t make_flow_id(size_t len)
-{
-    quicly_flexicast_flow_id_t flow_id = {0};
-    flow_id.len = (uint8_t)len;
-    for (size_t i = 0; i != len && i != sizeof(flow_id.bytes); ++i)
-        flow_id.bytes[i] = (uint8_t)(0xa0 + i);
-    return flow_id;
-}
-
-static void test_frame_codecs(void)
-{
-    uint8_t encoded[256], key_bytes[32], v6_source[16], v6_group[16];
-    size_t encoded_size, consumed;
-
-    for (size_t i = 0; i != sizeof(key_bytes); ++i)
-        key_bytes[i] = (uint8_t)i;
-    for (size_t i = 0; i != 16; ++i) {
-        v6_source[i] = (uint8_t)(0x20 + i);
-        v6_group[i] = (uint8_t)(0xff - i);
-    }
-
-    quicly_flexicast_announce_frame_t announce = {
-        .flow_id = make_flow_id(8),
-        .sequence = 63,
-        .ip_version = 4,
-        .source_ip = {192, 0, 2, 1},
-        .group_ip = {232, 1, 2, 3},
-        .udp_port = 4433,
-        .ack_delay_msec = 25,
-    };
-    size_t announce_capacity = quicly_flexicast_announce_frame_capacity(&announce);
-    ok(announce_capacity != 0);
-    ok(quicly_flexicast_encode_announce_frame(encoded, announce_capacity - 1, &announce, &encoded_size) ==
-       QUICLY_FLEXICAST_ERROR_BUFFER_TOO_SMALL);
-    ok(quicly_flexicast_encode_announce_frame(encoded, sizeof(encoded), &announce, &encoded_size) == QUICLY_FLEXICAST_OK);
-    ok(encoded_size == announce_capacity);
-    ok(memcmp(encoded, "\x80\x17\x3e\x00\x08", 5) == 0);
-    encoded[encoded_size] = 0xaa;
-    quicly_flexicast_announce_frame_t decoded_announce;
-    ok(quicly_flexicast_decode_announce_frame(encoded, encoded_size + 1, &decoded_announce, &consumed) == QUICLY_FLEXICAST_OK);
-    ok(consumed == encoded_size);
-    ok(decoded_announce.flow_id.len == announce.flow_id.len);
-    ok(memcmp(decoded_announce.flow_id.bytes, announce.flow_id.bytes, announce.flow_id.len) == 0);
-    ok(decoded_announce.sequence == announce.sequence);
-    ok(decoded_announce.ip_version == 4);
-    ok(memcmp(decoded_announce.source_ip, announce.source_ip, 4) == 0);
-    ok(memcmp(decoded_announce.group_ip, announce.group_ip, 4) == 0);
-    ok(decoded_announce.udp_port == announce.udp_port);
-    ok(decoded_announce.ack_delay_msec == announce.ack_delay_msec);
-    for (size_t i = 0; i != encoded_size; ++i)
-        ok(quicly_flexicast_decode_announce_frame(encoded, i, &decoded_announce, &consumed) ==
-           QUICLY_FLEXICAST_ERROR_FRAME_ENCODING);
-
-    announce.flow_id = make_flow_id(QUICLY_FLEXICAST_MAX_FLOW_ID_SIZE);
-    announce.sequence = 16384;
-    announce.ip_version = 6;
-    memcpy(announce.source_ip, v6_source, 16);
-    memcpy(announce.group_ip, v6_group, 16);
-    ok(quicly_flexicast_encode_announce_frame(encoded, sizeof(encoded), &announce, &encoded_size) == QUICLY_FLEXICAST_OK);
-    ok(quicly_flexicast_decode_announce_frame(encoded, encoded_size, &decoded_announce, &consumed) == QUICLY_FLEXICAST_OK);
-    ok(decoded_announce.ip_version == 6);
-    ok(memcmp(decoded_announce.source_ip, v6_source, 16) == 0);
-    ok(memcmp(decoded_announce.group_ip, v6_group, 16) == 0);
-    announce.flow_id.len = 0;
-    ok(quicly_flexicast_announce_frame_capacity(&announce) == 0);
-    announce.flow_id = make_flow_id(8);
-    announce.ip_version = 5;
-    ok(quicly_flexicast_announce_frame_capacity(&announce) == 0);
-
-    quicly_flexicast_state_frame_t state = {.flow_id = make_flow_id(3), .sequence = 64, .action = QUICLY_FLEXICAST_STATE_LISTEN};
-    ok(quicly_flexicast_encode_state_frame(encoded, sizeof(encoded), &state, &encoded_size) == QUICLY_FLEXICAST_OK);
-    /* draft-03 renames READY to LISTEN while preserving wire value 3 */
-    static const uint8_t listen_wire[] = {0x80, 0x17, 0x3e, 0x01, 3, 0xa0, 0xa1, 0xa2, 0x40, 0x40, 0, 0, 0, 0, 0, 0, 0, 3};
-    ok(encoded_size == sizeof(listen_wire) && memcmp(encoded, listen_wire, sizeof(listen_wire)) == 0);
-    ok(QUICLY_FLEXICAST_STATE_READY == QUICLY_FLEXICAST_STATE_LISTEN);
-    quicly_flexicast_state_frame_t decoded_state;
-    ok(quicly_flexicast_decode_state_frame(encoded, encoded_size, &decoded_state, &consumed) == QUICLY_FLEXICAST_OK);
-    ok(consumed == encoded_size);
-    ok(decoded_state.sequence == state.sequence);
-    ok(decoded_state.action == QUICLY_FLEXICAST_STATE_LISTEN);
-    ok(memcmp(decoded_state.flow_id.bytes, state.flow_id.bytes, state.flow_id.len) == 0);
-    for (size_t i = 0; i != encoded_size; ++i)
-        ok(quicly_flexicast_decode_state_frame(encoded, i, &decoded_state, &consumed) == QUICLY_FLEXICAST_ERROR_FRAME_ENCODING);
-    encoded[encoded_size - 1] = 4;
-    ok(quicly_flexicast_decode_state_frame(encoded, encoded_size, &decoded_state, &consumed) ==
-       QUICLY_FLEXICAST_ERROR_PROTOCOL_VIOLATION);
-    state.action = 4;
-    ok(quicly_flexicast_state_frame_capacity(&state) == 0);
-
-    quicly_flexicast_key_frame_t key = {.flow_id = make_flow_id(20),
-                                        .sequence = 1073741824,
-                                        .first_packet_number = 16383,
-                                        .key = ptls_iovec_init(key_bytes, sizeof(key_bytes)),
-                                        .algorithm = UINT64_C(0x1301000000000001)};
-    ok(quicly_flexicast_encode_key_frame(encoded, sizeof(encoded), &key, &encoded_size) == QUICLY_FLEXICAST_OK);
-    quicly_flexicast_key_frame_t decoded_key;
-    ok(quicly_flexicast_decode_key_frame(encoded, encoded_size, &decoded_key, &consumed) == QUICLY_FLEXICAST_OK);
-    ok(consumed == encoded_size);
-    ok(decoded_key.flow_id.len == key.flow_id.len);
-    ok(memcmp(decoded_key.flow_id.bytes, key.flow_id.bytes, key.flow_id.len) == 0);
-    ok(decoded_key.sequence == key.sequence);
-    ok(decoded_key.first_packet_number == key.first_packet_number);
-    ok(decoded_key.key.len == key.key.len);
-    ok(memcmp(decoded_key.key.base, key.key.base, key.key.len) == 0);
-    ok(decoded_key.algorithm == key.algorithm);
-    for (size_t i = 0; i != encoded_size; ++i)
-        ok(quicly_flexicast_decode_key_frame(encoded, i, &decoded_key, &consumed) == QUICLY_FLEXICAST_ERROR_FRAME_ENCODING);
-
-    /* reject malformed flow-ID lengths in every control-frame decoder */
-    for (size_t i = 0; i != 2; ++i) {
-        uint8_t malformed[] = {0x80, 0x17, 0x3e, 0, i == 0 ? 0 : QUICLY_FLEXICAST_MAX_FLOW_ID_SIZE + 1};
-        ok(quicly_flexicast_decode_announce_frame(malformed, sizeof(malformed), &decoded_announce, &consumed) ==
-           QUICLY_FLEXICAST_ERROR_FRAME_ENCODING);
-        malformed[3] = 1;
-        ok(quicly_flexicast_decode_state_frame(malformed, sizeof(malformed), &decoded_state, &consumed) ==
-           QUICLY_FLEXICAST_ERROR_FRAME_ENCODING);
-        malformed[3] = 2;
-        ok(quicly_flexicast_decode_key_frame(malformed, sizeof(malformed), &decoded_key, &consumed) ==
-           QUICLY_FLEXICAST_ERROR_FRAME_ENCODING);
-    }
-
-    /* reject oversized key lengths that exceed frame bounds */
-    static const uint8_t oversized_key[] = {0x80, 0x17, 0x3e, 2,    1, 0xa0, 0, 0, 0xff, 0xff, 0xff, 0xff,
-                                            0xff, 0xff, 0xff, 0xff, 0, 0,    0, 0, 0,    0,    0,    0};
-    ok(quicly_flexicast_decode_key_frame(oversized_key, sizeof(oversized_key), &decoded_key, &consumed) ==
-       QUICLY_FLEXICAST_ERROR_FRAME_ENCODING);
 }
 
 static void test_congestion_feedback(void)
@@ -215,52 +80,45 @@ static void test_congestion_feedback(void)
     size_t packet_size, num_acked, num_lost, num_completed, pending;
     quicly_flexicast_member_stats_t stats;
     quicly_flexicast_cc_output_t output;
+    test_flexicast_cc_t cc;
 
     memset(secret, 0x3c, ptls_openssl_aes128gcmsha256.hash->digest_size);
-    quicly_flexicast_flow_t *flow = create_cc_flow(flow_id, secret);
-    ok(quicly_flexicast_attach_at(flow, 101, 100) == QUICLY_FLEXICAST_OK);
+    quicly_flexicast_flow_t *flow = create_cc_flow(flow_id, secret, &cc);
+    ok(quicly_flexicast_attach(flow, 101, 100) == QUICLY_FLEXICAST_OK);
     for (size_t i = 0; i != PTLS_ELEMENTSOF(packet_numbers); ++i)
-        ok(quicly_flexicast_send_datagram_at(flow, ptls_iovec_init(payload, sizeof(payload)), packet, sizeof(packet), &packet_size,
-                                             packet_numbers + i, 100 + i) == QUICLY_FLEXICAST_OK);
+        ok(quicly_flexicast_send_datagram(flow, ptls_iovec_init(payload, sizeof(payload)), packet, sizeof(packet), &packet_size,
+                                          packet_numbers + i, 100 + i) == QUICLY_FLEXICAST_OK);
 
     quicly_ack_frame_t ack = {
         .largest_acknowledged = packet_numbers[4], .smallest_acknowledged = packet_numbers[4], .ack_block_lengths = {1}};
-    ok(quicly_flexicast_ack_frame_at(flow, 101, &ack, &num_acked, &num_lost, &num_completed, 200) == QUICLY_FLEXICAST_OK);
-    ok(num_acked == 1);
-    ok(num_lost == 2);
-    ok(num_completed == 3);
+    ok(quicly_flexicast_ack_frame(flow, 101, &ack, 0, &num_acked, &num_lost, &num_completed, 200) == QUICLY_FLEXICAST_OK);
+    ok(num_acked == 1 && num_lost == 2 && num_completed == 3);
     ok(quicly_flexicast_get_pending_members(flow, packet_numbers[0], &pending) == QUICLY_FLEXICAST_ERROR_NOT_FOUND);
     ok(quicly_flexicast_get_pending_members(flow, packet_numbers[2], &pending) == QUICLY_FLEXICAST_OK);
 
     ok(quicly_flexicast_get_member_stats(flow, 101, &stats) == QUICLY_FLEXICAST_OK);
-    ok(stats.feedback_epoch == 1);
-    ok(stats.delivered_packets == 1);
-    ok(stats.lost_packets == 2);
-    ok(stats.latest_rtt_msec == 96);
-    ok(stats.minimum_rtt_msec == 96);
+    ok(stats.feedback_epoch == 1 && stats.delivered_packets == 1 && stats.lost_packets == 2);
+    ok(stats.latest_rtt_msec == 96 && stats.minimum_rtt_msec == 96);
     quicly_flexicast_cc_get_flow_output(flow, &output);
-    ok(output.rate_bytes_per_second == 10120);
-    ok(output.limiting_member_id == 101);
+    ok(output.rate_bytes_per_second == 10120 && output.limiting_member_id == 101);
     ok(output.reason == (QUICLY_FLEXICAST_CC_REASON_ACK | QUICLY_FLEXICAST_CC_REASON_LOSS));
 
     /* repeated feedback is idempotent and does not advance the feedback epoch */
-    ok(quicly_flexicast_ack_frame_at(flow, 101, &ack, &num_acked, &num_lost, &num_completed, 210) == QUICLY_FLEXICAST_OK);
+    ok(quicly_flexicast_ack_frame(flow, 101, &ack, 0, &num_acked, &num_lost, &num_completed, 210) == QUICLY_FLEXICAST_OK);
     ok(num_acked == 0 && num_lost == 0 && num_completed == 0);
-    ok(quicly_flexicast_get_member_stats(flow, 101, &stats) == QUICLY_FLEXICAST_OK);
-    ok(stats.feedback_epoch == 1);
+    ok(quicly_flexicast_get_member_stats(flow, 101, &stats) == QUICLY_FLEXICAST_OK && stats.feedback_epoch == 1);
 
     ack = (quicly_ack_frame_t){
         .largest_acknowledged = packet_numbers[3], .smallest_acknowledged = packet_numbers[2], .ack_block_lengths = {2}};
-    ok(quicly_flexicast_ack_frame_at(flow, 101, &ack, &num_acked, &num_lost, &num_completed, 220) == QUICLY_FLEXICAST_OK);
+    ok(quicly_flexicast_ack_frame(flow, 101, &ack, 0, &num_acked, &num_lost, &num_completed, 220) == QUICLY_FLEXICAST_OK);
     ok(num_acked == 2 && num_lost == 0 && num_completed == 2);
     ok(quicly_flexicast_get_member_stats(flow, 101, &stats) == QUICLY_FLEXICAST_OK);
-    ok(stats.feedback_epoch == 2);
-    ok(stats.delivered_packets == 3 && stats.lost_packets == 2);
+    ok(stats.feedback_epoch == 2 && stats.delivered_packets == 3 && stats.lost_packets == 2);
 
     /* rekey resets active membership and packet epoch while preserving learned stats */
     uint8_t next_secret[PTLS_MAX_DIGEST_SIZE];
     memset(next_secret, 0x7e, ptls_openssl_aes128gcmsha256.hash->digest_size);
-    ok(quicly_flexicast_attach_at(flow, 202, 224) == QUICLY_FLEXICAST_OK);
+    ok(quicly_flexicast_attach(flow, 202, 224) == QUICLY_FLEXICAST_OK);
     quicly_flexicast_cc_get_flow_output(flow, &output);
     uint64_t learned_rate = output.rate_bytes_per_second;
     ok(quicly_flexicast_flow_rekey(flow, ptls_iovec_init(next_secret, ptls_openssl_aes128gcmsha256.hash->digest_size), 1000, 225) ==
@@ -268,21 +126,20 @@ static void test_congestion_feedback(void)
     ok(quicly_flexicast_num_members(flow) == 0);
     ok(quicly_flexicast_get_member_stats(flow, 101, &stats) == QUICLY_FLEXICAST_OK);
     ok(stats.delivered_packets == 3 && stats.lost_packets == 2);
-    ok(quicly_flexicast_detach_at(flow, 202, 225) == QUICLY_FLEXICAST_OK);
+    ok(quicly_flexicast_detach(flow, 202, 225) == QUICLY_FLEXICAST_OK);
     ok(quicly_flexicast_get_member_stats(flow, 202, &stats) == QUICLY_FLEXICAST_ERROR_NOT_FOUND);
     quicly_flexicast_cc_get_flow_output(flow, &output);
     ok(output.rate_bytes_per_second == learned_rate);
-    ok(quicly_flexicast_attach_at(flow, 101, 226) == QUICLY_FLEXICAST_OK);
-    ok(quicly_flexicast_send_datagram_at(flow, ptls_iovec_init(payload, sizeof(payload)), packet, sizeof(packet), &packet_size,
-                                         packet_numbers, 227) == QUICLY_FLEXICAST_OK);
+    ok(quicly_flexicast_attach(flow, 101, 226) == QUICLY_FLEXICAST_OK);
+    ok(quicly_flexicast_send_datagram(flow, ptls_iovec_init(payload, sizeof(payload)), packet, sizeof(packet), &packet_size,
+                                      packet_numbers, 227) == QUICLY_FLEXICAST_OK);
     ok(packet_numbers[0] == 1000);
     int complete;
-    ok(quicly_flexicast_abandon_datagram(flow, 101, packet_numbers[0], &complete) == QUICLY_FLEXICAST_OK);
-    ok(complete);
+    ok(quicly_flexicast_abandon_datagram(flow, 101, packet_numbers[0], &complete) == QUICLY_FLEXICAST_OK && complete);
     ok(quicly_flexicast_get_member_stats(flow, 101, &stats) == QUICLY_FLEXICAST_OK);
     ok(stats.delivered_packets == 3 && stats.lost_packets == 2);
 
-    ok(quicly_flexicast_detach_at(flow, 101, 230) == QUICLY_FLEXICAST_OK);
+    ok(quicly_flexicast_detach(flow, 101, 230) == QUICLY_FLEXICAST_OK);
     quicly_flexicast_flow_free(flow);
 }
 
@@ -291,27 +148,27 @@ static void test_ack_aggregation(void)
     static const uint64_t flow_id = UINT64_C(0x1020304050607082);
     static const uint8_t payload[] = "ack ranges";
     uint8_t secret[PTLS_MAX_DIGEST_SIZE] = {0};
-    uint8_t packets[3][256], encoded[QUICLY_FLEXICAST_MAX_ACK_ENCODED_SIZE];
-    size_t packet_sizes[3], encoded_size;
-    uint64_t packet_numbers[3], received_packet_number;
+    uint8_t packets[12][256], encoded[QUICLY_FLEXICAST_MAX_ACK_ENCODED_SIZE];
+    size_t packet_sizes[12], encoded_size;
+    uint64_t packet_numbers[12], received_packet_number;
     ptls_iovec_t received;
 
     memset(secret, 0x4d, ptls_openssl_aes128gcmsha256.hash->digest_size);
     quicly_flexicast_flow_t *source = create_flow(flow_id, secret);
     quicly_flexicast_flow_t *receiver = create_flow(flow_id, secret);
-    ok(quicly_flexicast_attach(source, 101) == QUICLY_FLEXICAST_OK);
+    ok(!quicly_flexicast_flow_has_sender_state(receiver));
+    ok(quicly_flexicast_attach(source, 101, 100) == QUICLY_FLEXICAST_OK);
     for (size_t i = 0; i != PTLS_ELEMENTSOF(packet_numbers); ++i)
-        ok(quicly_flexicast_send_datagram_at(source, ptls_iovec_init(payload, sizeof(payload)), packets[i], sizeof(packets[i]),
-                                             packet_sizes + i, packet_numbers + i, 100 + i) == QUICLY_FLEXICAST_OK);
+        ok(quicly_flexicast_send_datagram(source, ptls_iovec_init(payload, sizeof(payload)), packets[i], sizeof(packets[i]),
+                                          packet_sizes + i, packet_numbers + i, 100 + (int64_t)i) == QUICLY_FLEXICAST_OK);
 
-    ok(quicly_flexicast_receive_datagram_at(receiver, packets[0], packet_sizes[0], &received, &received_packet_number, 110) ==
+    ok(quicly_flexicast_receive_datagram(receiver, packets[0], packet_sizes[0], &received, &received_packet_number, 0, 110) ==
        QUICLY_FLEXICAST_OK);
-    ok(quicly_flexicast_receive_datagram_at(receiver, packets[2], packet_sizes[2], &received, &received_packet_number, 112) ==
+    ok(quicly_flexicast_receive_datagram(receiver, packets[2], packet_sizes[2], &received, &received_packet_number, 0, 112) ==
        QUICLY_FLEXICAST_OK);
-    ok(quicly_flexicast_get_ack_deadline(receiver) == 135);
-    /* first ACK in an epoch is immediate */
-    ok(quicly_flexicast_ack_is_due(receiver, 134));
-    ok(quicly_flexicast_ack_is_due(receiver, 135));
+    /* first ACK in an epoch has immediate deadline == ack_pending_since */
+    ok(quicly_flexicast_get_ack_deadline(receiver) == 110);
+    ok(quicly_flexicast_ack_is_due(receiver, 110));
     ok(quicly_flexicast_encode_pending_ack(receiver, encoded, sizeof(encoded), 135, &encoded_size) == QUICLY_FLEXICAST_OK);
 
     const uint8_t *src = encoded, *end = encoded + encoded_size;
@@ -322,16 +179,16 @@ static void test_ack_aggregation(void)
     ok(ack.largest_acknowledged == packet_numbers[2]);
     ok(ack.ack_delay == (23000 >> QUICLY_LOCAL_ACK_DELAY_EXPONENT));
     ok(ack.smallest_acknowledged == packet_numbers[0]);
-    ok(ack.num_gaps == 1);
-    ok(ack.ack_block_lengths[0] == 1 && ack.ack_block_lengths[1] == 1);
+    ok(ack.num_gaps == 1 && ack.ack_block_lengths[0] == 1 && ack.ack_block_lengths[1] == 1);
     ok(src != end && *src++ == QUICLY_FRAME_TYPE_PING && src == end);
 
     quicly_flexicast_ack_sent(receiver);
     ok(quicly_flexicast_get_ack_deadline(receiver) == INT64_MAX);
     ok(!quicly_flexicast_ack_is_due(receiver, 1000));
 
-    ok(quicly_flexicast_receive_datagram_at(receiver, packets[1], packet_sizes[1], &received, &received_packet_number, 200) ==
+    ok(quicly_flexicast_receive_datagram(receiver, packets[1], packet_sizes[1], &received, &received_packet_number, 0, 200) ==
        QUICLY_FLEXICAST_OK);
+    ok(quicly_flexicast_get_ack_deadline(receiver) == 225);
     ok(!quicly_flexicast_ack_is_due(receiver, 224));
     ok(quicly_flexicast_ack_is_due(receiver, 225));
     /* reordered arrivals fill gaps without changing the largest packet timestamp */
@@ -343,11 +200,21 @@ static void test_ack_aggregation(void)
     ok(ack.largest_acknowledged == packet_numbers[2]);
     ok(ack.num_gaps == 0 && ack.ack_block_lengths[0] == 3);
     ok(ack.ack_delay == (89000 >> QUICLY_LOCAL_ACK_DELAY_EXPONENT));
+
+    /* reaching ack_frequency (default 8) switches deadline from delayed to immediate */
+    quicly_flexicast_ack_sent(receiver);
+    for (size_t i = 3; i < 11; ++i) {
+        ok(quicly_flexicast_receive_datagram(receiver, packets[i], packet_sizes[i], &received, &received_packet_number, 0,
+                                             300 + (int64_t)(i - 3)) == QUICLY_FLEXICAST_OK);
+        if (i < 10)
+            ok(quicly_flexicast_get_ack_deadline(receiver) == 325);
+        else
+            ok(quicly_flexicast_get_ack_deadline(receiver) == 300 && quicly_flexicast_ack_is_due(receiver, 307));
+    }
+
     quicly_flexicast_flow_free(receiver);
     quicly_flexicast_flow_free(source);
 }
-
-#include "flexicast-cc-trace.inc"
 
 static void test_builtin_controllers(void)
 {
@@ -357,12 +224,11 @@ static void test_builtin_controllers(void)
         .maximum_rate_bytes_per_second = 1000000,
         .maximum_datagram_size = 1200,
         .feedback_timeout_msec = 100,
-        .packet_reordering_threshold = 3,
     };
     quicly_flexicast_cc_output_t output;
-    quicly_flexicast_cc_t *cc = NULL;
+    quicly_flexicast_cc_t *cc = quicly_flexicast_cc_new_multicast(&config, 100);
 
-    ok(quicly_flexicast_cc_create(&cc, &quicly_flexicast_cc_type_multicast, &config, 100) == 0);
+    ok(cc != NULL);
     quicly_flexicast_cc_on_member_added(cc, 101, 100);
     quicly_flexicast_cc_on_member_added(cc, 202, 100);
     quicly_flexicast_feedback_t feedback = {.member_id = 101,
@@ -379,7 +245,7 @@ static void test_builtin_controllers(void)
     feedback.member_id = 202;
     quicly_flexicast_cc_on_feedback(cc, &feedback);
     quicly_flexicast_cc_get_output(cc, &output);
-    ok(output.rate_bytes_per_second > 100000);
+    ok(output.rate_bytes_per_second > 100000 && output.reason == QUICLY_FLEXICAST_CC_REASON_ACK);
     uint64_t multicast_growth = output.rate_bytes_per_second;
     feedback.member_id = 101;
     feedback.epoch = 2;
@@ -390,15 +256,13 @@ static void test_builtin_controllers(void)
     feedback.now = 140;
     quicly_flexicast_cc_on_feedback(cc, &feedback);
     quicly_flexicast_cc_get_output(cc, &output);
-    ok(output.rate_bytes_per_second < multicast_growth);
-    ok(output.reason == QUICLY_FLEXICAST_CC_REASON_LOSS);
+    ok(output.rate_bytes_per_second < multicast_growth && output.reason == QUICLY_FLEXICAST_CC_REASON_LOSS);
     uint64_t loss_rate = output.rate_bytes_per_second;
     feedback.epoch = 3;
     feedback.now = 145;
     quicly_flexicast_cc_on_feedback(cc, &feedback);
     quicly_flexicast_cc_get_output(cc, &output);
     ok(output.rate_bytes_per_second == loss_rate);
-    ok(output.rate_reduction_events == 1 && output.loss_reduction_events == 1);
     quicly_flexicast_cc_on_member_removed(cc, 101, 150);
     quicly_flexicast_cc_get_output(cc, &output);
     ok(output.limiting_member_id == 202 && output.rate_bytes_per_second == multicast_growth);
@@ -414,11 +278,7 @@ static void test_builtin_controllers(void)
     quicly_flexicast_cc_get_output(cc, &output);
     ok(output.reason == QUICLY_FLEXICAST_CC_REASON_TIMEOUT && output.rate_bytes_per_second == multicast_growth / 2 &&
        output.next_timeout == 520);
-    ok(output.rate_increase_events == 2);
-    ok(output.ack_growth_events == 1 && output.other_growth_events == 1);
-    ok(output.rate_reduction_events == 2);
-    ok(output.loss_reduction_events == 1 && output.timeout_reduction_events == 1);
-    quicly_flexicast_cc_free(cc);
+    quicly_flexicast_cc_free_multicast(cc);
 }
 
 static void test_scalable_members(void)
@@ -427,6 +287,12 @@ static void test_scalable_members(void)
     static const uint64_t first_member_id = 10000;
     static const uint8_t payload[] = "large group";
     uint8_t secret[PTLS_MAX_DIGEST_SIZE] = {0}, packet[256];
+    quicly_flexicast_cc_config_t cc_cfg = {.maximum_members = member_count,
+                                           .startup_rate_bytes_per_second = 100000,
+                                           .minimum_rate_bytes_per_second = 2000,
+                                           .maximum_datagram_size = 1200,
+                                           .feedback_timeout_msec = 100};
+    quicly_flexicast_cc_t *cc = quicly_flexicast_cc_new_multicast(&cc_cfg, 0);
     quicly_flexicast_flow_t *flow = NULL;
     quicly_flexicast_config_t config = {
         .flow_id = UINT64_C(0x1020304050607083),
@@ -434,160 +300,162 @@ static void test_scalable_members(void)
         .crypto_engine = &quicly_default_crypto_engine,
         .traffic_secret = ptls_iovec_init(secret, ptls_openssl_aes128gcmsha256.hash->digest_size),
         .max_members = member_count,
-        .cc_type = &quicly_flexicast_cc_type_multicast,
-        .cc_config = {.startup_rate_bytes_per_second = 100000,
-                      .minimum_rate_bytes_per_second = 2000,
-                      .maximum_datagram_size = 1200,
-                      .feedback_timeout_msec = 100,
-                      .packet_reordering_threshold = 3},
+        .cc = cc,
+        .packet_reordering_threshold = 3,
     };
     uint64_t packet_number;
     size_t packet_size, pending;
     int all_ok = 1, complete = 0;
 
     memset(secret, 0x6b, ptls_openssl_aes128gcmsha256.hash->digest_size);
-    ok(quicly_flexicast_flow_create(&flow, &config) == QUICLY_FLEXICAST_OK);
+    ok(cc != NULL && quicly_flexicast_flow_create(&flow, &config) == QUICLY_FLEXICAST_OK);
     for (size_t i = 0; i != member_count; ++i)
-        if (quicly_flexicast_attach(flow, first_member_id + i) != QUICLY_FLEXICAST_OK)
+        if (quicly_flexicast_attach(flow, first_member_id + i, 0) != QUICLY_FLEXICAST_OK)
             all_ok = 0;
-    ok(all_ok);
-    ok(quicly_flexicast_num_members(flow) == member_count);
-    ok(quicly_flexicast_attach(flow, first_member_id + member_count) == QUICLY_FLEXICAST_ERROR_MEMBER_LIMIT);
+    ok(all_ok && quicly_flexicast_num_members(flow) == member_count);
+    ok(quicly_flexicast_attach(flow, first_member_id + member_count, 0) == QUICLY_FLEXICAST_ERROR_MEMBER_LIMIT);
     ok(quicly_flexicast_send_datagram(flow, ptls_iovec_init(payload, sizeof(payload)), packet, sizeof(packet), &packet_size,
-                                      &packet_number) == QUICLY_FLEXICAST_OK);
+                                      &packet_number, 0) == QUICLY_FLEXICAST_OK);
     ok(quicly_flexicast_get_pending_members(flow, packet_number, &pending) == QUICLY_FLEXICAST_OK && pending == member_count);
 
     /* removing a member clears only its pending bit */
     uint64_t removed_id = first_member_id + 500, replacement_id = first_member_id + member_count;
-    ok(quicly_flexicast_detach(flow, removed_id) == QUICLY_FLEXICAST_OK);
-    ok(quicly_flexicast_attach(flow, replacement_id) == QUICLY_FLEXICAST_OK);
-    ok(quicly_flexicast_ack(flow, replacement_id, packet_number, &complete) == QUICLY_FLEXICAST_ERROR_REPLAY);
+    ok(quicly_flexicast_detach(flow, removed_id, 0) == QUICLY_FLEXICAST_OK);
+    ok(quicly_flexicast_attach(flow, replacement_id, 0) == QUICLY_FLEXICAST_OK);
+    ok(quicly_flexicast_ack_packet(flow, replacement_id, packet_number, &complete, 0) == QUICLY_FLEXICAST_ERROR_REPLAY);
     ok(quicly_flexicast_get_pending_members(flow, packet_number, &pending) == QUICLY_FLEXICAST_OK && pending == member_count - 1);
 
     all_ok = 1;
     for (size_t i = 0; i != member_count; ++i) {
         if (first_member_id + i == removed_id)
             continue;
-        if (quicly_flexicast_ack(flow, first_member_id + i, packet_number, &complete) != QUICLY_FLEXICAST_OK)
+        if (quicly_flexicast_ack_packet(flow, first_member_id + i, packet_number, &complete, 0) != QUICLY_FLEXICAST_OK)
             all_ok = 0;
     }
     ok(all_ok && complete);
     ok(quicly_flexicast_get_pending_members(flow, packet_number, &pending) == QUICLY_FLEXICAST_ERROR_NOT_FOUND);
 
     ok(quicly_flexicast_send_datagram(flow, ptls_iovec_init(payload, sizeof(payload)), packet, sizeof(packet), &packet_size,
-                                      &packet_number) == QUICLY_FLEXICAST_OK);
+                                      &packet_number, 0) == QUICLY_FLEXICAST_OK);
     ok(quicly_flexicast_get_pending_members(flow, packet_number, &pending) == QUICLY_FLEXICAST_OK && pending == member_count);
     all_ok = 1;
     for (size_t i = 0; i != member_count; ++i) {
         uint64_t member_id = first_member_id + i;
         if (member_id == removed_id)
             member_id = replacement_id;
-        if (quicly_flexicast_ack(flow, member_id, packet_number, &complete) != QUICLY_FLEXICAST_OK)
+        if (quicly_flexicast_ack_packet(flow, member_id, packet_number, &complete, 0) != QUICLY_FLEXICAST_OK)
             all_ok = 0;
     }
     ok(all_ok && complete);
     quicly_flexicast_flow_free(flow);
+    quicly_flexicast_cc_free_multicast(cc);
 }
 
 static void test_member_churn(void)
 {
-    quicly_flexicast_cc_type_t *types[] = {&quicly_flexicast_cc_type_multicast};
     quicly_flexicast_cc_config_t config = {
         .maximum_members = 2, .startup_rate_bytes_per_second = 100000, .maximum_datagram_size = 1200};
-    for (size_t t = 0; t != PTLS_ELEMENTSOF(types); ++t) {
-        quicly_flexicast_cc_t *cc;
-        quicly_flexicast_cc_output_t output;
-        int all_ok = 1;
-        ok(quicly_flexicast_cc_create(&cc, types[t], &config, 100) == 0);
-        quicly_flexicast_cc_on_member_added(cc, UINT64_MAX, 100);
-        for (uint64_t id = 1; id <= 512; ++id) {
-            quicly_flexicast_feedback_t feedback = {.member_id = id, .epoch = 1, .ecn_ce_count = 1, .now = 100 + id};
-            quicly_flexicast_cc_on_member_added(cc, id, feedback.now);
-            quicly_flexicast_cc_on_feedback(cc, &feedback);
-            quicly_flexicast_cc_get_output(cc, &output);
-            all_ok &= output.limiting_member_id == id && output.reason == QUICLY_FLEXICAST_CC_REASON_ECN;
-            quicly_flexicast_cc_on_member_removed(cc, id, feedback.now);
-        }
-        ok(all_ok); /* joining must still work after every hash bucket has been used */
-        quicly_flexicast_cc_free(cc);
+    quicly_flexicast_cc_t *cc = quicly_flexicast_cc_new_multicast(&config, 100);
+    quicly_flexicast_cc_output_t output;
+    int all_ok = 1;
+    ok(cc != NULL);
+    quicly_flexicast_cc_on_member_added(cc, UINT64_MAX, 100);
+    for (uint64_t id = 1; id <= 512; ++id) {
+        quicly_flexicast_feedback_t feedback = {.member_id = id, .epoch = 1, .ecn_ce_count = 1, .now = 100 + (int64_t)id};
+        quicly_flexicast_cc_on_member_added(cc, id, feedback.now);
+        quicly_flexicast_cc_on_feedback(cc, &feedback);
+        quicly_flexicast_cc_get_output(cc, &output);
+        all_ok &= output.limiting_member_id == id && output.reason == QUICLY_FLEXICAST_CC_REASON_ECN;
+        quicly_flexicast_cc_on_member_removed(cc, id, feedback.now);
     }
+    ok(all_ok); /* joining must still work after every hash bucket has been used */
+    quicly_flexicast_cc_free_multicast(cc);
 
     uint8_t secret[PTLS_MAX_DIGEST_SIZE] = {0}, packet[128];
     quicly_flexicast_flow_t *flow = create_flow(1000, secret);
     uint64_t ids[8], pn;
     size_t size;
-    int all_ok = 1, complete;
+    int complete;
+    all_ok = 1;
     for (size_t i = 0; i != PTLS_ELEMENTSOF(ids); ++i) {
         ids[i] = i + 1;
-        all_ok &= quicly_flexicast_attach(flow, ids[i]) == 0;
+        all_ok &= quicly_flexicast_attach(flow, ids[i], 0) == 0;
     }
     for (size_t turn = 0; turn != 512; ++turn) {
         size_t slot = turn % PTLS_ELEMENTSOF(ids);
-        all_ok &= quicly_flexicast_detach(flow, ids[slot]) == 0;
+        all_ok &= quicly_flexicast_detach(flow, ids[slot], 0) == 0;
         ids[slot] = turn + 100;
-        all_ok &= quicly_flexicast_attach(flow, ids[slot]) == 0;
-        all_ok &= quicly_flexicast_send_datagram(flow, ptls_iovec_init(NULL, 0), packet, sizeof(packet), &size, &pn) == 0;
+        all_ok &= quicly_flexicast_attach(flow, ids[slot], 0) == 0;
+        all_ok &= quicly_flexicast_send_datagram(flow, ptls_iovec_init(NULL, 0), packet, sizeof(packet), &size, &pn, 0) == 0;
         for (size_t i = 0; i != PTLS_ELEMENTSOF(ids); ++i) {
-            all_ok &= quicly_flexicast_ack(flow, ids[i], pn, &complete) == 0;
+            all_ok &= quicly_flexicast_ack_packet(flow, ids[i], pn, &complete, 0) == 0;
             all_ok &= complete == (i + 1 == PTLS_ELEMENTSOF(ids));
         }
     }
-    ok(all_ok); /* deleting a colliding entry must preserve the remaining members */
+    ok(all_ok);
     quicly_flexicast_flow_free(flow);
+
+    /* suspended members from prior epochs must be evicted when max_members slots fill */
+    quicly_flexicast_cc_t *rekey_cc = quicly_flexicast_cc_new_multicast(&config, 100);
+    quicly_flexicast_config_t small_cfg = {
+        .flow_id = 1001,
+        .cipher_suite = &ptls_openssl_aes128gcmsha256,
+        .crypto_engine = &quicly_default_crypto_engine,
+        .traffic_secret = ptls_iovec_init(secret, ptls_openssl_aes128gcmsha256.hash->digest_size),
+        .max_members = 2,
+        .cc = rekey_cc,
+    };
+    ok(quicly_flexicast_flow_create(&flow, &small_cfg) == QUICLY_FLEXICAST_OK);
+    ok(quicly_flexicast_attach(flow, 10, 100) == QUICLY_FLEXICAST_OK);
+    ok(quicly_flexicast_attach(flow, 20, 100) == QUICLY_FLEXICAST_OK);
+    secret[0] = 1;
+    ok(quicly_flexicast_flow_rekey(flow, ptls_iovec_init(secret, ptls_openssl_aes128gcmsha256.hash->digest_size), 1, 200) ==
+       QUICLY_FLEXICAST_OK);
+    ok(quicly_flexicast_attach(flow, 30, 210) == QUICLY_FLEXICAST_OK);
+    ok(quicly_flexicast_attach(flow, 40, 210) == QUICLY_FLEXICAST_OK);
+    ok(quicly_flexicast_num_members(flow) == 2);
+    ok(quicly_flexicast_attach(flow, 50, 210) == QUICLY_FLEXICAST_ERROR_MEMBER_LIMIT);
+    quicly_flexicast_flow_free(flow);
+    quicly_flexicast_cc_free_multicast(rekey_cc);
 }
 
 static void test_controller_boundaries(void)
 {
-    quicly_flexicast_cc_type_t *types[] = {&quicly_flexicast_cc_type_multicast};
-    for (size_t t = 0; t != PTLS_ELEMENTSOF(types); ++t) {
-        quicly_flexicast_cc_config_t config = {.maximum_datagram_size = 1200, .startup_rate_bytes_per_second = UINT64_MAX};
-        quicly_flexicast_cc_t *cc;
-        quicly_flexicast_cc_output_t output;
-        ok(quicly_flexicast_cc_create(&cc, types[t], &config, 100) == 0);
-        quicly_flexicast_cc_on_member_added(cc, 1, 100);
-        quicly_flexicast_cc_get_output(cc, &output);
-        ok(output.next_timeout > 100); /* a zero timeout selects a default, never a busy loop */
-        quicly_flexicast_feedback_t feedback = {.member_id = 1, .ecn_ce_count = 1, .now = 200};
-        quicly_flexicast_cc_on_feedback(cc, &feedback);
-        quicly_flexicast_cc_get_output(cc, &output);
-        uint64_t reduced = output.rate_bytes_per_second;
-        ok(reduced > UINT64_MAX / 2 && reduced < UINT64_MAX);
-        ok(output.ecn_reduction_events == 1);
-        quicly_flexicast_cc_on_epoch_reset(cc, 201);
-        feedback.now = 202;
-        quicly_flexicast_cc_on_feedback(cc, &feedback);
-        quicly_flexicast_cc_get_output(cc, &output);
-        ok(output.rate_bytes_per_second < reduced); /* an old epoch must not suppress fresh congestion feedback */
-        quicly_flexicast_cc_on_timeout(cc, output.next_timeout);
-        quicly_flexicast_cc_get_output(cc, &output);
-        ok(output.next_timeout > feedback.now);
-        quicly_flexicast_cc_free(cc);
-    }
-
-    quicly_flexicast_cc_config_t config = {.maximum_datagram_size = 1200, .startup_rate_bytes_per_second = 100000};
-    quicly_flexicast_cc_t *cc;
+    quicly_flexicast_cc_config_t config = {.maximum_datagram_size = 1200, .startup_rate_bytes_per_second = UINT64_MAX};
+    quicly_flexicast_cc_t *cc = quicly_flexicast_cc_new_multicast(&config, 100);
     quicly_flexicast_cc_output_t output;
-    ok(quicly_flexicast_cc_create(&cc, &test_cc_type, &config, 100) == 0);
-    quicly_flexicast_feedback_t feedback = {.member_id = 1, .acked_packets = 1, .now = 200};
-    quicly_flexicast_cc_on_feedback(cc, &feedback);
-    quicly_flexicast_cc_on_timeout(cc, 201); /* this custom controller has no timeout callback */
+
+    ok(cc != NULL);
+    quicly_flexicast_cc_on_member_added(cc, 1, 100);
     quicly_flexicast_cc_get_output(cc, &output);
+    ok(output.next_timeout > 100); /* zero timeout selects default, never a busy loop */
+    quicly_flexicast_feedback_t feedback = {.member_id = 1, .ecn_ce_count = 1, .now = 200};
+    quicly_flexicast_cc_on_feedback(cc, &feedback);
+    quicly_flexicast_cc_get_output(cc, &output);
+    uint64_t reduced = output.rate_bytes_per_second;
+    ok(reduced > UINT64_MAX / 2 && reduced < UINT64_MAX && output.reason == QUICLY_FLEXICAST_CC_REASON_ECN);
+    quicly_flexicast_cc_on_epoch_reset(cc, 201);
+    feedback.now = 202;
+    quicly_flexicast_cc_on_feedback(cc, &feedback);
+    quicly_flexicast_cc_get_output(cc, &output);
+    ok(output.rate_bytes_per_second < reduced);
+    quicly_flexicast_cc_on_timeout(cc, output.next_timeout);
+    quicly_flexicast_cc_get_output(cc, &output);
+    ok(output.next_timeout > feedback.now);
+    quicly_flexicast_cc_free_multicast(cc);
+
+    test_flexicast_cc_t custom = {0};
+    config = (quicly_flexicast_cc_config_t){.maximum_datagram_size = 1200, .startup_rate_bytes_per_second = 100000};
+    ok(quicly_flexicast_cc_init(&custom.super, &test_cc_type, &config) == 0);
+    feedback = (quicly_flexicast_feedback_t){.member_id = 1, .acked_packets = 1, .now = 200};
+    quicly_flexicast_cc_on_feedback(&custom.super, &feedback);
+    quicly_flexicast_cc_on_timeout(&custom.super, 201);
+    quicly_flexicast_cc_get_output(&custom.super, &output);
     ok(output.reason == QUICLY_FLEXICAST_CC_REASON_NONE);
-    quicly_flexicast_cc_free(cc);
     config.minimum_rate_bytes_per_second = 2000;
     config.maximum_rate_bytes_per_second = 1000;
-    ok(quicly_flexicast_cc_create(&cc, &test_cc_type, &config, 100) != 0);
-
-    uint8_t secret[PTLS_MAX_DIGEST_SIZE] = {0};
-    quicly_flexicast_flow_t *flow;
-    quicly_flexicast_config_t flow_config = {.flow_id = 1000,
-                                             .cipher_suite = &ptls_openssl_aes128gcmsha256,
-                                             .crypto_engine = &quicly_default_crypto_engine,
-                                             .traffic_secret =
-                                                 ptls_iovec_init(secret, ptls_openssl_aes128gcmsha256.hash->digest_size),
-                                             .cc_type = &test_cc_type,
-                                             .cc_config = config};
-    ok(quicly_flexicast_flow_create(&flow, &flow_config) == QUICLY_FLEXICAST_ERROR_INVALID);
+    ok(quicly_flexicast_cc_init(&custom.super, &test_cc_type, &config) != 0);
+    ok(quicly_flexicast_cc_new_multicast(&config, 100) == NULL);
 }
 
 static void test_data_epoch_boundaries(void)
@@ -601,47 +469,52 @@ static void test_data_epoch_boundaries(void)
     quicly_flexicast_flow_t *source = create_flow_at(1000, secret, 100);
     quicly_flexicast_flow_t *receiver = create_flow_at(1000, secret, 101);
 
-    ok(quicly_flexicast_attach(source, 1) == QUICLY_FLEXICAST_OK);
-    ok(quicly_flexicast_send_datagram_at(source, ptls_iovec_init(NULL, 0), packet, sizeof(packet), &size, &pn, 100) ==
+    ok(quicly_flexicast_attach(source, 1, 100) == QUICLY_FLEXICAST_OK);
+    ok(quicly_flexicast_send_datagram(source, ptls_iovec_init(NULL, 0), packet, sizeof(packet), &size, &pn, 100) ==
        QUICLY_FLEXICAST_OK);
     /* reject packets below the advertised first packet number */
-    ok(quicly_flexicast_receive_datagram_at(receiver, packet, size, &payload, &received_pn, 110) == QUICLY_FLEXICAST_ERROR_REPLAY);
+    ok(quicly_flexicast_receive_datagram(receiver, packet, size, &payload, &received_pn, 0, 110) == QUICLY_FLEXICAST_ERROR_REPLAY);
     ok(quicly_flexicast_get_ack_deadline(receiver) == INT64_MAX);
-    ok(quicly_flexicast_send_datagram_at(source, ptls_iovec_init(NULL, 0), packet, sizeof(packet), &size, &pn, 111) ==
+    ok(quicly_flexicast_send_datagram(source, ptls_iovec_init(NULL, 0), packet, sizeof(packet), &size, &pn, 111) ==
        QUICLY_FLEXICAST_OK);
     memcpy(copy, packet, size);
-    ok(quicly_flexicast_receive_datagram_at(receiver, packet, size, &payload, &received_pn, 120) == QUICLY_FLEXICAST_OK);
+    ok(quicly_flexicast_receive_datagram(receiver, packet, size, &payload, &received_pn, 0, 120) == QUICLY_FLEXICAST_OK);
     ok(received_pn == 101);
-    ok(quicly_flexicast_receive_datagram_at(receiver, copy, size, &payload, &received_pn, 121) == QUICLY_FLEXICAST_ERROR_REPLAY);
+    ok(quicly_flexicast_receive_datagram(receiver, copy, size, &payload, &received_pn, 0, 121) == QUICLY_FLEXICAST_ERROR_REPLAY);
+
+    /* reject bogus ECN totals exceeding packets sent in this epoch */
+    quicly_ack_frame_t bogus_ecn = {
+        .largest_acknowledged = 101, .smallest_acknowledged = 100, .ack_block_lengths = {2}, .ecn_counts = {0, 0, 10}};
+    ok(quicly_flexicast_ack_frame(source, 1, &bogus_ecn, 0, &num_acked, &num_lost, &num_completed, 129) ==
+       QUICLY_FLEXICAST_ERROR_INVALID);
 
     quicly_ack_frame_t ack = {
-        .largest_acknowledged = 101, .smallest_acknowledged = 100, .ack_block_lengths = {2}, .ecn_counts = {0, 0, 10}};
-    ok(quicly_flexicast_ack_frame_at(source, 1, &ack, &num_acked, &num_lost, &num_completed, 130) == QUICLY_FLEXICAST_OK);
+        .largest_acknowledged = 101, .smallest_acknowledged = 100, .ack_block_lengths = {2}, .ecn_counts = {0, 0, 2}};
+    ok(quicly_flexicast_ack_frame(source, 1, &ack, 0, &num_acked, &num_lost, &num_completed, 130) == QUICLY_FLEXICAST_OK);
     ok(num_acked == 2 && num_completed == 2);
     ok(quicly_flexicast_flow_rekey(source, secret_bytes, 101, 140) == QUICLY_FLEXICAST_ERROR_INVALID);
-    ok(quicly_flexicast_get_next_packet_number(source) == 102);
-    ok(quicly_flexicast_num_members(source) == 1);
+    ok(quicly_flexicast_get_next_packet_number(source) == 102 && quicly_flexicast_num_members(source) == 1);
     ok(quicly_flexicast_flow_rekey(receiver, secret_bytes, 101, 140) == QUICLY_FLEXICAST_ERROR_INVALID);
     ok(quicly_flexicast_flow_rekey(receiver, secret_bytes, 102, 140) == QUICLY_FLEXICAST_OK);
     ok(quicly_flexicast_get_ack_deadline(receiver) == INT64_MAX);
 
     ok(quicly_flexicast_flow_rekey(source, secret_bytes, 102, 140) == QUICLY_FLEXICAST_OK);
-    ok(quicly_flexicast_attach(source, 1) == QUICLY_FLEXICAST_OK);
+    ok(quicly_flexicast_attach(source, 1, 140) == QUICLY_FLEXICAST_OK);
     ok(quicly_flexicast_get_member_stats(source, 1, &stats) == QUICLY_FLEXICAST_OK);
     ok(stats.delivered_packets == 2 && stats.ecn_ce_count == 0 && stats.last_feedback_at == 0);
-    ok(quicly_flexicast_send_datagram_at(source, ptls_iovec_init(NULL, 0), packet, sizeof(packet), &size, &pn, 150) ==
+    ok(quicly_flexicast_send_datagram(source, ptls_iovec_init(NULL, 0), packet, sizeof(packet), &size, &pn, 150) ==
        QUICLY_FLEXICAST_OK);
     ok(pn == 102);
-    ok(quicly_flexicast_receive_datagram_at(receiver, packet, size, &payload, &received_pn, 155) == QUICLY_FLEXICAST_OK);
+    ok(quicly_flexicast_receive_datagram(receiver, packet, size, &payload, &received_pn, 0, 155) == QUICLY_FLEXICAST_OK);
     /* ignore stale feedback from the previous epoch */
-    ok(quicly_flexicast_ack_frame_at(source, 1, &ack, &num_acked, &num_lost, &num_completed, 160) == QUICLY_FLEXICAST_OK);
+    ok(quicly_flexicast_ack_frame(source, 1, &ack, 0, &num_acked, &num_lost, &num_completed, 160) == QUICLY_FLEXICAST_OK);
     ok(num_acked == 0 && num_lost == 0 && num_completed == 0);
     ok(quicly_flexicast_get_pending_members(source, 102, &pending) == QUICLY_FLEXICAST_OK && pending == 1);
     ok(quicly_flexicast_get_member_stats(source, 1, &stats) == QUICLY_FLEXICAST_OK);
     ok(stats.ecn_ce_count == 0 && stats.last_feedback_at == 0);
     ack = (quicly_ack_frame_t){
         .largest_acknowledged = 102, .smallest_acknowledged = 102, .ack_block_lengths = {1}, .ecn_counts = {0, 0, 1}};
-    ok(quicly_flexicast_ack_frame_at(source, 1, &ack, &num_acked, &num_lost, &num_completed, 170) == QUICLY_FLEXICAST_OK);
+    ok(quicly_flexicast_ack_frame(source, 1, &ack, 0, &num_acked, &num_lost, &num_completed, 170) == QUICLY_FLEXICAST_OK);
     ok(num_acked == 1 && num_completed == 1);
     ok(quicly_flexicast_get_member_stats(source, 1, &stats) == QUICLY_FLEXICAST_OK);
     ok(stats.delivered_packets == 3 && stats.ecn_ce_count == 1 && stats.last_feedback_at == 170);
@@ -657,30 +530,30 @@ static void test_ack_rtt_largest_only(void)
     uint64_t pn;
     quicly_flexicast_member_stats_t stats;
     quicly_flexicast_flow_t *flow = create_flow(1000, secret);
-    ok(quicly_flexicast_attach(flow, 1) == QUICLY_FLEXICAST_OK);
+    ok(quicly_flexicast_attach(flow, 1, 100) == QUICLY_FLEXICAST_OK);
     for (int64_t i = 0; i != 2; ++i)
-        ok(quicly_flexicast_send_datagram_at(flow, ptls_iovec_init(NULL, 0), packet, sizeof(packet), &size, &pn, 100 + i * 10) ==
+        ok(quicly_flexicast_send_datagram(flow, ptls_iovec_init(NULL, 0), packet, sizeof(packet), &size, &pn, 100 + i * 10) ==
            QUICLY_FLEXICAST_OK);
     quicly_ack_frame_t ack = {.largest_acknowledged = 1, .smallest_acknowledged = 1, .ack_block_lengths = {1}};
-    ok(quicly_flexicast_ack_frame_at(flow, 1, &ack, &num_acked, &num_lost, &num_completed, 150) == QUICLY_FLEXICAST_OK);
+    ok(quicly_flexicast_ack_frame(flow, 1, &ack, 0, &num_acked, &num_lost, &num_completed, 150) == QUICLY_FLEXICAST_OK);
     ok(quicly_flexicast_get_member_stats(flow, 1, &stats) == QUICLY_FLEXICAST_OK);
     ok(stats.latest_rtt_msec == 40 && stats.smoothed_rtt_msec == 40);
     ack.smallest_acknowledged = 0;
     ack.ack_block_lengths[0] = 2;
-    ok(quicly_flexicast_ack_frame_at(flow, 1, &ack, &num_acked, &num_lost, &num_completed, 200) == QUICLY_FLEXICAST_OK);
+    ok(quicly_flexicast_ack_frame(flow, 1, &ack, 0, &num_acked, &num_lost, &num_completed, 200) == QUICLY_FLEXICAST_OK);
     ok(num_acked == 1);
     ok(quicly_flexicast_get_member_stats(flow, 1, &stats) == QUICLY_FLEXICAST_OK);
     ok(stats.latest_rtt_msec == 40 && stats.smoothed_rtt_msec == 40);
-    ok(quicly_flexicast_send_datagram_at(flow, ptls_iovec_init(NULL, 0), packet, sizeof(packet), &size, &pn, 210) ==
+    ok(quicly_flexicast_send_datagram(flow, ptls_iovec_init(NULL, 0), packet, sizeof(packet), &size, &pn, 210) ==
        QUICLY_FLEXICAST_OK);
     ack = (quicly_ack_frame_t){.largest_acknowledged = 2, .smallest_acknowledged = 2, .ack_block_lengths = {1}, .ack_delay = 25};
-    ok(quicly_flexicast_ack_frame_at(flow, 1, &ack, &num_acked, &num_lost, &num_completed, 275) == QUICLY_FLEXICAST_OK);
+    ok(quicly_flexicast_ack_frame(flow, 1, &ack, 0, &num_acked, &num_lost, &num_completed, 275) == QUICLY_FLEXICAST_OK);
     ok(quicly_flexicast_get_member_stats(flow, 1, &stats) == QUICLY_FLEXICAST_OK);
     ok(stats.latest_rtt_msec == 40 && stats.smoothed_rtt_msec == 40);
     /* subtract full ACK delay from established RTT */
-    ok(quicly_flexicast_send_datagram_at(flow, ptls_iovec_init(NULL, 0), packet, sizeof(packet), &size, &pn, 300) == 0);
+    ok(quicly_flexicast_send_datagram(flow, ptls_iovec_init(NULL, 0), packet, sizeof(packet), &size, &pn, 300) == 0);
     ack = (quicly_ack_frame_t){.largest_acknowledged = 3, .smallest_acknowledged = 3, .ack_block_lengths = {1}, .ack_delay = 500};
-    ok(quicly_flexicast_ack_frame_at(flow, 1, &ack, &num_acked, &num_lost, &num_completed, 840) == 0);
+    ok(quicly_flexicast_ack_frame(flow, 1, &ack, 0, &num_acked, &num_lost, &num_completed, 840) == 0);
     ok(quicly_flexicast_get_member_stats(flow, 1, &stats) == 0);
     ok(stats.latest_rtt_msec == 40 && stats.smoothed_rtt_msec == 40);
     quicly_flexicast_flow_free(flow);
@@ -689,18 +562,19 @@ static void test_ack_rtt_largest_only(void)
 static void test_single_ack_loss_retirement(void)
 {
     uint8_t secret[32] = {1}, packet[128];
-    quicly_flexicast_flow_t *flow = create_cc_flow(1000, secret);
+    test_flexicast_cc_t cc;
+    quicly_flexicast_flow_t *flow = create_cc_flow(1000, secret, &cc);
     size_t size, pending;
     uint64_t pn;
     int complete;
     quicly_flexicast_member_stats_t stats;
-    ok(quicly_flexicast_attach(flow, 1) == 0);
-    ok(quicly_flexicast_attach(flow, 2) == 0);
+    ok(quicly_flexicast_attach(flow, 1, 100) == 0);
+    ok(quicly_flexicast_attach(flow, 2, 100) == 0);
     for (int64_t i = 0; i != 5; ++i)
-        ok(quicly_flexicast_send_datagram_at(flow, ptls_iovec_init(NULL, 0), packet, sizeof(packet), &size, &pn, 100 + i) == 0);
-    ok(quicly_flexicast_ack_at(flow, 2, 0, &complete, 110) == 0 && !complete);
+        ok(quicly_flexicast_send_datagram(flow, ptls_iovec_init(NULL, 0), packet, sizeof(packet), &size, &pn, 100 + i) == 0);
+    ok(quicly_flexicast_ack_packet(flow, 2, 0, &complete, 110) == 0 && !complete);
     /* retiring packet 0 completes it without marking packet 4 complete */
-    ok(quicly_flexicast_ack_at(flow, 1, 4, &complete, 120) == 0 && !complete);
+    ok(quicly_flexicast_ack_packet(flow, 1, 4, &complete, 120) == 0 && !complete);
     ok(test_last_feedback.acked_packets == 1 && test_last_feedback.lost_packets == 2);
     ok(quicly_flexicast_get_member_stats(flow, 1, &stats) == 0);
     ok(stats.lost_packets == 2 && stats.lost_bytes == size * 2 && stats.largest_acknowledged == 4);
@@ -708,9 +582,9 @@ static void test_single_ack_loss_retirement(void)
     ok(quicly_flexicast_get_pending_members(flow, 1, &pending) == 0 && pending == 1);
     ok(quicly_flexicast_get_pending_members(flow, 2, &pending) == 0 && pending == 2);
     ok(quicly_flexicast_get_pending_members(flow, 4, &pending) == 0 && pending == 1);
-    ok(quicly_flexicast_ack_at(flow, 1, 3, &complete, 130) == 0 && !complete);
+    ok(quicly_flexicast_ack_packet(flow, 1, 3, &complete, 130) == 0 && !complete);
     ok(test_last_feedback.lost_packets == 0);
-    ok(quicly_flexicast_ack(flow, 2, 4, &complete) == 0 && complete);
+    ok(quicly_flexicast_ack_packet(flow, 2, 4, &complete, 0) == 0 && complete);
     ok(test_last_feedback.lost_packets == 1);
     ok(quicly_flexicast_get_pending_members(flow, 1, &pending) == QUICLY_FLEXICAST_ERROR_NOT_FOUND);
     quicly_flexicast_flow_free(flow);
@@ -726,12 +600,12 @@ static void test_ack_range_history(void)
     quicly_flexicast_flow_t *source = create_flow(1000, secret);
     quicly_flexicast_flow_t *receiver = create_flow(1000, secret);
 
-    ok(quicly_flexicast_attach(source, 1) == QUICLY_FLEXICAST_OK);
+    ok(quicly_flexicast_attach(source, 1, 0) == QUICLY_FLEXICAST_OK);
     for (size_t i = 0; i <= QUICLY_MAX_ACK_BLOCKS * 2; ++i) {
-        ok(quicly_flexicast_send_datagram(source, ptls_iovec_init(NULL, 0), packet, sizeof(packet), &packet_size, &pn) ==
+        ok(quicly_flexicast_send_datagram(source, ptls_iovec_init(NULL, 0), packet, sizeof(packet), &packet_size, &pn, 0) ==
            QUICLY_FLEXICAST_OK);
         if (i % 2 == 0) {
-            ok(quicly_flexicast_receive_datagram_at(receiver, packet, packet_size, &payload, &received_pn, (int64_t)i) ==
+            ok(quicly_flexicast_receive_datagram(receiver, packet, packet_size, &payload, &received_pn, 0, (int64_t)i) ==
                QUICLY_FLEXICAST_OK);
             if (i == 0) {
                 /* zero clock value is a valid receive timestamp */
@@ -745,12 +619,12 @@ static void test_ack_range_history(void)
         }
     }
     ok(quicly_flexicast_ack_is_due(receiver, 140));
+    ok(quicly_flexicast_get_ack_deadline(receiver) == 0);
     ok(quicly_flexicast_encode_pending_ack(receiver, encoded, sizeof(encoded), 140, &encoded_size) == QUICLY_FLEXICAST_OK);
     const uint8_t *src = encoded + 1, *end = encoded + encoded_size;
     ok(quicly_decodev(&src, end) == 1000);
     ok(quicly_decode_ack_frame(&src, end, &ack, 0) == 0);
-    ok(ack.num_gaps == QUICLY_MAX_ACK_BLOCKS - 1);
-    ok(ack.smallest_acknowledged == 2 && ack.largest_acknowledged == 128);
+    ok(ack.num_gaps == QUICLY_MAX_ACK_BLOCKS - 1 && ack.smallest_acknowledged == 2 && ack.largest_acknowledged == 128);
     ok(ack.ack_delay == (12000 >> QUICLY_LOCAL_ACK_DELAY_EXPONENT));
     quicly_flexicast_ack_sent(receiver);
     ok(!quicly_flexicast_ack_is_due(receiver, 140));
@@ -762,14 +636,12 @@ static void test_ack_range_history(void)
     ok(ack.num_gaps == QUICLY_MAX_ACK_BLOCKS - 1 && ack.smallest_acknowledged == 2 && ack.largest_acknowledged == 128);
     ok(ack.ack_delay == (12000 >> QUICLY_LOCAL_ACK_DELAY_EXPONENT));
     quicly_flexicast_ack_sent(receiver);
-    ok(!quicly_flexicast_ack_is_due(receiver, 140));
-    ok(quicly_flexicast_get_ack_deadline(receiver) == INT64_MAX);
+    ok(!quicly_flexicast_ack_is_due(receiver, 140) && quicly_flexicast_get_ack_deadline(receiver) == INT64_MAX);
 
     /* retained history does not force an immediate ACK for each new packet */
-    ok(quicly_flexicast_send_datagram(source, ptls_iovec_init(NULL, 0), packet, sizeof(packet), &packet_size, &pn) == 0);
-    ok(quicly_flexicast_receive_datagram_at(receiver, packet, packet_size, &payload, &received_pn, 150) == 0);
-    ok(!quicly_flexicast_ack_is_due(receiver, 150));
-    ok(quicly_flexicast_get_ack_deadline(receiver) == 175);
+    ok(quicly_flexicast_send_datagram(source, ptls_iovec_init(NULL, 0), packet, sizeof(packet), &packet_size, &pn, 0) == 0);
+    ok(quicly_flexicast_receive_datagram(receiver, packet, packet_size, &payload, &received_pn, 0, 150) == 0);
+    ok(!quicly_flexicast_ack_is_due(receiver, 150) && quicly_flexicast_get_ack_deadline(receiver) == 175);
 
     quicly_flexicast_flow_free(receiver);
     quicly_flexicast_flow_free(source);
@@ -781,11 +653,10 @@ static void test_packet_number_limit(void)
     quicly_flexicast_flow_t *flow = create_flow_at(1000, secret, PTLS_QUICINT_MAX);
     uint64_t pn;
     size_t size;
-    ok(quicly_flexicast_attach(flow, 1) == 0);
-    ok(quicly_flexicast_send_datagram(flow, ptls_iovec_init(NULL, 0), packet, sizeof(packet), &size, &pn) == 0);
-    ok(pn == PTLS_QUICINT_MAX);
-    ok(size == quicly_flexicast_datagram_size(flow, 0));
-    ok(quicly_flexicast_send_datagram(flow, ptls_iovec_init(NULL, 0), packet, sizeof(packet), &size, &pn) ==
+    ok(quicly_flexicast_attach(flow, 1, 0) == 0);
+    ok(quicly_flexicast_send_datagram(flow, ptls_iovec_init(NULL, 0), packet, sizeof(packet), &size, &pn, 0) == 0);
+    ok(pn == PTLS_QUICINT_MAX && size == quicly_flexicast_datagram_size(flow, 0));
+    ok(quicly_flexicast_send_datagram(flow, ptls_iovec_init(NULL, 0), packet, sizeof(packet), &size, &pn, 0) ==
        QUICLY_FLEXICAST_ERROR_INVALID);
     quicly_flexicast_flow_free(flow);
 }
@@ -794,7 +665,7 @@ static void regression_send(quicly_flexicast_flow_t *flow, uint8_t *packet, size
                             int64_t now)
 {
     uint8_t payload[1000] = {0};
-    ok(quicly_flexicast_send_datagram_at(flow, ptls_iovec_init(payload, sizeof(payload)), packet, capacity, size, pn, now) == 0);
+    ok(quicly_flexicast_send_datagram(flow, ptls_iovec_init(payload, sizeof(payload)), packet, capacity, size, pn, now) == 0);
 }
 
 static void regression_ack(quicly_flexicast_flow_t *flow, uint64_t member, uint64_t first, uint64_t last, uint64_t delay,
@@ -803,7 +674,7 @@ static void regression_ack(quicly_flexicast_flow_t *flow, uint64_t member, uint6
     quicly_ack_frame_t ack = {
         .largest_acknowledged = last, .smallest_acknowledged = first, .ack_block_lengths = {last - first + 1}, .ack_delay = delay};
     size_t acked, lost, complete;
-    ok(quicly_flexicast_ack_frame_at(flow, member, &ack, &acked, &lost, &complete, now) == 0);
+    ok(quicly_flexicast_ack_frame(flow, member, &ack, 0, &acked, &lost, &complete, now) == 0);
 }
 
 static void test_feedback_clock_and_submission(void)
@@ -813,8 +684,9 @@ static void test_feedback_clock_and_submission(void)
     uint64_t pn;
     uint64_t rates[3];
     for (size_t mode = 0; mode != 3; ++mode) {
-        quicly_flexicast_flow_t *flow = create_cc_flow(1000, secret);
-        ok(quicly_flexicast_attach_at(flow, 1, 100) == 0);
+        test_flexicast_cc_t cc;
+        quicly_flexicast_flow_t *flow = create_cc_flow(1000, secret, &cc);
+        ok(quicly_flexicast_attach(flow, 1, 100) == 0);
         regression_send(flow, packet, sizeof(packet), &size, &pn, 100);
         regression_ack(flow, 1, 0, 0, 0, 200);
         for (size_t i = 0; i != 9; ++i)
@@ -822,15 +694,13 @@ static void test_feedback_clock_and_submission(void)
         if (mode == 2) {
             regression_ack(flow, 1, 0, 0, 0, 209); /* duplicate cannot move the sampler clock */
             quicly_flexicast_member_stats_t stats;
-            ok(quicly_flexicast_get_member_stats(flow, 1, &stats) == 0);
-            ok(stats.last_feedback_at == 200);
+            ok(quicly_flexicast_get_member_stats(flow, 1, &stats) == 0 && stats.last_feedback_at == 200);
         }
         if (mode == 1) {
             for (uint64_t n = 1; n <= 8; ++n) {
                 regression_ack(flow, 1, n, n, 0, 210);
                 quicly_flexicast_member_stats_t stats;
-                ok(quicly_flexicast_get_member_stats(flow, 1, &stats) == 0);
-                ok(stats.delivery_rate_bytes_per_second == 0); /* no partial same-tick sample */
+                ok(quicly_flexicast_get_member_stats(flow, 1, &stats) == 0 && stats.delivery_rate_bytes_per_second == 0);
                 ok(test_last_feedback.delivery_rate_sample_epoch == 0);
             }
         } else {
@@ -840,30 +710,28 @@ static void test_feedback_clock_and_submission(void)
         quicly_flexicast_member_stats_t stats;
         ok(quicly_flexicast_get_member_stats(flow, 1, &stats) == 0);
         rates[mode] = stats.delivery_rate_bytes_per_second;
-        ok(rates[mode] == size * 8 * 1000 / 101); /* the send interval exceeds the compressed ACK interval */
-        ok(test_last_feedback.delivery_rate_sample_epoch == 1);
-        ok(test_last_feedback.delivery_rate_bytes_per_second == rates[mode]);
+        ok(rates[mode] == size * 8 * 1000 / 101);
+        ok(test_last_feedback.delivery_rate_sample_epoch == 1 && test_last_feedback.delivery_rate_bytes_per_second == rates[mode]);
         if (mode == 0) {
             /* CE feedback without new delivery retains the published sample epoch */
             quicly_ack_frame_t ack = {
                 .largest_acknowledged = 9, .smallest_acknowledged = 9, .ack_block_lengths = {1}, .ecn_counts = {0, 0, 1}};
             size_t acked, lost, complete;
-            ok(quicly_flexicast_ack_frame_at(flow, 1, &ack, &acked, &lost, &complete, 221) == 0);
+            ok(quicly_flexicast_ack_frame(flow, 1, &ack, 0, &acked, &lost, &complete, 221) == 0);
             ok(acked == 0 && test_last_feedback.ecn_ce_count == 1);
-            ok(test_last_feedback.delivery_rate_sample_epoch == 1);
-            ok(test_last_feedback.delivery_rate_bytes_per_second == rates[mode]);
+            ok(test_last_feedback.delivery_rate_sample_epoch == 1 &&
+               test_last_feedback.delivery_rate_bytes_per_second == rates[mode]);
 
             /* keep learned stats across rekey without exposing a new CC sample epoch */
             uint8_t next_secret[32] = {2};
             ok(quicly_flexicast_flow_rekey(flow, ptls_iovec_init(next_secret, sizeof(next_secret)), 100, 250) == 0);
-            ok(quicly_flexicast_attach_at(flow, 1, 250) == 0);
+            ok(quicly_flexicast_attach(flow, 1, 250) == 0);
             for (int64_t i = 0; i != 3; ++i) {
                 regression_send(flow, packet, sizeof(packet), &size, &pn, 300 + i * 10);
                 regression_ack(flow, 1, pn, pn, 0, 301 + i * 10);
                 ok(test_last_feedback.delivery_rate_sample_epoch == (i == 2 ? 1 : 0));
                 ok((test_last_feedback.delivery_rate_bytes_per_second != 0) == (i == 2));
-                ok(quicly_flexicast_get_member_stats(flow, 1, &stats) == 0);
-                ok(stats.delivery_rate_bytes_per_second != 0);
+                ok(quicly_flexicast_get_member_stats(flow, 1, &stats) == 0 && stats.delivery_rate_bytes_per_second != 0);
             }
         }
         quicly_flexicast_flow_free(flow);
@@ -871,31 +739,26 @@ static void test_feedback_clock_and_submission(void)
     ok(rates[0] == rates[1] && rates[1] == rates[2]);
 
     quicly_flexicast_flow_t *flow = create_flow(1000, secret);
-    ok(quicly_flexicast_attach_at(flow, 1, 100) == 0);
-    ok(quicly_flexicast_attach_at(flow, 2, 100) == 0);
+    ok(quicly_flexicast_attach(flow, 1, 100) == 0);
+    ok(quicly_flexicast_attach(flow, 2, 100) == 0);
     regression_send(flow, packet, sizeof(packet), &size, &pn, 100);
-    ok(quicly_flexicast_mark_submitted(flow, 1, pn, 110) == 0);
-    ok(quicly_flexicast_mark_submitted(flow, 2, pn, 400) == 0);
+    ok(quicly_flexicast_mark_submitted(flow, 1, pn, 110, NULL) == 0);
+    ok(quicly_flexicast_mark_submitted(flow, 2, pn, 400, NULL) == 0);
     regression_ack(flow, 1, pn, pn, 0, 120);
     regression_ack(flow, 2, pn, pn, 0, 410);
     quicly_flexicast_member_stats_t stats;
-    ok(quicly_flexicast_get_member_stats(flow, 1, &stats) == 0);
-    ok(stats.minimum_rtt_msec == 10 && stats.latest_rtt_msec == 10);
-    ok(quicly_flexicast_get_member_stats(flow, 2, &stats) == 0);
-    ok(stats.minimum_rtt_msec == 10 && stats.latest_rtt_msec == 10);
+    ok(quicly_flexicast_get_member_stats(flow, 1, &stats) == 0 && stats.minimum_rtt_msec == 10 && stats.latest_rtt_msec == 10);
+    ok(quicly_flexicast_get_member_stats(flow, 2, &stats) == 0 && stats.minimum_rtt_msec == 10 && stats.latest_rtt_msec == 10);
     regression_send(flow, packet, sizeof(packet), &size, &pn, 500);
-    ok(quicly_flexicast_mark_submitted(flow, 0, pn, 600) == 0);
-    regression_ack(flow, 1, pn, pn, 25, 635); /* exact min RTT + ACK delay boundary */
-    ok(quicly_flexicast_get_member_stats(flow, 1, &stats) == 0);
-    ok(stats.latest_rtt_msec == 10);
+    ok(quicly_flexicast_mark_submitted(flow, 0, pn, 600, NULL) == 0);
+    regression_ack(flow, 1, pn, pn, 25, 635);
+    ok(quicly_flexicast_get_member_stats(flow, 1, &stats) == 0 && stats.latest_rtt_msec == 10);
     regression_ack(flow, 2, pn, pn, 25, 636);
-    ok(quicly_flexicast_get_member_stats(flow, 2, &stats) == 0);
-    ok(stats.latest_rtt_msec == 11);
+    ok(quicly_flexicast_get_member_stats(flow, 2, &stats) == 0 && stats.latest_rtt_msec == 11);
     regression_send(flow, packet, sizeof(packet), &size, &pn, 700);
-    ok(quicly_flexicast_mark_submitted(flow, 0, pn, 0) == 0); /* unknown queued send time: do not invent RTT */
+    ok(quicly_flexicast_mark_submitted(flow, 0, pn, 0, NULL) == 0);
     regression_ack(flow, 1, pn, pn, 0, 10000);
-    ok(quicly_flexicast_get_member_stats(flow, 1, &stats) == 0);
-    ok(stats.latest_rtt_msec == 10);
+    ok(quicly_flexicast_get_member_stats(flow, 1, &stats) == 0 && stats.latest_rtt_msec == 10);
     quicly_flexicast_flow_free(flow);
 }
 
@@ -906,26 +769,24 @@ static void test_submission_timestamp_bound(void)
     uint64_t pn;
     quicly_flexicast_flow_t *flow = create_flow(1000, secret);
     for (uint64_t member = 1; member <= 4; ++member)
-        ok(quicly_flexicast_attach_at(flow, member, 100) == 0);
+        ok(quicly_flexicast_attach(flow, member, 100) == 0);
     /* excess replica exceptions beyond 4096 are omitted without unbounded memory */
     for (size_t i = 0; i != QUICLY_FLEXICAST_SENT_WINDOW; ++i) {
         regression_send(flow, packet, sizeof(packet), &size, &pn, 100);
         for (uint64_t member = 1; member <= 4; ++member)
-            ok(quicly_flexicast_mark_submitted(flow, member, pn, 110 + (int64_t)member) == 0);
+            ok(quicly_flexicast_mark_submitted(flow, member, pn, 110 + (int64_t)member, NULL) == 0);
     }
     for (uint64_t member = 1; member <= 4; ++member) {
         regression_ack(flow, member, pn, pn, 0, 1000);
         quicly_flexicast_member_stats_t stats;
-        ok(quicly_flexicast_get_member_stats(flow, member, &stats) == 0);
-        ok(stats.latest_rtt_msec == 0);
+        ok(quicly_flexicast_get_member_stats(flow, member, &stats) == 0 && stats.latest_rtt_msec == 0);
     }
     /* loss processing releases sparse entries so reused slots record timestamps again */
     regression_send(flow, packet, sizeof(packet), &size, &pn, 2000);
-    ok(quicly_flexicast_mark_submitted(flow, 1, pn, 2300) == 0);
+    ok(quicly_flexicast_mark_submitted(flow, 1, pn, 2300, NULL) == 0);
     regression_ack(flow, 1, pn, pn, 0, 2310);
     quicly_flexicast_member_stats_t stats;
-    ok(quicly_flexicast_get_member_stats(flow, 1, &stats) == 0);
-    ok(stats.latest_rtt_msec == 10);
+    ok(quicly_flexicast_get_member_stats(flow, 1, &stats) == 0 && stats.latest_rtt_msec == 10);
     quicly_flexicast_flow_free(flow);
 }
 
@@ -950,12 +811,12 @@ static void test_feedback_backpressure_and_ecn(void)
     ptls_iovec_t payload;
     quicly_ack_frame_t ack;
     quicly_flexicast_flow_t *tx = create_flow(1000, secret), *rx = create_flow(1000, secret);
-    ok(quicly_flexicast_attach_at(tx, 1, 100) == 0);
+    ok(quicly_flexicast_attach(tx, 1, 100) == 0);
     /* leave ACKs pending as if the reliable control queue were full */
     for (size_t i = 0; i != 201; ++i) {
         regression_send(tx, packet, sizeof(packet), &size, &pn, 100 + (int64_t)i);
         if (i % 2 == 0)
-            ok(quicly_flexicast_receive_datagram_at(rx, packet, size, &payload, &received_pn, 110 + (int64_t)i) == 0);
+            ok(quicly_flexicast_receive_datagram(rx, packet, size, &payload, &received_pn, 0, 110 + (int64_t)i) == 0);
     }
     decode_feedback(rx, 400, &ack, &type);
     ok(ack.num_gaps + 1 == QUICLY_MAX_ACK_BLOCKS);
@@ -966,56 +827,51 @@ static void test_feedback_backpressure_and_ecn(void)
     quicly_flexicast_ack_sent(rx);
     ok(quicly_flexicast_get_ack_deadline(rx) == INT64_MAX);
     regression_send(tx, packet, sizeof(packet), &size, &pn, 500);
-    ok(quicly_flexicast_receive_datagram_at(rx, packet, size, &payload, &received_pn, 510) == 0);
+    ok(quicly_flexicast_receive_datagram(rx, packet, size, &payload, &received_pn, 0, 510) == 0);
     decode_feedback(rx, 520, &ack, &type);
-    ok(ack.largest_acknowledged == 201);
-    ok(ack.num_gaps == QUICLY_MAX_ACK_BLOCKS - 1 && ack.ack_block_lengths[0] == 2);
+    ok(ack.largest_acknowledged == 201 && ack.num_gaps == QUICLY_MAX_ACK_BLOCKS - 1 && ack.ack_block_lengths[0] == 2);
     ok(ack.ack_delay == (10000 >> QUICLY_LOCAL_ACK_DELAY_EXPONENT));
     quicly_flexicast_flow_free(tx);
     quicly_flexicast_flow_free(rx);
 
     tx = create_flow(1000, secret);
     rx = create_flow(1000, secret);
-    ok(quicly_flexicast_attach_at(tx, 1, 100) == 0);
+    ok(quicly_flexicast_attach(tx, 1, 100) == 0);
     const uint8_t marks[] = {2, 1, 3, 3};
     for (size_t i = 0; i != sizeof(marks); ++i) {
         regression_send(tx, packet, sizeof(packet), &size, &pn, 100 + (int64_t)i);
         memcpy(duplicate, packet, size);
-        ok(quicly_flexicast_receive_datagram_ecn_at(rx, packet, size, &payload, &received_pn, 110 + (int64_t)i, marks[i]) == 0);
+        ok(quicly_flexicast_receive_datagram(rx, packet, size, &payload, &received_pn, marks[i], 110 + (int64_t)i) == 0);
     }
-    ok(quicly_flexicast_receive_datagram_ecn_at(rx, duplicate, size, &payload, &received_pn, 120, 3) ==
-       QUICLY_FLEXICAST_ERROR_REPLAY);
+    ok(quicly_flexicast_receive_datagram(rx, duplicate, size, &payload, &received_pn, 3, 120) == QUICLY_FLEXICAST_ERROR_REPLAY);
     decode_feedback(rx, 130, &ack, &type);
     ok(type == QUICLY_FRAME_TYPE_PATH_ACK_ECN && ack.ecn_counts[0] == 1 && ack.ecn_counts[1] == 1 && ack.ecn_counts[2] == 2);
     size_t acked, lost, complete;
-    ok(quicly_flexicast_ack_frame_at(tx, 1, &ack, &acked, &lost, &complete, 140) == 0);
+    ok(quicly_flexicast_ack_frame(tx, 1, &ack, 0, &acked, &lost, &complete, 140) == 0);
     quicly_flexicast_member_stats_t stats;
     ok(quicly_flexicast_get_member_stats(tx, 1, &stats) == 0);
     uint64_t epoch = stats.feedback_epoch;
     ok(stats.ecn_ce_count == 2);
-    ok(quicly_flexicast_ack_frame_at(tx, 1, &ack, &acked, &lost, &complete, 141) == 0);
-    ok(quicly_flexicast_get_member_stats(tx, 1, &stats) == 0);
-    ok(stats.feedback_epoch == epoch && stats.ecn_ce_count == 2);
+    ok(quicly_flexicast_ack_frame(tx, 1, &ack, 0, &acked, &lost, &complete, 141) == 0);
+    ok(quicly_flexicast_get_member_stats(tx, 1, &stats) == 0 && stats.feedback_epoch == epoch && stats.ecn_ce_count == 2);
     quicly_flexicast_ack_sent(rx);
     regression_send(tx, packet, sizeof(packet), &size, &pn, 150);
-    ok(quicly_flexicast_receive_datagram_ecn_at(rx, packet, size, &payload, &received_pn, 160, 2) == 0);
+    ok(quicly_flexicast_receive_datagram(rx, packet, size, &payload, &received_pn, 2, 160) == 0);
     quicly_ack_frame_t old_ack;
     decode_feedback(rx, 170, &old_ack, &type);
     ok(old_ack.ecn_counts[0] == 2 && old_ack.ecn_counts[1] == 1 && old_ack.ecn_counts[2] == 2);
     secret[0] = 2;
     ok(quicly_flexicast_flow_rekey(tx, ptls_iovec_init(secret, sizeof(secret)), 10, 180) == 0);
     ok(quicly_flexicast_flow_rekey(rx, ptls_iovec_init(secret, sizeof(secret)), 10, 180) == 0);
-    ok(quicly_flexicast_attach_at(tx, 1, 180) == 0);
-    ok(quicly_flexicast_ack_frame_at(tx, 1, &old_ack, &acked, &lost, &complete, 181) == 0);
-    ok(quicly_flexicast_get_member_stats(tx, 1, &stats) == 0);
-    ok(stats.ecn_ce_count == 0 && acked == 0);
+    ok(quicly_flexicast_attach(tx, 1, 180) == 0);
+    ok(quicly_flexicast_ack_frame(tx, 1, &old_ack, 0, &acked, &lost, &complete, 181) == 0);
+    ok(quicly_flexicast_get_member_stats(tx, 1, &stats) == 0 && stats.ecn_ce_count == 0 && acked == 0);
     regression_send(tx, packet, sizeof(packet), &size, &pn, 190);
-    ok(quicly_flexicast_receive_datagram_ecn_at(rx, packet, size, &payload, &received_pn, 200, 3) == 0);
+    ok(quicly_flexicast_receive_datagram(rx, packet, size, &payload, &received_pn, 3, 200) == 0);
     decode_feedback(rx, 210, &ack, &type);
     ok(ack.ecn_counts[0] == 0 && ack.ecn_counts[1] == 0 && ack.ecn_counts[2] == 1);
-    ok(quicly_flexicast_ack_frame_at(tx, 1, &ack, &acked, &lost, &complete, 220) == 0);
-    ok(quicly_flexicast_get_member_stats(tx, 1, &stats) == 0);
-    ok(stats.ecn_ce_count == 1 && stats.feedback_epoch == epoch + 1);
+    ok(quicly_flexicast_ack_frame(tx, 1, &ack, 0, &acked, &lost, &complete, 220) == 0);
+    ok(quicly_flexicast_get_member_stats(tx, 1, &stats) == 0 && stats.ecn_ce_count == 1 && stats.feedback_epoch == epoch + 1);
     quicly_flexicast_flow_free(tx);
     quicly_flexicast_flow_free(rx);
 }
@@ -1035,13 +891,13 @@ static void test_sparse_control_and_member_lifecycle(void)
     /* test receive state borrowing and history_lower_bound updates */
     quicly_flexicast_flow_t *tx = create_flow_at(2000, secret, 50);
     quicly_flexicast_flow_t *rx = create_flow_at(2000, secret, 50);
-    ok(quicly_flexicast_attach_at(tx, 1, 100) == QUICLY_FLEXICAST_OK);
+    ok(quicly_flexicast_attach(tx, 1, 100) == QUICLY_FLEXICAST_OK);
     ok(quicly_flexicast_get_receive_state(rx, &ranges, &num_ranges, &history_lb, &largest_at, ecn_counts) == QUICLY_FLEXICAST_OK);
     ok(num_ranges == 0 && history_lb == 50 && largest_at == 0);
     for (size_t i = 0; i != 132; ++i) {
         regression_send(tx, packet, sizeof(packet), &size, &pn, 100 + (int64_t)i);
         if (i % 2 == 0)
-            ok(quicly_flexicast_receive_datagram_ecn_at(rx, packet, size, &payload, &received_pn, 200 + (int64_t)i, 3) == 0);
+            ok(quicly_flexicast_receive_datagram(rx, packet, size, &payload, &received_pn, 3, 200 + (int64_t)i) == 0);
     }
     ok(quicly_flexicast_get_receive_state(rx, &ranges, &num_ranges, &history_lb, &largest_at, ecn_counts) == QUICLY_FLEXICAST_OK);
     ok(num_ranges == 66 && history_lb == 50 && largest_at == 330 && ecn_counts[2] == 66);
@@ -1051,18 +907,20 @@ static void test_sparse_control_and_member_lifecycle(void)
     quicly_flexicast_flow_free(rx);
     quicly_flexicast_flow_free(tx);
 
-    /* test ack_frame_ex flags, deferred loss commit, and detach full-window cleanup */
-    quicly_flexicast_flow_t *flow = create_cc_flow(2001, secret);
-    ok(quicly_flexicast_attach_at(flow, 1, 100) == QUICLY_FLEXICAST_OK);
-    ok(quicly_flexicast_attach_at(flow, 2, 100) == QUICLY_FLEXICAST_OK);
+    /* test ack_frame flags, deferred loss commit, and detach cleanup */
+    test_flexicast_cc_t cc;
+    quicly_flexicast_flow_t *flow = create_cc_flow(2001, secret, &cc);
+    ok(quicly_flexicast_attach(flow, 1, 100) == QUICLY_FLEXICAST_OK);
+    ok(quicly_flexicast_attach(flow, 2, 100) == QUICLY_FLEXICAST_OK);
     for (int i = 0; i != 6; ++i)
         regression_send(flow, packet, sizeof(packet), &size, &pn, 100 + i * 10);
 
     quicly_ack_frame_t ack = {.largest_acknowledged = 5, .smallest_acknowledged = 5, .ack_block_lengths = {1}};
-    ok(quicly_flexicast_ack_frame_ex(flow, 1, &ack, &acked, &lost, &completed, 200, 0x80u) == QUICLY_FLEXICAST_ERROR_INVALID);
-    ok(quicly_flexicast_ack_frame_ex(flow, 1, &ack, &acked, &lost, &completed, 200,
-                                     QUICLY_FLEXICAST_ACK_OMIT_RTT | QUICLY_FLEXICAST_ACK_OMIT_DELIVERY_RATE |
-                                         QUICLY_FLEXICAST_ACK_DEFER_LOSS) == QUICLY_FLEXICAST_OK);
+    ok(quicly_flexicast_ack_frame(flow, 1, &ack, 0x80u, &acked, &lost, &completed, 200) == QUICLY_FLEXICAST_ERROR_INVALID);
+    ok(quicly_flexicast_ack_frame(flow, 1, &ack,
+                                  QUICLY_FLEXICAST_ACK_OMIT_RTT | QUICLY_FLEXICAST_ACK_OMIT_DELIVERY_RATE |
+                                      QUICLY_FLEXICAST_ACK_DEFER_LOSS,
+                                  &acked, &lost, &completed, 200) == QUICLY_FLEXICAST_OK);
     ok(acked == 1 && lost == 0 && completed == 0);
     ok(quicly_flexicast_get_member_stats(flow, 1, &stats) == QUICLY_FLEXICAST_OK);
     ok(stats.latest_rtt_msec == 0 && test_last_feedback.latest_rtt_msec == 0 && test_last_feedback.delivery_rate_sample_epoch == 0);
@@ -1070,33 +928,33 @@ static void test_sparse_control_and_member_lifecycle(void)
     /* commit loss only from pn 1..2, leaving pn 0 unresolved below coverage */
     ok(quicly_flexicast_commit_ack_loss(flow, 1, 1, 5, &lost, &completed, 205) == QUICLY_FLEXICAST_OK);
     ok(lost == 2 && completed == 0);
-    ok(quicly_flexicast_ack(flow, 2, 0, &(int){0}) == QUICLY_FLEXICAST_OK);
+    ok(quicly_flexicast_ack_packet(flow, 2, 0, &(int){0}, 205) == QUICLY_FLEXICAST_OK);
     ok(quicly_flexicast_get_pending_members(flow, 0, &pending) == QUICLY_FLEXICAST_OK && pending == 1);
-    ok(quicly_flexicast_detach_at(flow, 1, 206) == QUICLY_FLEXICAST_OK);
+    ok(quicly_flexicast_detach(flow, 1, 206) == QUICLY_FLEXICAST_OK);
     ok(quicly_flexicast_get_pending_members(flow, 0, &pending) == QUICLY_FLEXICAST_ERROR_NOT_FOUND);
 
-    /* test suspend, resume, reset_member_path, and note_member_feedback_at */
+    /* test suspend, resume, reset_member_path, and note_member_feedback */
     regression_ack(flow, 2, 5, 5, 0, 210);
     ok(quicly_flexicast_get_member_stats(flow, 2, &stats) == QUICLY_FLEXICAST_OK && stats.latest_rtt_msec > 0);
     uint64_t epoch_before = stats.feedback_epoch;
-    ok(quicly_flexicast_note_member_feedback_at(flow, 2, 210) == QUICLY_FLEXICAST_OK);
+    ok(quicly_flexicast_note_member_feedback(flow, 2, 210) == QUICLY_FLEXICAST_OK);
     ok(quicly_flexicast_get_member_stats(flow, 2, &stats) == QUICLY_FLEXICAST_OK && stats.feedback_epoch == epoch_before);
-    ok(quicly_flexicast_note_member_feedback_at(flow, 2, 220) == QUICLY_FLEXICAST_OK);
+    ok(quicly_flexicast_note_member_feedback(flow, 2, 220) == QUICLY_FLEXICAST_OK);
     ok(quicly_flexicast_get_member_stats(flow, 2, &stats) == QUICLY_FLEXICAST_OK);
     ok(stats.feedback_epoch == epoch_before + 1 && stats.last_feedback_at == 220 && test_last_feedback.acked_packets == 0);
 
     regression_send(flow, packet, sizeof(packet), &size, &pn, 225); /* pn 6 sent before suspend/reset */
-    ok(quicly_flexicast_suspend_at(flow, 2, 230) == QUICLY_FLEXICAST_OK);
+    ok(quicly_flexicast_suspend(flow, 2, 230) == QUICLY_FLEXICAST_OK);
     ok(quicly_flexicast_num_members(flow) == 0);
-    ok(quicly_flexicast_note_member_feedback_at(flow, 2, 235) == QUICLY_FLEXICAST_ERROR_NOT_FOUND);
+    ok(quicly_flexicast_note_member_feedback(flow, 2, 235) == QUICLY_FLEXICAST_ERROR_NOT_FOUND);
     ack = (quicly_ack_frame_t){.largest_acknowledged = 4, .smallest_acknowledged = 4, .ack_block_lengths = {1}};
-    ok(quicly_flexicast_ack_frame_at(flow, 2, &ack, &acked, &lost, &completed, 235) == QUICLY_FLEXICAST_ERROR_NOT_FOUND);
-    ok(quicly_flexicast_ack_frame_ex(flow, 2, &ack, &acked, &lost, &completed, 235, QUICLY_FLEXICAST_ACK_DEFER_LOSS) ==
+    ok(quicly_flexicast_ack_frame(flow, 2, &ack, 0, &acked, &lost, &completed, 235) == QUICLY_FLEXICAST_ERROR_NOT_FOUND);
+    ok(quicly_flexicast_ack_frame(flow, 2, &ack, QUICLY_FLEXICAST_ACK_DEFER_LOSS, &acked, &lost, &completed, 235) ==
        QUICLY_FLEXICAST_OK);
     ok(acked == 1);
 
     /* resume resets path baselines and suppresses old-route samples below path_sample_floor */
-    ok(quicly_flexicast_resume_at(flow, 2, 240) == QUICLY_FLEXICAST_OK);
+    ok(quicly_flexicast_resume(flow, 2, 240) == QUICLY_FLEXICAST_OK);
     ok(quicly_flexicast_num_members(flow) == 1);
     ok(quicly_flexicast_get_member_stats(flow, 2, &stats) == QUICLY_FLEXICAST_OK && stats.latest_rtt_msec == 0);
     regression_ack(flow, 2, 6, 6, 0, 250);
@@ -1116,21 +974,21 @@ static void test_sparse_control_regressions(void)
     uint64_t pn;
     quicly_flexicast_member_stats_t stats;
     quicly_flexicast_send_context_t ctx = provenance_context(500000, 1, 0);
+    test_flexicast_cc_t cc;
 
     /* deferred loss + commit_ack_loss preserves in-progress delivery-rate buckets */
-    quicly_flexicast_flow_t *flow = create_cc_flow(2002, secret);
-    ok(quicly_flexicast_attach_at(flow, 1, 100) == QUICLY_FLEXICAST_OK);
+    quicly_flexicast_flow_t *flow = create_cc_flow(2002, secret, &cc);
+    ok(quicly_flexicast_attach(flow, 1, 100) == QUICLY_FLEXICAST_OK);
     for (int step = 0; step != 3; ++step) {
         for (int j = 0; j != 4; ++j)
             provenance_send(flow, 100 + step * 50 + j * 5, &ctx, &size);
         uint64_t first = (uint64_t)step * 4, last = first + 3;
         quicly_ack_frame_t ack = {.largest_acknowledged = last, .smallest_acknowledged = first, .ack_block_lengths = {4}};
-        ok(quicly_flexicast_ack_frame_ex(flow, 1, &ack, &acked, &lost, &completed, 130 + step * 50,
-                                         QUICLY_FLEXICAST_ACK_DEFER_LOSS) == QUICLY_FLEXICAST_OK);
-        /* duplicate OMIT_DELIVERY_RATE frame does not wipe the active bucket */
-        ok(quicly_flexicast_ack_frame_ex(flow, 1, &ack, &acked, &lost, &completed, 131 + step * 50,
-                                         QUICLY_FLEXICAST_ACK_OMIT_DELIVERY_RATE | QUICLY_FLEXICAST_ACK_DEFER_LOSS) ==
+        ok(quicly_flexicast_ack_frame(flow, 1, &ack, QUICLY_FLEXICAST_ACK_DEFER_LOSS, &acked, &lost, &completed, 130 + step * 50) ==
            QUICLY_FLEXICAST_OK);
+        /* duplicate OMIT_DELIVERY_RATE frame does not wipe the active bucket */
+        ok(quicly_flexicast_ack_frame(flow, 1, &ack, QUICLY_FLEXICAST_ACK_OMIT_DELIVERY_RATE | QUICLY_FLEXICAST_ACK_DEFER_LOSS,
+                                      &acked, &lost, &completed, 131 + step * 50) == QUICLY_FLEXICAST_OK);
         ok(quicly_flexicast_commit_ack_loss(flow, 1, 0, last, &lost, &completed, 132 + step * 50) == QUICLY_FLEXICAST_OK);
         ok(lost == 0);
     }
@@ -1146,21 +1004,21 @@ static void test_sparse_control_regressions(void)
 
     /* untracked new-route packet before bucket completion reports zero rate/RTT sample epochs */
     uint64_t new_pn0 = provenance_send(flow, 320, &ctx, &size); /* pn 14 */
-    ok(quicly_flexicast_mark_submitted(flow, 0, new_pn0, 0) == QUICLY_FLEXICAST_OK);
+    ok(quicly_flexicast_mark_submitted(flow, 0, new_pn0, 0, NULL) == QUICLY_FLEXICAST_OK);
     regression_ack(flow, 1, new_pn0, new_pn0, 0, 330);
     ok(test_last_feedback.delivery_rate_sample_epoch == 0 && test_last_feedback.rtt_sample_epoch == 0);
 
     /* establish clean new-route clock (retiring old_pn_lost without CC loss) and span ACK across old_pn_late + new_pn2 */
     uint64_t new_pn1 = provenance_send(flow, 340, &ctx, &size); /* pn 15 retires pn 12 */
     quicly_ack_frame_t ack1 = {.largest_acknowledged = new_pn1, .smallest_acknowledged = new_pn1, .ack_block_lengths = {1}};
-    ok(quicly_flexicast_ack_frame_at(flow, 1, &ack1, &acked, &lost, &completed, 350) == QUICLY_FLEXICAST_OK);
+    ok(quicly_flexicast_ack_frame(flow, 1, &ack1, 0, &acked, &lost, &completed, 350) == QUICLY_FLEXICAST_OK);
     ok(acked == 1 && lost == 1 && test_last_feedback.lost_packets == 0);
     ok(quicly_flexicast_get_pending_members(flow, old_pn_lost, &pending) == QUICLY_FLEXICAST_ERROR_NOT_FOUND);
     ok(test_last_feedback.rtt_sample_epoch == old_rtt_epoch + 1);
     uint64_t new_pn2 = provenance_send(flow, 360, &ctx, &size); /* pn 16 */
     quicly_ack_frame_t span = {
         .largest_acknowledged = new_pn2, .smallest_acknowledged = old_pn_late, .ack_block_lengths = {new_pn2 - old_pn_late + 1}};
-    ok(quicly_flexicast_ack_frame_at(flow, 1, &span, &acked, &lost, &completed, 370) == QUICLY_FLEXICAST_OK);
+    ok(quicly_flexicast_ack_frame(flow, 1, &span, 0, &acked, &lost, &completed, 370) == QUICLY_FLEXICAST_OK);
     ok(acked == 2 && lost == 0 && test_last_feedback.delivery_rate_sample_epoch == old_rate_epoch + 1);
 
     uint64_t new_pn3 = provenance_send(flow, 380, &ctx, &size); /* pn 17 closes the [350..370] bucket */
@@ -1171,17 +1029,17 @@ static void test_sparse_control_regressions(void)
     ok((test_last_feedback.delivery_sample_flags & QUICLY_FLEXICAST_SAMPLE_VALID) != 0);
     quicly_flexicast_flow_free(flow);
 
-    /* suspend_at followed by attach_at preserves loss_cursor so pre-suspend packets retire cleanly */
-    flow = create_cc_flow(2003, secret);
-    ok(quicly_flexicast_attach_at(flow, 1, 100) == QUICLY_FLEXICAST_OK);
-    ok(quicly_flexicast_attach_at(flow, 2, 100) == QUICLY_FLEXICAST_OK);
-    regression_send(flow, packet, sizeof(packet), &size, &pn, 100); /* pn 0 pending on 1 and 2 */
-    ok(quicly_flexicast_ack(flow, 2, 0, &(int){0}) == QUICLY_FLEXICAST_OK);
-    ok(quicly_flexicast_suspend_at(flow, 1, 110) == QUICLY_FLEXICAST_OK);
+    /* suspend followed by attach preserves loss_cursor so pre-suspend packets retire cleanly */
+    flow = create_cc_flow(2003, secret, &cc);
+    ok(quicly_flexicast_attach(flow, 1, 100) == QUICLY_FLEXICAST_OK);
+    ok(quicly_flexicast_attach(flow, 2, 100) == QUICLY_FLEXICAST_OK);
+    regression_send(flow, packet, sizeof(packet), &size, &pn, 100);
+    ok(quicly_flexicast_ack_packet(flow, 2, 0, &(int){0}, 105) == QUICLY_FLEXICAST_OK);
+    ok(quicly_flexicast_suspend(flow, 1, 110) == QUICLY_FLEXICAST_OK);
     for (int i = 0; i != 3; ++i)
         regression_send(flow, packet, sizeof(packet), &size, &pn, 120 + i);
-    ok(quicly_flexicast_attach_at(flow, 1, 130) == QUICLY_FLEXICAST_OK);
-    regression_send(flow, packet, sizeof(packet), &size, &pn, 140); /* pn 4 */
+    ok(quicly_flexicast_attach(flow, 1, 130) == QUICLY_FLEXICAST_OK);
+    regression_send(flow, packet, sizeof(packet), &size, &pn, 140);
     regression_ack(flow, 1, 4, 4, 0, 150);
     ok(quicly_flexicast_get_pending_members(flow, 0, &pending) == QUICLY_FLEXICAST_ERROR_NOT_FOUND);
     quicly_flexicast_flow_free(flow);
@@ -1198,11 +1056,9 @@ void test_flexicast(void)
     ptls_iovec_t received;
     int complete;
 
-    test_frame_codecs();
     test_congestion_feedback();
     test_ack_aggregation();
     test_builtin_controllers();
-    test_cc_trace();
     test_scalable_members();
     test_member_churn();
     test_controller_boundaries();
@@ -1229,97 +1085,85 @@ void test_flexicast(void)
     quicly_flexicast_flow_t *wrong_receiver = create_flow(flow_id, wrong_secret);
 
     ok(quicly_flexicast_get_flow_id(source) == flow_id);
-    ok(quicly_flexicast_attach(source, 101) == QUICLY_FLEXICAST_OK);
-    ok(quicly_flexicast_attach(source, 202) == QUICLY_FLEXICAST_OK);
-    ok(quicly_flexicast_attach(source, 202) == QUICLY_FLEXICAST_OK);
+    ok(quicly_flexicast_attach(source, 101, 0) == QUICLY_FLEXICAST_OK);
+    ok(quicly_flexicast_attach(source, 202, 0) == QUICLY_FLEXICAST_OK);
+    ok(quicly_flexicast_attach(source, 202, 0) == QUICLY_FLEXICAST_OK);
     ok(quicly_flexicast_num_members(source) == 2);
 
     ok(quicly_flexicast_send_datagram(source, ptls_iovec_init(payload_bytes, sizeof(payload_bytes)), encrypted, sizeof(encrypted),
-                                      &encrypted_size, &packet_number) == QUICLY_FLEXICAST_OK);
-    ok(packet_number == 0);
-    ok(quicly_flexicast_get_next_packet_number(source) == 1);
-    ok(quicly_flexicast_get_pending_members(source, packet_number, &pending) == QUICLY_FLEXICAST_OK);
-    ok(pending == 2);
+                                      &encrypted_size, &packet_number, 0) == QUICLY_FLEXICAST_OK);
+    ok(packet_number == 0 && quicly_flexicast_get_next_packet_number(source) == 1);
+    ok(quicly_flexicast_get_pending_members(source, packet_number, &pending) == QUICLY_FLEXICAST_OK && pending == 2);
 
     memcpy(receiver_a_packet, encrypted, encrypted_size);
     memcpy(receiver_b_packet, encrypted, encrypted_size);
-    ok(quicly_flexicast_receive_datagram(receiver_a, receiver_a_packet, encrypted_size, &received, &received_packet_number) ==
+    ok(quicly_flexicast_receive_datagram(receiver_a, receiver_a_packet, encrypted_size, &received, &received_packet_number, 0, 0) ==
        QUICLY_FLEXICAST_OK);
-    ok(received_packet_number == packet_number);
-    ok(received.len == sizeof(payload_bytes));
+    ok(received_packet_number == packet_number && received.len == sizeof(payload_bytes));
     ok(memcmp(received.base, payload_bytes, sizeof(payload_bytes)) == 0);
-    ok(quicly_flexicast_receive_datagram(receiver_b, receiver_b_packet, encrypted_size, &received, &received_packet_number) ==
+    ok(quicly_flexicast_receive_datagram(receiver_b, receiver_b_packet, encrypted_size, &received, &received_packet_number, 0, 0) ==
        QUICLY_FLEXICAST_OK);
-    ok(received_packet_number == packet_number);
-    ok(memcmp(received.base, payload_bytes, sizeof(payload_bytes)) == 0);
+    ok(received_packet_number == packet_number && memcmp(received.base, payload_bytes, sizeof(payload_bytes)) == 0);
 
     memcpy(bad_packet, encrypted, encrypted_size);
-    ok(quicly_flexicast_receive_datagram(receiver_a, bad_packet, encrypted_size, &received, &received_packet_number) ==
+    ok(quicly_flexicast_receive_datagram(receiver_a, bad_packet, encrypted_size, &received, &received_packet_number, 0, 0) ==
        QUICLY_FLEXICAST_ERROR_REPLAY);
     memcpy(bad_packet, encrypted, encrypted_size);
-    ok(quicly_flexicast_receive_datagram(wrong_receiver, bad_packet, encrypted_size, &received, &received_packet_number) ==
+    ok(quicly_flexicast_receive_datagram(wrong_receiver, bad_packet, encrypted_size, &received, &received_packet_number, 0, 0) ==
        QUICLY_FLEXICAST_ERROR_CRYPTO);
     memcpy(bad_packet, encrypted, encrypted_size);
     bad_packet[1] ^= 1;
-    ok(quicly_flexicast_receive_datagram(receiver_b, bad_packet, encrypted_size, &received, &received_packet_number) ==
+    ok(quicly_flexicast_receive_datagram(receiver_b, bad_packet, encrypted_size, &received, &received_packet_number, 0, 0) ==
        QUICLY_FLEXICAST_ERROR_WRONG_FLOW);
 
-    ok(quicly_flexicast_ack(source, 101, packet_number, &complete) == QUICLY_FLEXICAST_OK);
-    ok(!complete);
-    ok(quicly_flexicast_get_pending_members(source, packet_number, &pending) == QUICLY_FLEXICAST_OK);
-    ok(pending == 1);
-    ok(quicly_flexicast_ack(source, 101, packet_number, &complete) == QUICLY_FLEXICAST_ERROR_REPLAY);
-    ok(quicly_flexicast_ack(source, 202, packet_number, &complete) == QUICLY_FLEXICAST_OK);
-    ok(complete);
+    ok(quicly_flexicast_ack_packet(source, 101, packet_number, &complete, 0) == QUICLY_FLEXICAST_OK && !complete);
+    ok(quicly_flexicast_get_pending_members(source, packet_number, &pending) == QUICLY_FLEXICAST_OK && pending == 1);
+    ok(quicly_flexicast_ack_packet(source, 101, packet_number, &complete, 0) == QUICLY_FLEXICAST_ERROR_REPLAY);
+    ok(quicly_flexicast_ack_packet(source, 202, packet_number, &complete, 0) == QUICLY_FLEXICAST_OK && complete);
     ok(quicly_flexicast_get_pending_members(source, packet_number, &pending) == QUICLY_FLEXICAST_ERROR_NOT_FOUND);
 
-    ok(quicly_flexicast_detach(source, 202) == QUICLY_FLEXICAST_OK);
+    ok(quicly_flexicast_detach(source, 202, 0) == QUICLY_FLEXICAST_OK);
     ok(quicly_flexicast_num_members(source) == 1);
     ok(quicly_flexicast_send_datagram(source, ptls_iovec_init(payload_bytes, 0), encrypted, sizeof(encrypted), &encrypted_size,
-                                      &packet_number) == QUICLY_FLEXICAST_OK);
-    ok(quicly_flexicast_get_pending_members(source, packet_number, &pending) == QUICLY_FLEXICAST_OK);
-    ok(pending == 1);
+                                      &packet_number, 0) == QUICLY_FLEXICAST_OK);
+    ok(quicly_flexicast_get_pending_members(source, packet_number, &pending) == QUICLY_FLEXICAST_OK && pending == 1);
 
     size_t num_acked, num_completed;
     quicly_ack_frame_t ack_frame = {
         .largest_acknowledged = packet_number, .smallest_acknowledged = packet_number, .ack_block_lengths = {1}};
-    ok(quicly_flexicast_ack_frame(source, 101, &ack_frame, &num_acked, &num_completed) == QUICLY_FLEXICAST_OK);
-    ok(num_acked == 1);
-    ok(num_completed == 1);
+    ok(quicly_flexicast_ack_frame(source, 101, &ack_frame, 0, &num_acked, NULL, &num_completed, 0) == QUICLY_FLEXICAST_OK);
+    ok(num_acked == 1 && num_completed == 1);
     ok(quicly_flexicast_get_pending_members(source, packet_number, &pending) == QUICLY_FLEXICAST_ERROR_NOT_FOUND);
 
     uint64_t range_packets[3];
     for (size_t i = 0; i != 3; ++i) {
         ok(quicly_flexicast_send_datagram(source, ptls_iovec_init(payload_bytes, 0), encrypted, sizeof(encrypted), &encrypted_size,
-                                          range_packets + i) == QUICLY_FLEXICAST_OK);
+                                          range_packets + i, 0) == QUICLY_FLEXICAST_OK);
     }
     ack_frame = (quicly_ack_frame_t){.largest_acknowledged = range_packets[2],
                                      .smallest_acknowledged = range_packets[0],
                                      .num_gaps = 1,
                                      .ack_block_lengths = {1, 1},
                                      .gaps = {1}};
-    ok(quicly_flexicast_ack_frame(source, 101, &ack_frame, &num_acked, &num_completed) == QUICLY_FLEXICAST_OK);
-    ok(num_acked == 2);
-    ok(num_completed == 2);
-    ok(quicly_flexicast_get_pending_members(source, range_packets[1], &pending) == QUICLY_FLEXICAST_OK);
-    ok(pending == 1);
+    ok(quicly_flexicast_ack_frame(source, 101, &ack_frame, 0, &num_acked, NULL, &num_completed, 0) == QUICLY_FLEXICAST_OK);
+    ok(num_acked == 2 && num_completed == 2);
+    ok(quicly_flexicast_get_pending_members(source, range_packets[1], &pending) == QUICLY_FLEXICAST_OK && pending == 1);
     ack_frame = (quicly_ack_frame_t){
         .largest_acknowledged = range_packets[1], .smallest_acknowledged = range_packets[1], .ack_block_lengths = {1}};
-    ok(quicly_flexicast_ack_frame(source, 101, &ack_frame, &num_acked, &num_completed) == QUICLY_FLEXICAST_OK);
+    ok(quicly_flexicast_ack_frame(source, 101, &ack_frame, 0, &num_acked, NULL, &num_completed, 0) == QUICLY_FLEXICAST_OK);
     ok(num_acked == 1 && num_completed == 1);
 
     /* verify first_packet_number across the 16-bit truncated PN boundary */
     quicly_flexicast_flow_t *late_source = create_flow_at(flow_id, secret, 65536);
     quicly_flexicast_flow_t *late_receiver = create_flow_at(flow_id, secret, 65536);
-    ok(quicly_flexicast_attach(late_source, 303) == QUICLY_FLEXICAST_OK);
+    ok(quicly_flexicast_attach(late_source, 303, 0) == QUICLY_FLEXICAST_OK);
     ok(quicly_flexicast_send_datagram(late_source, ptls_iovec_init(payload_bytes, sizeof(payload_bytes)), encrypted,
-                                      sizeof(encrypted), &encrypted_size, &packet_number) == QUICLY_FLEXICAST_OK);
+                                      sizeof(encrypted), &encrypted_size, &packet_number, 0) == QUICLY_FLEXICAST_OK);
     ok(packet_number == 65536);
     memcpy(receiver_a_packet, encrypted, encrypted_size);
-    ok(quicly_flexicast_receive_datagram(late_receiver, receiver_a_packet, encrypted_size, &received, &received_packet_number) ==
-       QUICLY_FLEXICAST_OK);
-    ok(received_packet_number == 65536);
-    ok(memcmp(received.base, payload_bytes, sizeof(payload_bytes)) == 0);
+    ok(quicly_flexicast_receive_datagram(late_receiver, receiver_a_packet, encrypted_size, &received, &received_packet_number, 0,
+                                         0) == QUICLY_FLEXICAST_OK);
+    ok(received_packet_number == 65536 && memcmp(received.base, payload_bytes, sizeof(payload_bytes)) == 0);
     quicly_flexicast_flow_free(late_receiver);
     quicly_flexicast_flow_free(late_source);
 

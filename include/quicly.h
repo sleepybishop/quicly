@@ -89,9 +89,6 @@ typedef union st_quicly_address_t {
     struct sockaddr_in6 sin6;
 } quicly_address_t;
 
-int quicly_flexicast_send_path_ack_encoded(quicly_conn_t *conn, uint64_t flow_id, const uint8_t *encoded, size_t encoded_size,
-                                           int64_t now);
-
 typedef struct st_quicly_context_t quicly_context_t;
 typedef struct st_quicly_stream_t quicly_stream_t;
 typedef struct st_quicly_send_context_t quicly_send_context_t;
@@ -143,15 +140,12 @@ typedef struct st_quicly_path_scheduler_t {
      */
     int (*is_path_eligible)(struct st_quicly_path_scheduler_t *sched, quicly_conn_t *conn, size_t path_index);
     /**
-     * optional additional data-readiness filter for deadline reporting. zero means the scheduler will not place application
-     * data on this path now; maintenance remains eligible. NULL assumes any queued datagram or affinity-compatible stream can
-     * be selected. the application must arrange a wakeup when its policy changes. same callback restrictions as above.
+     * optional stream-data policy for an available path; when NULL, uses built-in primary/backup/PTO preference.
      */
     int (*can_send_data)(struct st_quicly_path_scheduler_t *sched, quicly_conn_t *conn, size_t path_index);
 } quicly_path_scheduler_t;
 
 extern quicly_path_scheduler_t quicly_default_path_scheduler;
-extern quicly_path_scheduler_t quicly_round_robin_path_scheduler;
 
 /**
  * called when stream is being open. Application is expected to create it's corresponding state and tie it to stream->data.
@@ -161,9 +155,13 @@ QUICLY_CALLBACK_TYPE(quicly_error_t, stream_open, quicly_stream_t *stream);
  *
  */
 QUICLY_CALLBACK_TYPE(void, receive_datagram_frame, quicly_conn_t *conn, ptls_iovec_t payload);
-/* called synchronously for FC control frames; application owns flow state, sequence ordering, and membership */
+/**
+ * called synchronously for flexicast control frames; frame->data.key.key borrows packet memory valid only during the callback
+ */
 QUICLY_CALLBACK_TYPE(quicly_error_t, receive_flexicast_frame, quicly_conn_t *conn, const quicly_flexicast_frame_t *frame);
-/* receives a PATH_ACK for a flexicast flow ID (above local max_path_id) with ack_delay in msec */
+/**
+ * called when a PATH_ACK frame arrives for a flexicast flow ID (above local max_path_id) with ack_delay in milliseconds
+ */
 QUICLY_CALLBACK_TYPE(quicly_error_t, receive_flexicast_ack, quicly_conn_t *conn, uint64_t flow_id, const quicly_ack_frame_t *frame);
 /**
  * Called when the connection is closed (i.e., when entering the closing or draining state). Otherwise the callback is not called;
@@ -327,7 +325,9 @@ typedef struct st_quicly_transport_parameters_t {
     uint8_t grease_quic_bit : 1;
     /* version information (RFC 9368) */
     quicly_version_information_t version_information;
-    /** address families supported by draft-navarre-quic-flexicast-03 */
+    /**
+     * address families supported by draft-navarre-quic-flexicast-03
+     */
     struct {
         uint8_t ipv4 : 1;
         uint8_t ipv6 : 1;
@@ -442,9 +442,13 @@ struct st_quicly_context_t {
      * callback for receiving datagram frame
      */
     quicly_receive_datagram_frame_t *receive_datagram_frame;
-    /* callback for draft-navarre-quic-flexicast control frames */
+    /**
+     * callback for draft-navarre-quic-flexicast control frames
+     */
     quicly_receive_flexicast_frame_t *receive_flexicast_frame;
-    /* callback for PATH_ACK feedback referring to a flexicast flow ID */
+    /**
+     * callback for PATH_ACK feedback referring to a flexicast flow ID
+     */
     quicly_receive_flexicast_ack_t *receive_flexicast_ack;
     /**
      * callback called when a connection enters closing or draining
@@ -542,12 +546,6 @@ struct st_quicly_context_t {
          */
         uint8_t respect_app_limited : 1;
     } egress[1 + QUICLY_NUM_ALT_EGRESS];
-    /**
-     * opt-in failover: consecutive ordinary PTOs before suppressing data on a path when a validated, physically eligible
-     * alternative has recent ACK progress. zero disables this policy, retaining normal retransmission and scheduler behavior.
-     * recovery requires ACKs of two separately sent, fresh ack-eliciting packets. set before creating connections.
-     */
-    unsigned multipath_failover_pto_threshold;
     /**
      * maximum number of DATAGRAM frame payloads that can be queued per path (0 uses default)
      */
@@ -721,8 +719,8 @@ struct st_quicly_conn_streamgroup_state_t {
         uint64_t padding, ping, ack, reset_stream, stop_sending, crypto, new_token, stream, max_data, max_stream_data,             \
             max_streams_bidi, max_streams_uni, data_blocked, stream_data_blocked, streams_blocked, new_connection_id,              \
             retire_connection_id, path_challenge, path_response, transport_close, application_close, handshake_done, datagram,     \
-            ack_frequency, immediate_ack, reset_stream_at, path_ack, path_abandon, path_status, path_new_connection_id, path_retire_connection_id,  \
-            max_path_id, paths_blocked, path_cids_blocked, fc_announce, fc_state, fc_key;                                          \
+            ack_frequency, immediate_ack, reset_stream_at, path_ack, path_abandon, path_status, path_new_connection_id,            \
+            path_retire_connection_id, max_path_id, paths_blocked, path_cids_blocked, fc_announce, fc_state, fc_key;               \
     } num_frames_received, num_frames_sent;                                                                                        \
     struct {                                                                                                                       \
         /**                                                                                                                        \
@@ -851,12 +849,6 @@ typedef struct st_quicly_stats_t {
     size_t num_sentmap_packets_largest;
 } quicly_stats_t;
 
-typedef enum en_quicly_path_health_state_t {
-    QUICLY_PATH_USABLE,     /* ordinary scheduling */
-    QUICLY_PATH_SUSPECT,    /* application data suppressed; PTO probes continue */
-    QUICLY_PATH_RECOVERING, /* fresh ACK received; flight capped at initial window */
-} quicly_path_health_state_t;
-
 typedef struct st_quicly_path_stats_t {
     size_t path_index;
     uint32_t path_id;
@@ -877,7 +869,6 @@ typedef struct st_quicly_path_stats_t {
     uint8_t probe_only : 1;
     uint8_t abandoned : 1;
     uint8_t validated : 1;
-    quicly_path_health_state_t health_state;
 } quicly_path_stats_t;
 
 /* clang-format off */
@@ -1052,11 +1043,13 @@ struct _st_quicly_conn_public_t {
     quicly_state_t state;
     struct {
         /**
-         * initial local CID snapshot retained for layout compatibility and tracing; live CID state belongs to path zero.
+         * initial local CID plaintext retained for probe offset compatibility; live CID state belongs to path zero.
          * `quicly_conn_public_t::local.cid_set.plaintext.master_id has to be located right after `ctx` and `state`, as probes rely
          * on that assumption.
          */
-        quicly_local_cid_set_t cid_set;
+        struct {
+            quicly_cid_plaintext_t plaintext;
+        } cid_set;
         /**
          * the SCID used in long header packets. Equivalent to local_cid[seq=0]. Retaining the value separately is the easiest way
          * of staying away from the complexity caused by remote peer sending RCID frames before the handshake concludes.
@@ -1069,10 +1062,6 @@ struct _st_quicly_conn_public_t {
         uint64_t max_path_id;
     } local;
     struct {
-        /**
-         * initial remote CID snapshot retained for layout compatibility; use quicly_get_remote_cid for path zero's live CID state.
-         */
-        quicly_remote_cid_set_t cid_set;
         struct st_quicly_conn_streamgroup_state_t bidi, uni;
         quicly_transport_parameters_t transport_params;
         struct {
@@ -1230,10 +1219,6 @@ struct st_quicly_stream_t {
          */
         uint32_t window;
     } _recv_aux;
-    /**
-     * path ID this stream is bound to (UINT32_MAX if unbound); used by the stream scheduler in multipath mode
-     */
-    uint32_t affinity_path_id;
 };
 
 /**
@@ -1395,7 +1380,7 @@ static const quicly_cid_plaintext_t *quicly_get_master_id(quicly_conn_t *conn);
  */
 static const quicly_cid_t *quicly_get_original_dcid(quicly_conn_t *conn);
 /**
- * returns the first entry in path zero's live remote CID set; use quicly_get_path_tuple for per-path DCIDs
+ * returns the first entry in path zero's live remote CID set
  */
 const quicly_cid_t *quicly_get_remote_cid(quicly_conn_t *conn);
 /**
@@ -1472,21 +1457,6 @@ static quicly_tracer_t *quicly_get_tracer(quicly_conn_t *conn);
  * destroys a connection object.
  */
 void quicly_free(quicly_conn_t *conn);
-typedef struct st_quicly_tuple_t {
-    struct {
-        quicly_address_t remote;
-        quicly_address_t local;
-    } address;
-    quicly_cid_t dcid;
-    uint32_t path_id;
-} quicly_tuple_t;
-
-/**
- * gets the address pair, DCID, and path ID for a path index without assigning or consuming a CID.
- * @return 0 for an existing slot, or -1 without modifying *tuple for an invalid/unused slot
- */
-int quicly_get_path_tuple(quicly_conn_t *conn, size_t path_index, quicly_tuple_t *tuple);
-
 /**
  * populates stats and protocol state for an existing path slot (including retained abandoned paths).
  * @return 0 for an existing slot, or -1 without modifying *stats for an invalid/unused slot
@@ -1553,23 +1523,12 @@ int quicly_is_path_available(quicly_conn_t *conn, size_t path_index);
 int quicly_request_path_probe(quicly_conn_t *conn, size_t path_index);
 /**
  * returns whether the stream scheduler has data sendable under connection flow control and current application keys.
- * does not check per-path affinity, physical eligibility, congestion credit, pacing, or queued DATAGRAM frames.
  */
 int quicly_has_pending_stream_data(quicly_conn_t *conn);
 /**
  * builds packets on the specified path index; optionally populates packets_sent with the number of datagrams generated
  */
 quicly_error_t quicly_send_on_path(quicly_conn_t *conn, quicly_send_context_t *s, size_t path_index, size_t *packets_sent);
-/**
- * service due multipath ACKs/loss probes. quicly_send does this before invoking the path scheduler; existing schedulers may still
- * call this helper from do_send, under quicly_send's time lock. honors is_path_eligible and protocol limits. no application STREAM
- * or DATAGRAM payload is sent; reliable ranges made pending are subsequently placed by the data scheduler, retaining affinity.
- * protocol control/CRYPTO may accompany probes. optional packets_sent reports the total datagrams in this send context;
- * return on output or nonzero error.
- * repeated calls in the same callback are supported: after output they do nothing. zero output leaves data selection available.
- * outside negotiated multipath this is a no-op. no private connection/send-context access is required.
- */
-quicly_error_t quicly_send_path_maintenance(quicly_conn_t *conn, quicly_send_context_t *s, size_t *packets_sent);
 /**
  * Builds a Version Negotiation packet. The generated packet might include a greasing version.
  * * @param versions  zero-terminated list of versions to advertise; use `quicly_supported_versions` for sending the list of
@@ -1745,21 +1704,6 @@ quicly_error_t quicly_get_or_open_stream(quicly_conn_t *conn, uint64_t stream_id
  *
  */
 void quicly_reset_stream(quicly_stream_t *stream, quicly_error_t err);
-
-/**
- * sets the path affinity for a stream (UINT32_MAX clears affinity).
- * with the built-in schedulers, explicit affinity permits using a backup path; affinity is cleared on path abandonment.
- */
-int quicly_set_stream_path_affinity(quicly_stream_t *stream, uint32_t path_id);
-
-/**
- * checks whether the selected send path matches a stream's affinity or, for unbound streams using a built-in path scheduler,
- * the path preference. custom path schedulers retain their own policy for unbound streams.
- * stream schedulers should skip streams returning zero before calling quicly_send_stream. this does not check flow control or
- * whether stream data is pending; use quicly_stream_can_send for those checks.
- */
-int quicly_stream_can_send_on_path(quicly_stream_t *stream, quicly_send_context_t *s);
-
 /**
  * Marks the stream for a reliable reset, committing to the delivery of the first `reliable_size` bytes; see
  * draft-ietf-quic-reliable-stream-reset. Similarly to a shutdown, bytes remain to be emitted, hence the stream is to be scheduled
@@ -1824,23 +1768,45 @@ size_t quicly_get_num_datagram_frames_path(quicly_conn_t *conn, size_t path_inde
 size_t quicly_get_max_datagram_frames_path(quicly_conn_t *conn, size_t path_index);
 /**
  * queues DATAGRAM frames on the specified path; honors explicit placement on backup paths while gating on eligibility,
- * validation, congestion, pacing, and SUSPECT health.
+ * validation, congestion, and pacing.
  */
 void quicly_send_datagram_frames_path(quicly_conn_t *conn, size_t path_index, ptls_iovec_t *datagrams, size_t num_datagrams);
 /**
  * returns whether any path has queued DATAGRAM frames
  */
 int quicly_has_datagram_frames(quicly_conn_t *conn);
-#define QUICLY_AMTQ_ADAPTER_API 1
-/* current path/peer framing limit for one DATAGRAM payload; zero if unavailable */
-size_t quicly_get_datagram_payload_limit(quicly_conn_t *conn, size_t path_index);
-/* discard locally queued DATAGRAMs on this path before send */
-void quicly_discard_datagram_frames(quicly_conn_t *conn, size_t path_index);
 /**
  * additional per-connection UDP ceiling for packets and probes; zero clears it; nonzero sizes must be at least
  * QUICLY_MIN_CLIENT_INITIAL_SIZE; context and peer limits continue to apply; returns 0 on success, -1 on invalid argument
  */
 int quicly_set_max_udp_payload_size(quicly_conn_t *conn, uint16_t max_size);
+/**
+ * returns the current path/peer framing limit for one DATAGRAM payload, or zero if unavailable
+ */
+size_t quicly_get_datagram_payload_limit(quicly_conn_t *conn, size_t path_index);
+/**
+ * discards locally queued DATAGRAM frames on the specified path before send
+ */
+void quicly_discard_datagram_frames(quicly_conn_t *conn, size_t path_index);
+/**
+ * returns whether flexicast and multipath are negotiated on the connection
+ */
+int quicly_flexicast_is_negotiated(quicly_conn_t *conn);
+/**
+ * queues an ack-eliciting, retransmittable flexicast control frame on the unicast connection
+ */
+quicly_error_t quicly_flexicast_send_announce(quicly_conn_t *conn, const quicly_flexicast_announce_frame_t *frame);
+quicly_error_t quicly_flexicast_send_state(quicly_conn_t *conn, const quicly_flexicast_state_frame_t *frame);
+quicly_error_t quicly_flexicast_send_key(quicly_conn_t *conn, const quicly_flexicast_key_frame_t *frame);
+/**
+ * queues or refreshes coalesced PATH_ACK feedback for a flexicast flow ID on the unicast connection
+ */
+quicly_error_t quicly_flexicast_send_path_ack(quicly_conn_t *conn, uint64_t flow_id, const quicly_ranges_t *ranges,
+                                              const uint64_t ecn_counts[3], uint64_t ack_delay_msec, int64_t now);
+/**
+ * closes the unicast connection on authenticated protocol/frame flexicast receive errors; ignores packet-local and AEAD limits
+ */
+quicly_error_t quicly_flexicast_handle_receive_error(quicly_conn_t *conn, int result);
 /**
  * Sets CC to the specified type. Returns a boolean indicating if the operation was successful.
  */

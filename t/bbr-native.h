@@ -9,7 +9,7 @@ static void test_bbr_native(void)
     quic_ctx.egress[0].cc.initcwnd_packets = 100;
     quic_ctx.egress[0].pacing = 1;
     quicly_conn_t *client, *server;
-    health_setup(&client, &server);
+    setup_multipath_scheduling_peers(&client, &server, &test_round_robin_path_scheduler);
     quicly_path_space_t *primary = client->path_spaces[0], *alternative = client->path_spaces[1];
     ok(primary->cc.type == &quicly_cc_type_bbr && alternative->cc.type == &quicly_cc_type_bbr);
     ok(primary->cc.state.bbr.engine.rst == &primary->cc.state.bbr.sampler.rst);
@@ -21,12 +21,12 @@ static void test_bbr_native(void)
     memset(payload, 0x6a, sizeof(payload));
     quicly_stream_t *stream;
     ok(quicly_open_stream(client, &stream, 0) == 0);
-    ok(quicly_set_stream_path_affinity(stream, 0) == 0);
     ok(quicly_streambuf_egress_write(stream, payload, sizeof(payload)) == 0);
     quicly_stream_t *received = NULL;
     for (size_t i = 0; i < 5000; ++i) {
         ++quic_now;
         transmit_multipath(client, server);
+        ++quic_now; /* A bandwidth sample needs a nonzero send-to-ACK interval. */
         transmit_multipath(server, client);
         received = quicly_get_stream(server, stream->stream_id);
         if (received != NULL && quicly_streambuf_ingress_get(received).len == sizeof(payload) &&
@@ -39,7 +39,7 @@ static void test_bbr_native(void)
     ok(primary->cc.state.bbr.sampler.rst.delivered > primary_delivered + sizeof(payload));
     ok(alternative->cc.state.bbr.sampler.rst.delivered < alternate_delivered + 4096);
     ok(primary->cc.state.bbr.engine.max_bw != 0);
-    ok(primary->cc.state.bbr.sampler.rst.delivered == primary->bytes_acked);
+    ok(primary->cc.state.bbr.sampler.rst.delivered == primary->num_packets.bytes_acked);
     ok(primary->cc.state.bbr.stats.pacing_interval_m != 0);
 
     /* classic ECN must reduce the model once per recovery flight and exit Startup/ProbeBW_UP */
@@ -60,7 +60,6 @@ static void test_bbr_native(void)
 
     /* retain old BBR metadata while switching through an unrelated union */
     ok(quicly_request_path_probe(client, 1) == 0);
-    client->next_send_path_index = 1;
     transmit_multipath_with_loss(client, server, 20000);
     quicly_sentmap_iter_t old;
     quicly_sent_t *old_meta = NULL;
@@ -128,7 +127,6 @@ static void test_bbr_native(void)
     uint8_t small_dg[64] = {0x42};
     ptls_iovec_t dg_vec = ptls_iovec_init(small_dg, sizeof(small_dg));
     quicly_send_datagram_frames_path(client, 0, &dg_vec, 1);
-    client->next_send_path_index = 0;
     ++quic_now;
     transmit_multipath_with_loss(client, server, 20000);
     ok(primary->cc.state.bbr.sampler.rst.app_limited != 0);
@@ -151,7 +149,6 @@ static void test_bbr_native(void)
     ok(quicly_bbr_packet_sent(&primary->cc, &sample, 1200, (uint32_t)primary->loss.sentmap.bytes_in_flight + 1200,
                               data_pn, data_sent_at));
     ok(quicly_sentmap_prepare(&primary->loss.sentmap, data_pn, data_sent_at, QUICLY_EPOCH_1RTT) == 0);
-    primary->loss.sentmap._pending_packet->data.packet.path_id = primary->path_id;
     quicly_sent_t *times = quicly_sentmap_allocate(&primary->loss.sentmap, on_ack_bbr_times);
     quicly_sent_t *meta = quicly_sentmap_allocate(&primary->loss.sentmap, on_ack_bbr_meta);
     ok(times != NULL && meta != NULL);
@@ -165,7 +162,6 @@ static void test_bbr_native(void)
     lock_now(client, 0);
     uint64_t ack_only_pn = primary->packet_number++;
     ok(quicly_sentmap_prepare(&primary->loss.sentmap, ack_only_pn, client->stash.now_double, QUICLY_EPOCH_1RTT) == 0);
-    primary->loss.sentmap._pending_packet->data.packet.path_id = primary->path_id;
     quicly_sentmap_commit(&primary->loss.sentmap, 0, 0);
     unlock_now(client);
 
@@ -199,7 +195,7 @@ static void test_bbr_switch_clock(void)
     quic_ctx.egress[0].cc.init_cc = &quicly_cc_cubic_init;
     quic_ctx.egress[0].pacing = 1;
     quicly_conn_t *client, *server;
-    health_setup(&client, &server);
+    setup_multipath_scheduling_peers(&client, &server, &test_round_robin_path_scheduler);
     quicly_path_space_t *primary = client->path_spaces[0];
 
     /* an application call has no cached clock; starting at zero would expire ProbeRTT on the first ACK */
@@ -213,7 +209,6 @@ static void test_bbr_switch_clock(void)
 
     quicly_stream_t *stream;
     ok(quicly_open_stream(client, &stream, 0) == 0);
-    ok(quicly_set_stream_path_affinity(stream, 0) == 0);
     uint8_t payload[1000] = {0};
     ok(quicly_streambuf_egress_write(stream, payload, sizeof(payload)) == 0);
     for (size_t i = 0; i < 100 && primary->cc.state.bbr.sampler.rst.delivered == 0; ++i) {
@@ -264,7 +259,6 @@ static quicly_sent_t *bbr_record_test_packet(quicly_path_space_t *ps, uint64_t p
     if (bytes != 0)
         ok(quicly_bbr_packet_sent(&ps->cc, &sample, bytes, (uint32_t)ps->loss.sentmap.bytes_in_flight + bytes, pn, sent_at));
     ok(quicly_sentmap_prepare(&ps->loss.sentmap, pn, sent_at, QUICLY_EPOCH_1RTT) == 0);
-    ps->loss.sentmap._pending_packet->data.packet.path_id = ps->path_id;
     quicly_sent_t *meta = NULL;
     if (bytes != 0) {
         quicly_sent_t *times = quicly_sentmap_allocate(&ps->loss.sentmap, on_ack_bbr_times);
@@ -309,8 +303,67 @@ static void bbr_ack_test_packet(quicly_path_space_t *ps, uint64_t pn, double now
     ok(quicly_sentmap_update(&ps->loss.sentmap, &iter, QUICLY_SENTMAP_EVENT_ACKED) == 0);
 }
 
+static void test_bbr_pmtud_probe_loss(void)
+{
+    quicly_context_t saved = quic_ctx;
+    int64_t saved_now = quic_now;
+    quic_ctx.egress[0].cc.init_cc = &quicly_cc_bbr_init;
+    quic_ctx.egress[0].pacing = 1;
+    quicly_conn_t *client, *server;
+    test_setup_connected_peers(&client, &server);
+
+    quicly_path_space_t *ps = client->path_spaces[0];
+    quicly_cc_bbr_t *b = &ps->cc.state.bbr;
+    uint64_t delivered = b->sampler.rst.delivered, lost = b->sampler.rst.lost;
+    uint64_t episodes = ps->cc.num_loss_episodes, undone = ps->cc.num_loss_episodes_undone;
+    size_t inflight = ps->loss.sentmap.bytes_in_flight;
+    quic_ctx.egress[0].enable_pmtud = 1;
+    reset_pmtud_search(client, ps, 1200, quic_now);
+    quicly_send_context_t send;
+    struct iovec datagram;
+    uint8_t buf[1500];
+    test_setup_send_context(client, &send, &datagram, buf, sizeof(buf));
+    ok(send_pmtud_probe(client, &send) == 0 && send.num_datagrams == 1);
+    uint64_t pn = ps->pmtud.probe_pn;
+    quicly_sentmap_iter_t iter;
+    quicly_sentmap_init_iter(&ps->loss.sentmap, &iter);
+    while (quicly_sentmap_get(&iter)->packet_number < pn)
+        quicly_sentmap_skip(&iter);
+    const quicly_sent_packet_t *packet = quicly_sentmap_get(&iter);
+    ok(pn != UINT64_MAX && packet->packet_number == pn && packet->is_pmtud_probe);
+    size_t bytes = packet->cc_bytes_in_flight;
+    ok(bytes == datagram.iov_len && ps->loss.sentmap.bytes_in_flight == inflight + bytes);
+
+    /* An oversized probe may disappear without indicating congestion. */
+    ps->loss.on_loss_iter = &iter;
+    on_loss_detected(&ps->loss, packet, 1);
+    ps->loss.on_loss_iter = NULL;
+    ok(quicly_sentmap_update(&ps->loss.sentmap, &iter, QUICLY_SENTMAP_EVENT_LOST) == 0);
+    ok(ps->loss.sentmap.bytes_in_flight == inflight && b->stats.bytes_in_flight == inflight);
+    ok(b->sampler.rst.lost == lost && b->pending_lost == 0 && b->undo_pending == 0);
+    ok(ps->cc.num_loss_episodes == episodes);
+    unlock_now(client);
+
+    /* A late ACK still delivers the probe exactly once and confirms its size. */
+    ++quic_now;
+    lock_now(client, 0);
+    quicly_ack_frame_t ack = {.largest_acknowledged = pn, .smallest_acknowledged = pn, .ack_block_lengths = {1}};
+    struct st_quicly_handle_payload_state_t state = {.epoch = QUICLY_EPOCH_1RTT, .frame_type = QUICLY_FRAME_TYPE_ACK};
+    for (int i = 0; i < 2; ++i) {
+        ok(process_ack_frame_core(client, &state, ps->path_id, &ack) == 0);
+        ok(b->sampler.rst.delivered == delivered + bytes && ps->cc.num_loss_episodes_undone == undone);
+    }
+    ok(ps->pmtud.current_mtu == bytes);
+    unlock_now(client);
+    quicly_free(client);
+    quicly_free(server);
+    quic_ctx = saved;
+    quic_now = saved_now;
+}
+
 static void test_bbr_congestion_and_undo(void)
 {
+    subtest("pmtud-probe-loss", test_bbr_pmtud_probe_loss);
     quicly_path_space_t ps = {0};
     quicly_cc_t *cc = &ps.cc;
     quicly_loss_t *loss = &ps.loss;
@@ -492,7 +545,7 @@ static void test_bbr_persistent_congestion(void)
     quic_ctx.egress[0].pacing = 1;
     for (int ack_middle = 0; ack_middle != 2; ++ack_middle) {
         quicly_conn_t *client, *server;
-        health_setup(&client, &server);
+        setup_multipath_scheduling_peers(&client, &server, &test_round_robin_path_scheduler);
         quicly_path_space_t *ps = client->path_spaces[0];
         uint64_t pn = ps->packet_number, events = ps->cc.state.bbr.persistent_events;
         double sent_at = quic_now;
@@ -550,14 +603,13 @@ static void test_bbr_idle_switch(void)
 {
     for (int switch_back = 0; switch_back != 2; ++switch_back) {
         quicly_conn_t *client, *server;
-        health_setup(&client, &server);
+        setup_multipath_scheduling_peers(&client, &server, &test_round_robin_path_scheduler);
         quicly_path_space_t *ps = client->path_spaces[0];
         ok(ps->cc.type == &quicly_cc_type_bbr && ps->loss.sentmap.bytes_in_flight == 0);
         quicly_bbr_set_app_limited(&ps->cc, 0);
         uint32_t generation = ps->bbr_generation;
         quicly_stream_t *stream;
         ok(quicly_open_stream(client, &stream, 0) == 0);
-        ok(quicly_set_stream_path_affinity(stream, 0) == 0);
         ok(quicly_streambuf_egress_write(stream, "pending", 7) == 0);
         quicly_stream_scheduler_t *original = quic_ctx.stream_scheduler;
         struct st_bbr_idle_switch_scheduler_t sched = {.super = *original, .switch_back = switch_back};
@@ -666,7 +718,7 @@ static void test_bbr_idle_restart(void)
     quic_ctx.egress[0].cc.initcwnd_packets = 100;
     quic_ctx.egress[0].pacing = 1;
     quicly_conn_t *client, *server;
-    health_setup(&client, &server);
+    setup_multipath_scheduling_peers(&client, &server, &test_round_robin_path_scheduler);
     quicly_path_space_t *primary = client->path_spaces[0];
     quicly_cc_bbr_t *pb = &primary->cc.state.bbr;
     pb->engine.state = QUICLY_BBR_BBR_STATE_PROBE_RTT;
@@ -690,7 +742,6 @@ static void test_bbr_idle_restart(void)
     /* now write 10000 bytes (> 4800 probe_rtt cwnd) and verify a single quicly_send sends the full flight */
     quicly_stream_t *stream;
     ok(quicly_open_stream(client, &stream, 0) == 0);
-    ok(quicly_set_stream_path_affinity(stream, 0) == 0);
     uint8_t burst[10000];
     memset(burst, 0x5a, sizeof(burst));
     ok(quicly_streambuf_egress_write(stream, burst, sizeof(burst)) == 0);
@@ -712,8 +763,37 @@ static void test_bbr_blackout(void)
     quicly_context_t saved = quic_ctx;
     quic_ctx.egress[0].cc.init_cc = &quicly_cc_bbr_init;
     quic_ctx.egress[0].pacing = 1;
-    test_multipath_automatic_failover_with_scheduler(&quicly_round_robin_path_scheduler);
-    quic_ctx = saved;
+    int64_t saved_now = quic_now;
+    quicly_conn_t *client, *server;
+    setup_multipath_scheduling_peers(&client, &server, &test_round_robin_path_scheduler);
+    quicly_stream_t *stream, *reverse;
+    ok(quicly_open_stream(client, &stream, 0) == 0);
+    ok(quicly_open_stream(server, &reverse, 0) == 0);
+    uint8_t payload[50000];
+    for (size_t i = 0; i < sizeof(payload); ++i)
+        payload[i] = (uint8_t)(i * 13 + i / 31);
+    ok(quicly_streambuf_egress_write(stream, payload, sizeof(payload)) == 0);
+    ok(quicly_streambuf_egress_write(reverse, payload, sizeof(payload)) == 0);
+    for (size_t i = 0; i < 5000; ++i) {
+        multipath_round(client, server, 0, 0);
+        if (multipath_received_length(server, stream->stream_id) == sizeof(payload) &&
+            multipath_received_length(client, reverse->stream_id) == sizeof(payload))
+            break;
+    }
+    ok(client->path_spaces[0]->loss.pto_count >= 2);
+    for (int i = 0; i < 2; ++i) {
+        quicly_stream_t *received = quicly_get_stream(i == 0 ? server : client, i == 0 ? stream->stream_id : reverse->stream_id);
+        ptls_iovec_t bytes = received != NULL ? quicly_streambuf_ingress_get(received) : ptls_iovec_init(NULL, 0);
+        ok(bytes.len == sizeof(payload) && memcmp(bytes.base, payload, sizeof(payload)) == 0);
+    }
+    uint64_t before = client->path_spaces[0]->num_packets.sent;
+    multipath_run(client, server, 5000, 0, 0);
+    ok(client->path_spaces[0]->num_packets.sent - before <= 20);
+    for (size_t i = 0; i < 20000 && client->path_spaces[0]->loss.pto_count >= 2; ++i)
+        multipath_round(client, server, -1, -1);
+    ok(client->path_spaces[0]->loss.pto_count < 2);
+    free_multipath_regression_peers(client, server, saved);
+    quic_now = saved_now;
 }
 
 static void test_bbr_configuration(void)

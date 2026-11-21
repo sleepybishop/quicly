@@ -20,100 +20,56 @@ static void send_and_release(quicly_flexicast_flow_t *flow, uint64_t expected_pn
     size_t size;
     uint64_t pn;
     int complete;
-    ok(quicly_flexicast_send_datagram(flow, ptls_iovec_init(NULL, 0), packet, sizeof(packet), &size, &pn) == QUICLY_FLEXICAST_OK);
+    ok(quicly_flexicast_send_datagram(flow, ptls_iovec_init(NULL, 0), packet, sizeof(packet), &size, &pn, 0) ==
+       QUICLY_FLEXICAST_OK);
     ok(pn == expected_pn);
     /* protection consumes the budget even if local submission is abandoned */
     ok(quicly_flexicast_abandon_datagram(flow, 1, pn, &complete) == QUICLY_FLEXICAST_OK && complete);
 }
 
-static void test_encryption_budget_history(void)
+static void test_encryption_budget_and_rekey(void)
 {
-    uint8_t secrets[3][32] = {{1}, {2}, {3}}, packet[128];
+    uint8_t secrets[2][32] = {{1}, {2}}, new_secret[32] = {0}, packet[128];
     quicly_flexicast_config_t config = crypto_config(secrets[0]);
     config.max_packets_per_key = 3;
     config.first_packet_number = 60000;
     quicly_flexicast_flow_t *flow;
+    quicly_flexicast_crypto_usage_t usage;
     uint64_t pn;
     size_t size;
+
     ok(quicly_flexicast_flow_create(&flow, &config) == QUICLY_FLEXICAST_OK);
-    ok(quicly_flexicast_attach(flow, 1) == QUICLY_FLEXICAST_OK);
-    ok(quicly_flexicast_send_datagram(flow, ptls_iovec_init(NULL, 0), packet, 1, &size, &pn) == QUICLY_FLEXICAST_ERROR_INVALID);
+    ok(quicly_flexicast_attach(flow, 1, 0) == QUICLY_FLEXICAST_OK);
+    ok(quicly_flexicast_send_datagram(flow, ptls_iovec_init(NULL, 0), packet, 1, &size, &pn, 0) == QUICLY_FLEXICAST_ERROR_INVALID);
     send_and_release(flow, 60000);
 
-    /* reinstalling the current secret cannot replenish its budget */
+    /* reinstalling the active secret preserves its remaining packet budget */
     ok(quicly_flexicast_flow_rekey(flow, ptls_iovec_init(secrets[0], 32), 60001, 1) == QUICLY_FLEXICAST_OK);
-    ok(quicly_flexicast_attach(flow, 1) == QUICLY_FLEXICAST_OK);
+    ok(quicly_flexicast_get_crypto_usage(flow, &usage) == QUICLY_FLEXICAST_OK && usage.encrypted_packets == 1);
+    ok(quicly_flexicast_attach(flow, 1, 1) == QUICLY_FLEXICAST_OK);
     send_and_release(flow, 60001);
-    ok(quicly_flexicast_flow_rekey(flow, ptls_iovec_init(secrets[1], 32), 60002, 2) == QUICLY_FLEXICAST_OK);
-    ok(quicly_flexicast_attach(flow, 1) == QUICLY_FLEXICAST_OK);
     send_and_release(flow, 60002);
-
-    /* switching back to a prior key restores its existing packet count */
-    ok(quicly_flexicast_flow_rekey(flow, ptls_iovec_init(secrets[0], 32), 60003, 3) == QUICLY_FLEXICAST_OK);
-    ok(quicly_flexicast_attach(flow, 1) == QUICLY_FLEXICAST_OK);
-    send_and_release(flow, 60003);
-    ok(quicly_flexicast_send_datagram(flow, ptls_iovec_init(NULL, 0), packet, sizeof(packet), &size, &pn) ==
+    ok(quicly_flexicast_send_datagram(flow, ptls_iovec_init(NULL, 0), packet, sizeof(packet), &size, &pn, 1) ==
        QUICLY_FLEXICAST_ERROR_KEY_UPDATE_REQUIRED);
-    ok(quicly_flexicast_get_next_packet_number(flow) == 60004);
-    ok(quicly_flexicast_flow_rekey(flow, ptls_iovec_init(secrets[0], 32), 60004, 4) == QUICLY_FLEXICAST_ERROR_KEY_UPDATE_REQUIRED);
+    ok(quicly_flexicast_get_next_packet_number(flow) == 60003);
+    ok(quicly_flexicast_flow_rekey(flow, ptls_iovec_init(secrets[0], 32), 60003, 2) == QUICLY_FLEXICAST_ERROR_KEY_UPDATE_REQUIRED);
     ok(quicly_flexicast_num_members(flow) == 1);
 
-    ok(quicly_flexicast_flow_rekey(flow, ptls_iovec_init(secrets[1], 32), 60004, 4) == QUICLY_FLEXICAST_OK);
-    ok(quicly_flexicast_attach(flow, 1) == QUICLY_FLEXICAST_OK);
-    send_and_release(flow, 60004);
-    ok(quicly_flexicast_flow_rekey(flow, ptls_iovec_init(secrets[0], 32), 60005, 5) == QUICLY_FLEXICAST_ERROR_KEY_UPDATE_REQUIRED);
-    send_and_release(flow, 60005); /* rejected rekey leaves current key usable */
-    ok(quicly_flexicast_send_datagram(flow, ptls_iovec_init(NULL, 0), packet, sizeof(packet), &size, &pn) ==
-       QUICLY_FLEXICAST_ERROR_KEY_UPDATE_REQUIRED);
-    ok(quicly_flexicast_flow_rekey(flow, ptls_iovec_init(secrets[2], 32), 60006, 6) == QUICLY_FLEXICAST_OK);
-    ok(quicly_flexicast_attach(flow, 1) == QUICLY_FLEXICAST_OK);
-    send_and_release(flow, 60006);
-    quicly_flexicast_flow_free(flow);
-}
-
-static void test_encryption_budget_long_history(void)
-{
-    uint8_t secrets[2][32] = {{1}, {2}}, new_secret[32] = {0}, packet[128];
-    quicly_flexicast_config_t config = crypto_config(secrets[0]);
-    quicly_flexicast_flow_t *flow;
-    uint64_t next_pn = 0, pn;
-    size_t size;
-    config.max_packets_per_key = 3;
-    ok(quicly_flexicast_flow_create(&flow, &config) == QUICLY_FLEXICAST_OK);
-    ok(quicly_flexicast_attach(flow, 1) == QUICLY_FLEXICAST_OK);
-    for (size_t i = 0; i != 3; ++i)
-        send_and_release(flow, next_pn++);
-
-    ok(quicly_flexicast_flow_rekey(flow, ptls_iovec_init(secrets[1], 32), next_pn, next_pn) == QUICLY_FLEXICAST_OK);
-    ok(quicly_flexicast_attach(flow, 1) == QUICLY_FLEXICAST_OK);
-    send_and_release(flow, next_pn++);
-
-    /* exceed the former 64-key cache with both an exhausted and a partially used key in its history */
-    for (size_t i = 3; i != 68; ++i) {
+    /* rekeying to fresh secrets resets per-key encryption budget in O(1) space */
+    ok(quicly_flexicast_flow_rekey(flow, ptls_iovec_init(secrets[1], 32), 60003, 3) == QUICLY_FLEXICAST_OK);
+    ok(quicly_flexicast_get_crypto_usage(flow, &usage) == QUICLY_FLEXICAST_OK && usage.encrypted_packets == 0);
+    uint64_t next_pn = 60003;
+    for (size_t i = 3; i != 130; ++i) {
         new_secret[0] = (uint8_t)i;
-        ok(quicly_flexicast_flow_rekey(flow, ptls_iovec_init(new_secret, sizeof(new_secret)), next_pn, next_pn) ==
+        ok(quicly_flexicast_flow_rekey(flow, ptls_iovec_init(new_secret, sizeof(new_secret)), next_pn, (int64_t)i) ==
            QUICLY_FLEXICAST_OK);
-        ok(quicly_flexicast_attach(flow, 1) == QUICLY_FLEXICAST_OK);
+        ok(quicly_flexicast_attach(flow, 1, (int64_t)i) == QUICLY_FLEXICAST_OK);
         send_and_release(flow, next_pn++);
     }
-
-    /* rejecting an old exhausted key preserves the current key, membership, and remaining budget */
-    ok(quicly_flexicast_flow_rekey(flow, ptls_iovec_init(secrets[0], 32), next_pn, next_pn) ==
+    send_and_release(flow, next_pn++);
+    send_and_release(flow, next_pn++);
+    ok(quicly_flexicast_send_datagram(flow, ptls_iovec_init(NULL, 0), packet, sizeof(packet), &size, &pn, 200) ==
        QUICLY_FLEXICAST_ERROR_KEY_UPDATE_REQUIRED);
-    ok(quicly_flexicast_num_members(flow) == 1 && quicly_flexicast_get_next_packet_number(flow) == next_pn);
-    send_and_release(flow, next_pn++);
-    send_and_release(flow, next_pn++);
-    ok(quicly_flexicast_send_datagram(flow, ptls_iovec_init(NULL, 0), packet, sizeof(packet), &size, &pn) ==
-       QUICLY_FLEXICAST_ERROR_KEY_UPDATE_REQUIRED);
-
-    /* reusing the old partially used key permits only its two remaining encryptions */
-    ok(quicly_flexicast_flow_rekey(flow, ptls_iovec_init(secrets[1], 32), next_pn, next_pn) == QUICLY_FLEXICAST_OK);
-    ok(quicly_flexicast_attach(flow, 1) == QUICLY_FLEXICAST_OK);
-    send_and_release(flow, next_pn++);
-    send_and_release(flow, next_pn++);
-    ok(quicly_flexicast_send_datagram(flow, ptls_iovec_init(NULL, 0), packet, sizeof(packet), &size, &pn) ==
-       QUICLY_FLEXICAST_ERROR_KEY_UPDATE_REQUIRED);
-    ok(quicly_flexicast_get_next_packet_number(flow) == next_pn);
     quicly_flexicast_flow_free(flow);
 }
 
@@ -128,34 +84,34 @@ static void test_authentication_budget(void)
     ok(quicly_flexicast_flow_create(&source, &config) == QUICLY_FLEXICAST_OK);
     config.max_authentication_failures = 2;
     ok(quicly_flexicast_flow_create(&receiver, &config) == QUICLY_FLEXICAST_OK);
-    ok(quicly_flexicast_attach(source, 1) == QUICLY_FLEXICAST_OK);
-    ok(quicly_flexicast_send_datagram(source, ptls_iovec_init(data, sizeof(data)), packet, sizeof(packet), &size, &pn) ==
+    ok(quicly_flexicast_attach(source, 1, 0) == QUICLY_FLEXICAST_OK);
+    ok(quicly_flexicast_send_datagram(source, ptls_iovec_init(data, sizeof(data)), packet, sizeof(packet), &size, &pn, 0) ==
        QUICLY_FLEXICAST_OK);
     memcpy(copy, packet, size);
     copy[1] ^= 1;
-    ok(quicly_flexicast_receive_datagram(receiver, copy, size, &received, &received_pn) == QUICLY_FLEXICAST_ERROR_WRONG_FLOW);
-    ok(quicly_flexicast_receive_datagram(receiver, copy, 1, &received, &received_pn) == QUICLY_FLEXICAST_ERROR_INVALID);
+    ok(quicly_flexicast_receive_datagram(receiver, copy, size, &received, &received_pn, 0, 0) == QUICLY_FLEXICAST_ERROR_WRONG_FLOW);
+    ok(quicly_flexicast_receive_datagram(receiver, copy, 1, &received, &received_pn, 0, 0) == QUICLY_FLEXICAST_ERROR_INVALID);
     memcpy(copy, packet, size);
     copy[size - 1] ^= 1; /* tag outside the header-protection sample */
-    ok(quicly_flexicast_receive_datagram(receiver, copy, size, &received, &received_pn) == QUICLY_FLEXICAST_ERROR_CRYPTO);
+    ok(quicly_flexicast_receive_datagram(receiver, copy, size, &received, &received_pn, 0, 0) == QUICLY_FLEXICAST_ERROR_CRYPTO);
     memcpy(copy, packet, size);
-    ok(quicly_flexicast_receive_datagram(receiver, copy, size, &received, &received_pn) == QUICLY_FLEXICAST_OK);
+    ok(quicly_flexicast_receive_datagram(receiver, copy, size, &received, &received_pn, 0, 0) == QUICLY_FLEXICAST_OK);
 
     /* successful authentication and a new key do not reset earlier failures */
     ok(quicly_flexicast_flow_rekey(source, ptls_iovec_init(secrets[1], 32), 1, 1) == QUICLY_FLEXICAST_OK);
     ok(quicly_flexicast_flow_rekey(receiver, ptls_iovec_init(secrets[1], 32), 1, 1) == QUICLY_FLEXICAST_OK);
-    ok(quicly_flexicast_attach(source, 1) == QUICLY_FLEXICAST_OK);
-    ok(quicly_flexicast_send_datagram(source, ptls_iovec_init(data, sizeof(data)), packet, sizeof(packet), &size, &pn) ==
+    ok(quicly_flexicast_attach(source, 1, 1) == QUICLY_FLEXICAST_OK);
+    ok(quicly_flexicast_send_datagram(source, ptls_iovec_init(data, sizeof(data)), packet, sizeof(packet), &size, &pn, 1) ==
        QUICLY_FLEXICAST_OK);
     memcpy(copy, packet, size);
     copy[size - 1] ^= 1;
-    ok(quicly_flexicast_receive_datagram(receiver, copy, size, &received, &received_pn) ==
+    ok(quicly_flexicast_receive_datagram(receiver, copy, size, &received, &received_pn, 0, 1) ==
        QUICLY_FLEXICAST_ERROR_AEAD_LIMIT_REACHED);
     memcpy(copy, packet, size);
-    ok(quicly_flexicast_receive_datagram(receiver, copy, size, &received, &received_pn) ==
+    ok(quicly_flexicast_receive_datagram(receiver, copy, size, &received, &received_pn, 0, 1) ==
        QUICLY_FLEXICAST_ERROR_AEAD_LIMIT_REACHED);
     ok(quicly_flexicast_flow_rekey(receiver, ptls_iovec_init(secrets[2], 32), 2, 2) == QUICLY_FLEXICAST_ERROR_AEAD_LIMIT_REACHED);
-    ok(quicly_flexicast_send_datagram(receiver, ptls_iovec_init(NULL, 0), copy, sizeof(copy), &size, &pn) ==
+    ok(quicly_flexicast_send_datagram(receiver, ptls_iovec_init(NULL, 0), copy, sizeof(copy), &size, &pn, 2) ==
        QUICLY_FLEXICAST_ERROR_AEAD_LIMIT_REACHED);
     quicly_flexicast_flow_free(receiver);
     quicly_flexicast_flow_free(source);
@@ -219,18 +175,18 @@ static void test_authenticated_epoch_floor(void)
     ++config.first_packet_number;
     config.max_authentication_failures = 2;
     ok(quicly_flexicast_flow_create(&receiver, &config) == 0);
-    ok(quicly_flexicast_attach(source, 1) == 0);
-    ok(quicly_flexicast_send_datagram(source, ptls_iovec_init(data, sizeof(data)), packet, sizeof(packet), &size, &pn) == 0);
+    ok(quicly_flexicast_attach(source, 1, 0) == 0);
+    ok(quicly_flexicast_send_datagram(source, ptls_iovec_init(data, sizeof(data)), packet, sizeof(packet), &size, &pn, 0) == 0);
 
     /* valid packets below the join floor are replay-filtered without spending the forgery budget */
     memcpy(copy, packet, size);
-    ok(quicly_flexicast_receive_datagram(receiver, copy, size, &received, &received_pn) == QUICLY_FLEXICAST_ERROR_REPLAY);
+    ok(quicly_flexicast_receive_datagram(receiver, copy, size, &received, &received_pn, 0, 0) == QUICLY_FLEXICAST_ERROR_REPLAY);
     memcpy(copy, packet, size);
     copy[size - 1] ^= 1;
-    ok(quicly_flexicast_receive_datagram(receiver, copy, size, &received, &received_pn) == QUICLY_FLEXICAST_ERROR_CRYPTO);
+    ok(quicly_flexicast_receive_datagram(receiver, copy, size, &received, &received_pn, 0, 0) == QUICLY_FLEXICAST_ERROR_CRYPTO);
     memcpy(copy, packet, size);
     copy[size - 1] ^= 1;
-    ok(quicly_flexicast_receive_datagram(receiver, copy, size, &received, &received_pn) ==
+    ok(quicly_flexicast_receive_datagram(receiver, copy, size, &received, &received_pn, 0, 0) ==
        QUICLY_FLEXICAST_ERROR_AEAD_LIMIT_REACHED);
     ok(quicly_flexicast_get_ack_deadline(receiver) == INT64_MAX);
     quicly_flexicast_flow_free(receiver);
@@ -260,7 +216,7 @@ static void test_rekey_setup_failure(void)
     config.crypto_engine = &engine;
     config.max_packets_per_key = 2;
     ok(quicly_flexicast_flow_create(&flow, &config) == QUICLY_FLEXICAST_OK);
-    ok(quicly_flexicast_attach(flow, 1) == QUICLY_FLEXICAST_OK);
+    ok(quicly_flexicast_attach(flow, 1, 0) == QUICLY_FLEXICAST_OK);
     send_and_release(flow, 0);
     /* failed ingress setup preserves the previous key, count, and membership */
     fail_ingress_setup = 1;
@@ -268,12 +224,11 @@ static void test_rekey_setup_failure(void)
     fail_ingress_setup = 0;
     ok(quicly_flexicast_num_members(flow) == 1 && quicly_flexicast_get_next_packet_number(flow) == 1);
     send_and_release(flow, 1);
-    ok(quicly_flexicast_send_datagram(flow, ptls_iovec_init(NULL, 0), packet, sizeof(packet), &size, &pn) ==
+    ok(quicly_flexicast_send_datagram(flow, ptls_iovec_init(NULL, 0), packet, sizeof(packet), &size, &pn, 1) ==
        QUICLY_FLEXICAST_ERROR_KEY_UPDATE_REQUIRED);
     ok(quicly_flexicast_flow_rekey(flow, ptls_iovec_init(secrets[1], 32), 2, 2) == QUICLY_FLEXICAST_OK);
-    ok(quicly_flexicast_attach(flow, 1) == QUICLY_FLEXICAST_OK);
+    ok(quicly_flexicast_attach(flow, 1, 2) == QUICLY_FLEXICAST_OK);
     send_and_release(flow, 2);
-    ok(quicly_flexicast_flow_rekey(flow, ptls_iovec_init(secrets[0], 32), 3, 3) == QUICLY_FLEXICAST_ERROR_KEY_UPDATE_REQUIRED);
     quicly_flexicast_flow_free(flow);
 }
 
@@ -296,7 +251,9 @@ static void test_decryption_budget_and_receive_floor(void)
     rx_cfg.max_authentication_failures = 4;
     ok(quicly_flexicast_flow_create(&tx, &tx_cfg) == QUICLY_FLEXICAST_OK);
     ok(quicly_flexicast_flow_create(&rx, &rx_cfg) == QUICLY_FLEXICAST_OK);
-    ok(quicly_flexicast_attach(tx, 1) == QUICLY_FLEXICAST_OK);
+    ok(!quicly_flexicast_flow_has_sender_state(rx));
+    ok(quicly_flexicast_attach(tx, 1, 0) == QUICLY_FLEXICAST_OK);
+    ok(quicly_flexicast_flow_has_sender_state(tx));
 
     ok(quicly_flexicast_get_crypto_usage(NULL, &usage) == QUICLY_FLEXICAST_ERROR_INVALID);
     ok(quicly_flexicast_get_crypto_usage(rx, NULL) == QUICLY_FLEXICAST_ERROR_INVALID);
@@ -316,42 +273,85 @@ static void test_decryption_budget_and_receive_floor(void)
     ok(quicly_flexicast_flow_rekey(rx, ptls_iovec_init(secrets[1], 32), 70000, 1) == QUICLY_FLEXICAST_ERROR_INVALID);
 
     /* packet 70000 is below floor: decrypted and replay-rejected while charging attempts */
-    ok(quicly_flexicast_send_datagram(tx, ptls_iovec_init(data, sizeof(data)), packet, sizeof(packet), &size, &pn) ==
+    ok(quicly_flexicast_send_datagram(tx, ptls_iovec_init(data, sizeof(data)), packet, sizeof(packet), &size, &pn, 0) ==
        QUICLY_FLEXICAST_OK);
     ok(pn == 70000);
     memcpy(copy, packet, size);
-    ok(quicly_flexicast_receive_datagram(rx, copy, size, &received, &received_pn) == QUICLY_FLEXICAST_ERROR_REPLAY);
+    ok(quicly_flexicast_receive_datagram(rx, copy, size, &received, &received_pn, 0, 0) == QUICLY_FLEXICAST_ERROR_REPLAY);
     ok(quicly_flexicast_get_crypto_usage(rx, &usage) == QUICLY_FLEXICAST_OK && usage.decryption_attempts == 2);
 
     /* packet 70001 succeeds and locks out further floor installation */
-    ok(quicly_flexicast_send_datagram(tx, ptls_iovec_init(data, sizeof(data)), packet, sizeof(packet), &size, &pn) ==
+    ok(quicly_flexicast_send_datagram(tx, ptls_iovec_init(data, sizeof(data)), packet, sizeof(packet), &size, &pn, 0) ==
        QUICLY_FLEXICAST_OK);
     memcpy(copy, packet, size);
-    ok(quicly_flexicast_receive_datagram(rx, copy, size, &received, &received_pn) == QUICLY_FLEXICAST_OK && received_pn == 70001);
+    ok(quicly_flexicast_receive_datagram(rx, copy, size, &received, &received_pn, 0, 0) == QUICLY_FLEXICAST_OK &&
+       received_pn == 70001);
     ok(quicly_flexicast_install_receive_floor(rx, 70002) == QUICLY_FLEXICAST_ERROR_INVALID);
 
     /* replay of 70001 consumes the 4th and final decryption attempt for secrets[0] */
     memcpy(copy, packet, size);
-    ok(quicly_flexicast_receive_datagram(rx, copy, size, &received, &received_pn) == QUICLY_FLEXICAST_ERROR_REPLAY);
+    ok(quicly_flexicast_receive_datagram(rx, copy, size, &received, &received_pn, 0, 0) == QUICLY_FLEXICAST_ERROR_REPLAY);
     memcpy(copy, packet, size);
-    ok(quicly_flexicast_receive_datagram(rx, copy, size, &received, &received_pn) == QUICLY_FLEXICAST_ERROR_AEAD_LIMIT_REACHED);
+    ok(quicly_flexicast_receive_datagram(rx, copy, size, &received, &received_pn, 0, 0) ==
+       QUICLY_FLEXICAST_ERROR_AEAD_LIMIT_REACHED);
+    ok(quicly_flexicast_flow_rekey(rx, ptls_iovec_init(secrets[0], 32), 70002, 2) == QUICLY_FLEXICAST_ERROR_AEAD_LIMIT_REACHED);
 
-    /* rekeying to a fresh secret works, while reinstalling exhausted secrets[0] is rejected */
+    /* rekeying to a fresh secret resets per-key decryption attempts without allocating sender tables */
     ok(quicly_flexicast_flow_rekey(rx, ptls_iovec_init(secrets[1], 32), 70002, 2) == QUICLY_FLEXICAST_OK);
     ok(quicly_flexicast_get_crypto_usage(rx, &usage) == QUICLY_FLEXICAST_OK && usage.decryption_attempts == 0);
-    ok(quicly_flexicast_flow_rekey(rx, ptls_iovec_init(secrets[0], 32), 70003, 3) == QUICLY_FLEXICAST_ERROR_AEAD_LIMIT_REACHED);
+    ok(!quicly_flexicast_flow_has_sender_state(rx));
 
     quicly_flexicast_flow_free(rx);
     quicly_flexicast_flow_free(tx);
 }
 
+static void test_invalid_pn_before_aead(void)
+{
+    /* truncated PN reconstructing past PTLS_QUICINT_MAX must fail before spending AEAD budget */
+    uint8_t secret[32] = {0x99}, packet[64] = {0};
+    quicly_flexicast_config_t cfg = crypto_config(secret);
+    cfg.first_packet_number = PTLS_QUICINT_MAX;
+    cfg.max_decryption_attempts = 2;
+    cfg.max_authentication_failures = 2;
+    quicly_flexicast_flow_t *rx;
+    quicly_flexicast_crypto_usage_t usage;
+    ptls_iovec_t payload;
+    uint64_t pn;
+
+    ok(quicly_flexicast_flow_create(&rx, &cfg) == QUICLY_FLEXICAST_OK);
+    ptls_cipher_context_t *hp = NULL;
+    ptls_aead_context_t *aead = NULL;
+    ok(quicly_default_crypto_engine.setup_cipher(&quicly_default_crypto_engine, NULL, QUICLY_EPOCH_1RTT, 1, &hp, &aead,
+                                                 ptls_openssl_aes128gcmsha256.aead, ptls_openssl_aes128gcmsha256.hash,
+                                                 secret) == 0);
+    packet[0] = QUICLY_QUIC_BIT | 1; /* 2-byte PN */
+    quicly_encode64(packet + 1, cfg.flow_id);
+    /* PTLS_QUICINT_MAX has low 16 bits 0xffff; 0x0000 reconstructs to PTLS_QUICINT_MAX + 1 */
+    packet[9] = 0;
+    packet[10] = 0;
+    memset(packet + 11, 0x55, 20);
+    uint8_t mask[5] = {0};
+    ptls_cipher_init(hp, packet + 13);
+    ptls_cipher_encrypt(hp, mask, mask, sizeof(mask));
+    packet[0] ^= mask[0] & 0x1f;
+    packet[9] ^= mask[1];
+    packet[10] ^= mask[2];
+    ptls_cipher_free(hp);
+    ptls_aead_free(aead);
+
+    ok(quicly_flexicast_receive_datagram(rx, packet, 31, &payload, &pn, 0, 0) == QUICLY_FLEXICAST_ERROR_INVALID);
+    ok(quicly_flexicast_get_crypto_usage(rx, &usage) == QUICLY_FLEXICAST_OK);
+    ok(usage.decryption_attempts == 0 && usage.authentication_failures == 0);
+    quicly_flexicast_flow_free(rx);
+}
+
 void test_flexicast_crypto(void)
 {
-    test_encryption_budget_history();
-    test_encryption_budget_long_history();
+    test_encryption_budget_and_rekey();
     test_authentication_budget();
     test_authenticated_epoch_floor();
     test_crypto_limit_configuration();
     test_rekey_setup_failure();
     test_decryption_budget_and_receive_floor();
+    test_invalid_pn_before_aead();
 }

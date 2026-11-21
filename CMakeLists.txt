@@ -95,7 +95,6 @@ IF (BUILD_FLEXICAST)
     SET(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -DQUICLY_HAVE_FLEXICAST=1")
     SET(FLEXICAST_LIBRARY_FILES
         lib/flexicast.c
-        lib/flexicast_cc.c
         lib/flexicast_cc_multicast.c)
     LIST(APPEND UNITTEST_SOURCE_FILES
         t/flexicast.c

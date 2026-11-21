@@ -75,10 +75,6 @@ typedef struct st_quicly_sent_packet_t {
      */
     uint16_t cc_bytes_in_flight;
     /**
-     * path id on which the packet was sent
-     */
-    uint32_t path_id;
-    /**
      * udp payload size for pmtu confirmation and black-hole detection. set on the last ack-eliciting packet in each datagram
      * only, so that loss of coalesced packets counts as a single lost datagram.
      */

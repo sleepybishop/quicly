@@ -770,9 +770,6 @@ inline void quicly_cc_add_cwnd(uint32_t *cwnd, uint32_t increment)
 #endif
 }
 
-/* coupled LIA congestion avoidance target across active multipath paths */
-uint64_t quicly_calculate_lia_target(struct st_quicly_conn_t *conn);
-
 #ifdef __cplusplus
 }
 #endif
