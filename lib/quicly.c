@@ -67,6 +67,7 @@
 #define QUICLY_TRANSPORT_PARAMETER_ID_MAX_DATAGRAM_FRAME_SIZE 32
 #define QUICLY_TRANSPORT_PARAMETER_ID_MIN_ACK_DELAY 0xff04de1b
 #define QUICLY_TRANSPORT_PARAMETER_ID_INITIAL_MAX_PATH_ID 0x3e
+#define QUICLY_TRANSPORT_PARAMETER_ID_FLEXICAST_SUPPORT 0xedf3
 
 /**
  * maximum size of token that quicly accepts
@@ -390,6 +391,23 @@ struct st_quicly_delayed_packet_t {
     uint8_t bytes[1];
 };
 
+typedef struct st_quicly_flexicast_control_t {
+    struct st_quicly_flexicast_control_t *next;
+    uint64_t id;
+    uint64_t generation;
+    uint64_t type;
+    size_t encoded_size;
+    size_t capacity;
+    struct {
+        uint64_t flow_id;
+        int64_t queued_at;
+        uint64_t delay;
+        size_t offset;
+    } ack;
+    quicly_sender_state_t sender;
+    uint8_t encoded[1];
+} quicly_flexicast_control_t;
+
 struct st_quicly_conn_t {
     struct _st_quicly_conn_public_t super;
     quicly_path_space_t path_space_0;
@@ -528,6 +546,12 @@ struct st_quicly_conn_t {
             quicly_sender_state_t sender;
             uint64_t max_path_id;
         } paths_blocked;
+        struct {
+            quicly_flexicast_control_t *head;
+            quicly_flexicast_control_t **tail_ref;
+            uint64_t next_id;
+            size_t count;
+        } flexicast_control;
         /**
          * bit vector indicating if there's any pending crypto data (the insignificant 4 bits), or other non-stream data
          */
@@ -790,6 +814,205 @@ int quicly_is_multipath(quicly_conn_t *conn)
 {
     return conn->local_multipath_enabled && conn->super.remote.transport_params.enable_multipath &&
            conn->super.version == QUICLY_PROTOCOL_VERSION_1;
+}
+
+int quicly_flexicast_is_negotiated(quicly_conn_t *conn)
+{
+    return conn != NULL && quicly_is_multipath(conn) &&
+           ((conn->super.ctx->transport_params.flexicast_support.ipv4 &&
+             conn->super.remote.transport_params.flexicast_support.ipv4) ||
+            (conn->super.ctx->transport_params.flexicast_support.ipv6 &&
+             conn->super.remote.transport_params.flexicast_support.ipv6));
+}
+
+#define QUICLY_MAX_FLEXICAST_CONTROL_PAYLOAD                                                                                       \
+    (QUICLY_MIN_CLIENT_INITIAL_SIZE - (1 + QUICLY_MAX_CID_LEN_V1 + QUICLY_SEND_PN_SIZE + QUICLY_AEAD_TAG_SIZE))
+
+static void free_flexicast_control(quicly_flexicast_control_t *control)
+{
+    if (control == NULL)
+        return;
+    if (control->type == QUICLY_FRAME_TYPE_FC_KEY)
+        ptls_clear_memory(control->encoded, control->encoded_size);
+    free(control);
+}
+
+static void arm_flexicast_control_send(quicly_conn_t *conn)
+{
+    if (conn->application != NULL && conn->application->one_rtt_writable)
+        conn->egress.pending_flows |= QUICLY_PENDING_FLOW_OTHERS_BIT;
+}
+
+static quicly_error_t alloc_flexicast_control(quicly_conn_t *conn, uint64_t type, size_t encoded_size, size_t extra,
+                                              quicly_flexicast_control_t **control)
+{
+    if (conn == NULL || !quicly_flexicast_is_negotiated(conn))
+        return QUICLY_TRANSPORT_ERROR_PROTOCOL_VIOLATION;
+    if (encoded_size == 0 || encoded_size + extra > QUICLY_MAX_FLEXICAST_CONTROL_PAYLOAD)
+        return PTLS_ERROR_LIBRARY;
+    if (conn->egress.flexicast_control.count >= 256 || conn->egress.flexicast_control.next_id == UINT64_MAX)
+        return QUICLY_ERROR_STATE_EXHAUSTION;
+    if ((*control = malloc(offsetof(quicly_flexicast_control_t, encoded) + encoded_size + extra)) == NULL)
+        return PTLS_ERROR_NO_MEMORY;
+    (*control)->type = type;
+    (*control)->encoded_size = encoded_size;
+    (*control)->capacity = encoded_size + extra;
+    memset(&(*control)->ack, 0, sizeof((*control)->ack));
+    return 0;
+}
+
+static quicly_error_t enqueue_flexicast_control(quicly_conn_t *conn, quicly_flexicast_control_t *control)
+{
+    control->next = NULL;
+    control->id = conn->egress.flexicast_control.next_id++;
+    control->generation = 0;
+    control->sender = QUICLY_SENDER_STATE_SEND;
+    if (conn->egress.flexicast_control.tail_ref == NULL)
+        conn->egress.flexicast_control.tail_ref = &conn->egress.flexicast_control.head;
+    *conn->egress.flexicast_control.tail_ref = control;
+    conn->egress.flexicast_control.tail_ref = &control->next;
+    ++conn->egress.flexicast_control.count;
+    arm_flexicast_control_send(conn);
+    return 0;
+}
+
+quicly_error_t quicly_flexicast_send_announce(quicly_conn_t *conn, const quicly_flexicast_announce_frame_t *frame)
+{
+    quicly_flexicast_control_t *control;
+    quicly_error_t ret;
+
+    if (conn == NULL || frame == NULL || quicly_is_client(conn))
+        return QUICLY_TRANSPORT_ERROR_PROTOCOL_VIOLATION;
+    if ((frame->ip_version == 4 && (!conn->super.ctx->transport_params.flexicast_support.ipv4 ||
+                                    !conn->super.remote.transport_params.flexicast_support.ipv4)) ||
+        (frame->ip_version == 6 && (!conn->super.ctx->transport_params.flexicast_support.ipv6 ||
+                                    !conn->super.remote.transport_params.flexicast_support.ipv6)))
+        return QUICLY_TRANSPORT_ERROR_PROTOCOL_VIOLATION;
+    if ((ret = alloc_flexicast_control(conn, QUICLY_FRAME_TYPE_FC_ANNOUNCE, quicly_fc_announce_frame_capacity(frame), 0,
+                                       &control)) != 0)
+        return ret;
+    uint8_t *end = quicly_encode_fc_announce_frame(control->encoded, frame);
+    control->encoded_size = (size_t)(end - control->encoded);
+    return enqueue_flexicast_control(conn, control);
+}
+
+quicly_error_t quicly_flexicast_send_state(quicly_conn_t *conn, const quicly_flexicast_state_frame_t *frame)
+{
+    quicly_flexicast_control_t *control;
+    quicly_error_t ret;
+
+    if (conn == NULL || frame == NULL || (!quicly_is_client(conn) && frame->action != QUICLY_FLEXICAST_STATE_LEAVE))
+        return QUICLY_TRANSPORT_ERROR_PROTOCOL_VIOLATION;
+    if ((ret = alloc_flexicast_control(conn, QUICLY_FRAME_TYPE_FC_STATE, quicly_fc_state_frame_capacity(frame), 0, &control)) != 0)
+        return ret;
+    uint8_t *end = quicly_encode_fc_state_frame(control->encoded, frame);
+    control->encoded_size = (size_t)(end - control->encoded);
+    return enqueue_flexicast_control(conn, control);
+}
+
+quicly_error_t quicly_flexicast_send_key(quicly_conn_t *conn, const quicly_flexicast_key_frame_t *frame)
+{
+    quicly_flexicast_control_t *control;
+    quicly_error_t ret;
+
+    if (conn == NULL || quicly_is_client(conn))
+        return QUICLY_TRANSPORT_ERROR_PROTOCOL_VIOLATION;
+    if ((ret = alloc_flexicast_control(conn, QUICLY_FRAME_TYPE_FC_KEY, quicly_fc_key_frame_capacity(frame), 0, &control)) != 0)
+        return ret;
+    uint8_t *end = quicly_encode_fc_key_frame(control->encoded, frame);
+    control->encoded_size = (size_t)(end - control->encoded);
+    return enqueue_flexicast_control(conn, control);
+}
+
+quicly_error_t quicly_flexicast_send_path_ack(quicly_conn_t *conn, uint64_t flow_id, const quicly_ranges_t *ranges,
+                                              const uint64_t ecn_counts[3], uint64_t ack_delay_msec, int64_t now)
+{
+    static const uint64_t zero_ecn[3] = {0};
+    const uint64_t *ecn = ecn_counts != NULL ? ecn_counts : zero_ecn;
+    uint8_t buf[QUICLY_MAX_FLEXICAST_CONTROL_PAYLOAD];
+    quicly_ranges_t slice;
+
+    if (conn == NULL || !quicly_is_client(conn) || !quicly_flexicast_is_negotiated(conn) || flow_id <= conn->super.remote.max_path_id)
+        return QUICLY_TRANSPORT_ERROR_PROTOCOL_VIOLATION;
+    if (flow_id > PTLS_QUICINT_MAX || ranges == NULL || ranges->num_ranges == 0 || ranges->ranges == NULL ||
+        ecn[0] > PTLS_QUICINT_MAX || ecn[1] > PTLS_QUICINT_MAX || ecn[2] > PTLS_QUICINT_MAX)
+        return PTLS_ERROR_LIBRARY;
+
+    slice = *ranges;
+    if (slice.num_ranges > QUICLY_MAX_ACK_BLOCKS) {
+        slice.ranges += slice.num_ranges - QUICLY_MAX_ACK_BLOCKS;
+        slice.num_ranges = QUICLY_MAX_ACK_BLOCKS;
+    }
+    for (size_t i = 0; i != slice.num_ranges; ++i) {
+        if (slice.ranges[i].start >= slice.ranges[i].end || slice.ranges[i].end - 1 > PTLS_QUICINT_MAX ||
+            (i != 0 && slice.ranges[i - 1].end >= slice.ranges[i].start))
+            return PTLS_ERROR_LIBRARY;
+    }
+
+    const uint64_t units_per_msec = 1000 >> QUICLY_LOCAL_ACK_DELAY_EXPONENT;
+    uint64_t scaled_delay = ack_delay_msec > PTLS_QUICINT_MAX / units_per_msec ? PTLS_QUICINT_MAX : ack_delay_msec * units_per_msec;
+    size_t extra = 8 - quicly_encodev_capacity(scaled_delay);
+    uint64_t ecn_copy[3] = {ecn[0], ecn[1], ecn[2]};
+    uint8_t *end = quicly_encode_path_ack_frame(buf, buf + sizeof(buf) - 1 - extra, flow_id, &slice, ecn_copy, scaled_delay);
+    if (end == NULL)
+        return PTLS_ERROR_LIBRARY;
+    *end++ = QUICLY_FRAME_TYPE_PING;
+    size_t encoded_size = (size_t)(end - buf);
+    uint64_t largest_ack = slice.ranges[slice.num_ranges - 1].end - 1;
+    size_t ack_offset = 1 + quicly_encodev_capacity(flow_id) + quicly_encodev_capacity(largest_ack);
+    assert(ack_offset < encoded_size);
+
+    if (now <= 0) {
+        double d = conn->stash.now;
+        if (conn->stash.now == 0 && conn->super.ctx->now != NULL)
+            conn->super.ctx->now->cb(conn->super.ctx->now, &d);
+        now = (int64_t)d;
+    }
+
+    /* coalesce at most one pending PATH_ACK per flow_id so unicast stalls cannot starve FC_* frames */
+    for (quicly_flexicast_control_t **ref = &conn->egress.flexicast_control.head; *ref != NULL; ref = &(*ref)->next) {
+        quicly_flexicast_control_t *existing = *ref;
+        if (existing->type != QUICLY_FRAME_TYPE_PATH_ACK || existing->ack.flow_id != flow_id)
+            continue;
+        if (conn->egress.flexicast_control.next_id == UINT64_MAX)
+            return QUICLY_ERROR_STATE_EXHAUSTION;
+        if (existing->capacity < encoded_size + extra) {
+            quicly_flexicast_control_t *replacement =
+                malloc(offsetof(quicly_flexicast_control_t, encoded) + encoded_size + extra);
+            if (replacement == NULL)
+                return PTLS_ERROR_NO_MEMORY;
+            replacement->next = existing->next;
+            replacement->type = QUICLY_FRAME_TYPE_PATH_ACK;
+            replacement->capacity = encoded_size + extra;
+            *ref = replacement;
+            if (replacement->next == NULL)
+                conn->egress.flexicast_control.tail_ref = &replacement->next;
+            free(existing);
+            existing = replacement;
+        }
+        memcpy(existing->encoded, buf, encoded_size);
+        existing->encoded_size = encoded_size;
+        existing->id = conn->egress.flexicast_control.next_id++;
+        existing->generation = 0;
+        existing->sender = QUICLY_SENDER_STATE_SEND;
+        existing->ack.flow_id = flow_id;
+        existing->ack.queued_at = now;
+        existing->ack.delay = scaled_delay;
+        existing->ack.offset = ack_offset;
+        arm_flexicast_control_send(conn);
+        return 0;
+    }
+
+    quicly_flexicast_control_t *control;
+    quicly_error_t ret = alloc_flexicast_control(conn, QUICLY_FRAME_TYPE_PATH_ACK, encoded_size, extra, &control);
+    if (ret != 0)
+        return ret;
+    memcpy(control->encoded, buf, encoded_size);
+    control->ack.flow_id = flow_id;
+    control->ack.queued_at = now;
+    control->ack.delay = scaled_delay;
+    control->ack.offset = ack_offset;
+    return enqueue_flexicast_control(conn, control);
 }
 
 static inline int multipath_is_ready(quicly_conn_t *conn)
@@ -3340,6 +3563,13 @@ void quicly_free(quicly_conn_t *conn)
 
     destroy_all_streams(conn, 0, 1);
     update_open_count(conn->super.ctx, -1);
+    while (conn->egress.flexicast_control.head != NULL) {
+        quicly_flexicast_control_t *control = conn->egress.flexicast_control.head;
+        conn->egress.flexicast_control.head = control->next;
+        free_flexicast_control(control);
+    }
+    conn->egress.flexicast_control.tail_ref = NULL;
+    conn->egress.flexicast_control.count = 0;
 
     for (size_t i = 0; i != PTLS_ELEMENTSOF(conn->delayed_packets.as_array); ++i) {
         while (conn->delayed_packets.as_array[i].head != NULL) {
@@ -3627,6 +3857,11 @@ int quicly_encode_transport_parameter_list(ptls_buffer_t *buf, const quicly_tran
     if (is_handshake && local_multipath_enabled(params)) {
         PUSH_TP(buf, QUICLY_TRANSPORT_PARAMETER_ID_INITIAL_MAX_PATH_ID,
                 { ptls_buffer_push_quicint(buf, params->initial_max_path_id); });
+        if (params->flexicast_support.ipv4 || params->flexicast_support.ipv6) {
+            /* draft -03 encodes IPv4 and IPv6 support as two one-byte booleans */
+            PUSH_TP(buf, QUICLY_TRANSPORT_PARAMETER_ID_FLEXICAST_SUPPORT,
+                    { ptls_buffer_push(buf, params->flexicast_support.ipv4, params->flexicast_support.ipv6); });
+        }
     }
     /* if requested, add a greasing TP of 1 MTU size so that CH spans across multiple packets */
     if (expand_by != 0) {
@@ -3690,6 +3925,7 @@ quicly_error_t quicly_decode_transport_parameter_list(quicly_transport_parameter
     })
 
     uint64_t found_bits = 0;
+    ptls_iovec_t flexicast_support = ptls_iovec_init(NULL, 0);
     quicly_error_t ret;
 
     /* set parameters to their default values */
@@ -3845,6 +4081,11 @@ quicly_error_t quicly_decode_transport_parameter_list(quicly_transport_parameter
                     goto Exit;
                 }
             });
+            DECODE_TP(QUICLY_TRANSPORT_PARAMETER_ID_FLEXICAST_SUPPORT, {
+                /* parameter order is arbitrary; validate after finding multipath support */
+                flexicast_support = ptls_iovec_init(src, end - src);
+                src = end;
+            });
             /* skip unknown extension */
             if (tp_index >= 0)
                 src = end;
@@ -3854,6 +4095,18 @@ quicly_error_t quicly_decode_transport_parameter_list(quicly_transport_parameter
     /* check consistency between the transport parameters */
     if (params->min_ack_delay_usec != UINT64_MAX) {
         if (params->min_ack_delay_usec > params->max_ack_delay * 1000) {
+            ret = QUICLY_TRANSPORT_ERROR_PROTOCOL_VIOLATION;
+            goto Exit;
+        }
+    }
+    if (flexicast_support.base != NULL && params->enable_multipath) {
+        if (flexicast_support.len != 2 || flexicast_support.base[0] > 1 || flexicast_support.base[1] > 1) {
+            ret = QUICLY_TRANSPORT_ERROR_TRANSPORT_PARAMETER;
+            goto Exit;
+        }
+        params->flexicast_support.ipv4 = flexicast_support.base[0];
+        params->flexicast_support.ipv6 = flexicast_support.base[1];
+        if (!params->flexicast_support.ipv4 && !params->flexicast_support.ipv6) {
             ret = QUICLY_TRANSPORT_ERROR_PROTOCOL_VIOLATION;
             goto Exit;
         }
@@ -4821,6 +5074,31 @@ static quicly_error_t on_ack_data_blocked(quicly_sentmap_t *map, const quicly_se
     return 0;
 }
 
+static quicly_error_t on_ack_flexicast_control(quicly_sentmap_t *map, const quicly_sent_packet_t *packet, int acked,
+                                               quicly_sent_t *sent)
+{
+    quicly_conn_t *conn = get_conn_from_sentmap(map);
+    quicly_flexicast_control_t **ref = &conn->egress.flexicast_control.head;
+
+    while (*ref != NULL && (*ref)->id != sent->data.flexicast_control.id)
+        ref = &(*ref)->next;
+    if (*ref == NULL)
+        return 0;
+    quicly_flexicast_control_t *control = *ref;
+    if (acked) {
+        *ref = control->next;
+        if (control->next == NULL)
+            conn->egress.flexicast_control.tail_ref = ref;
+        --conn->egress.flexicast_control.count;
+        free_flexicast_control(control);
+    } else if (packet->frames_in_flight && control->generation == sent->data.flexicast_control.generation &&
+               control->sender == QUICLY_SENDER_STATE_UNACKED) {
+        control->sender = QUICLY_SENDER_STATE_SEND;
+        arm_flexicast_control_send(conn);
+    }
+    return 0;
+}
+
 static quicly_error_t on_ack_max_path_id(quicly_sentmap_t *map, const quicly_sent_packet_t *packet, int acked, quicly_sent_t *sent)
 {
     quicly_conn_t *conn = get_conn_from_sentmap(map);
@@ -5262,14 +5540,17 @@ static size_t path_max_datagram_frame_space(quicly_conn_t *conn, size_t path_ind
         const quicly_cid_t *dcid = get_dcid(conn, path_index);
         if (dcid != NULL)
             dcid_len = dcid->len;
+    } else if (ps->remote_cid_set.cids[0].state != QUICLY_REMOTE_CID_UNAVAILABLE && ps->remote_cid_set.cids[0].cid.len == 0) {
+        dcid_len = 0;
     } else {
+        size_t found = SIZE_MAX;
         for (size_t i = 0; i < PTLS_ELEMENTSOF(ps->remote_cid_set.cids); ++i) {
-            if (ps->remote_cid_set.cids[i].state == QUICLY_REMOTE_CID_AVAILABLE ||
-                (ps->remote_cid_set.cids[i].state != QUICLY_REMOTE_CID_UNAVAILABLE && ps->remote_cid_set.cids[i].cid.len == 0)) {
-                dcid_len = ps->remote_cid_set.cids[i].cid.len;
-                break;
-            }
+            if (ps->remote_cid_set.cids[i].state == QUICLY_REMOTE_CID_AVAILABLE &&
+                (found == SIZE_MAX || ps->remote_cid_set.cids[i].sequence < ps->remote_cid_set.cids[found].sequence))
+                found = i;
         }
+        if (found != SIZE_MAX)
+            dcid_len = ps->remote_cid_set.cids[found].cid.len;
     }
     size_t overhead = 1 + dcid_len + QUICLY_SEND_PN_SIZE + conn->application->cipher.egress.key.aead->algo->tag_size;
     if (!conn->application->one_rtt_writable)
@@ -6663,6 +6944,73 @@ static quicly_error_t send_streams_blocked(quicly_conn_t *conn, int uni, quicly_
     return 0;
 }
 
+static void refresh_flexicast_ack_delay(quicly_flexicast_control_t *control, int64_t now)
+{
+    uint64_t delay = control->ack.delay;
+    if (now > control->ack.queued_at) {
+        uint64_t elapsed = (uint64_t)now - (uint64_t)control->ack.queued_at;
+        /* convert milliseconds to scaled microseconds without overflowing */
+        uint64_t whole = elapsed >> QUICLY_LOCAL_ACK_DELAY_EXPONENT;
+        uint64_t fraction =
+            ((elapsed & ((UINT64_C(1) << QUICLY_LOCAL_ACK_DELAY_EXPONENT) - 1)) * 1000) >> QUICLY_LOCAL_ACK_DELAY_EXPONENT;
+        if (whole > (PTLS_QUICINT_MAX - delay) / 1000) {
+            delay = PTLS_QUICINT_MAX;
+        } else {
+            delay += whole * 1000;
+            delay += fraction < PTLS_QUICINT_MAX - delay ? fraction : PTLS_QUICINT_MAX - delay;
+        }
+    }
+    uint8_t *dst = control->encoded + control->ack.offset;
+    size_t old_size = (size_t)1 << (dst[0] >> 6), new_size = quicly_encodev_capacity(delay);
+    assert(control->ack.offset + old_size <= control->encoded_size);
+    assert(control->encoded_size - old_size + new_size <= control->capacity);
+    memmove(dst + new_size, dst + old_size, control->encoded_size - control->ack.offset - old_size);
+    quicly_encodev(dst, delay);
+    control->encoded_size = control->encoded_size - old_size + new_size;
+}
+
+static quicly_error_t send_flexicast_control_frames(quicly_conn_t *conn, quicly_send_context_t *s)
+{
+    for (quicly_flexicast_control_t *control = conn->egress.flexicast_control.head; control != NULL; control = control->next) {
+        if (control->sender != QUICLY_SENDER_STATE_SEND)
+            continue;
+        if (control->type == QUICLY_FRAME_TYPE_PATH_ACK)
+            refresh_flexicast_ack_delay(control, conn->stash.now);
+        quicly_sent_t *sent;
+        quicly_error_t ret;
+        size_t overhead = 1 + s->dcid->len + QUICLY_SEND_PN_SIZE + s->current.cipher->aead->algo->tag_size;
+        size_t capacity = get_send_path(conn, s)->path_space->max_udp_payload_size;
+        if (capacity < overhead || control->encoded_size > capacity - overhead)
+            return QUICLY_TRANSPORT_ERROR_INTERNAL;
+        if ((ret = allocate_ack_eliciting_frame(conn, s, control->encoded_size, &sent, on_ack_flexicast_control)) != 0)
+            return ret;
+        memcpy(s->dst, control->encoded, control->encoded_size);
+        s->dst += control->encoded_size;
+        sent->data.flexicast_control.id = control->id;
+        sent->data.flexicast_control.generation = ++control->generation;
+        control->sender = QUICLY_SENDER_STATE_UNACKED;
+        switch (control->type) {
+        case QUICLY_FRAME_TYPE_FC_ANNOUNCE:
+            ++conn->super.stats.num_frames_sent.fc_announce;
+            break;
+        case QUICLY_FRAME_TYPE_FC_STATE:
+            ++conn->super.stats.num_frames_sent.fc_state;
+            break;
+        case QUICLY_FRAME_TYPE_FC_KEY:
+            ++conn->super.stats.num_frames_sent.fc_key;
+            break;
+        case QUICLY_FRAME_TYPE_PATH_ACK:
+            ++conn->super.stats.num_frames_sent.path_ack;
+            ++conn->super.stats.num_frames_sent.ping;
+            break;
+        default:
+            assert(!"invalid flexicast control frame type");
+            break;
+        }
+    }
+    return 0;
+}
+
 static quicly_error_t send_max_path_id(quicly_conn_t *conn, quicly_send_context_t *s)
 {
     quicly_sent_t *sent;
@@ -7324,6 +7672,12 @@ static void rearm_deferred_control_frames(quicly_conn_t *conn)
 {
     if (conn->application == NULL || !conn->application->one_rtt_writable)
         return;
+    for (quicly_flexicast_control_t *fc = conn->egress.flexicast_control.head; fc != NULL; fc = fc->next) {
+        if (fc->sender == QUICLY_SENDER_STATE_SEND) {
+            conn->egress.pending_flows |= QUICLY_PENDING_FLOW_OTHERS_BIT;
+            return;
+        }
+    }
     int mp_ready = quicly_is_multipath(conn) && conn->application->cipher.ingress.aead[0] != NULL;
     if (mp_ready) {
         if (conn->egress.max_path_id == QUICLY_SENDER_STATE_SEND || conn->egress.paths_blocked.sender == QUICLY_SENDER_STATE_SEND) {
@@ -7512,6 +7866,9 @@ static quicly_error_t send_other_control_frames(quicly_conn_t *conn, quicly_send
     int one_rtt = conn->application != NULL && conn->application->one_rtt_writable;
     int mp_ready = one_rtt && multipath_is_ready(conn);
     size_t max_ps = mp_ready ? PTLS_ELEMENTSOF(conn->path_spaces) : 1;
+
+    if (one_rtt && (ret = send_flexicast_control_frames(conn, s)) != 0)
+        return ret;
 
     if (mp_ready) {
         /* MAX_PATH_ID */
@@ -8057,6 +8414,52 @@ int quicly_has_datagram_frames(quicly_conn_t *conn)
             return 1;
     }
     return 0;
+}
+
+size_t quicly_get_datagram_payload_limit(quicly_conn_t *conn, size_t path_index)
+{
+    if (conn == NULL || conn->super.state != QUICLY_STATE_CONNECTED || conn->application == NULL ||
+        !conn->application->one_rtt_writable)
+        return 0;
+    struct st_quicly_conn_path_t *path = get_path(conn, path_index);
+    if (path == NULL || path != path->path_space->addrs[0] || path->abandoned || path->probe_only || !path_is_validated(path) ||
+        !path_has_usable_dcid(path) ||
+        path->path_space->datagram_frame_payloads.count >= quicly_get_max_datagram_frames_path(conn, path_index))
+        return 0;
+    size_t capacity = path_max_datagram_frame_space(conn, path_index);
+    if (capacity > conn->super.remote.transport_params.max_datagram_frame_size)
+        capacity = conn->super.remote.transport_params.max_datagram_frame_size;
+    /* subtract 1-byte DATAGRAM_WITHLEN type plus 1-, 2-, or 4-byte length varint */
+    if (capacity < 3)
+        return 0;
+    if (capacity <= 65)
+        return capacity - 2;
+    if (capacity == 66)
+        return 63;
+    if (capacity <= 16386)
+        return capacity - 3;
+    if (capacity <= 16388)
+        return 16383;
+    return capacity - 5;
+}
+
+void quicly_discard_datagram_frames(quicly_conn_t *conn, size_t path_index)
+{
+    if (conn == NULL)
+        return;
+    struct st_quicly_conn_path_t *path = get_path(conn, path_index);
+    if (path == NULL || path != path->path_space->addrs[0])
+        return;
+    clear_datagram_queue(&path->path_space->datagram_frame_payloads);
+    /* dropping the queued tail ends the CC-limited period before newly queued data is sent */
+    if (path->path_space->cc_limited_end_pn == UINT64_MAX &&
+        path->path_space->loss.sentmap.bytes_in_flight < path->path_space->cc.cwnd) {
+        int can_send_stream = scheduler_can_send(conn) &&
+                              (!quicly_is_multipath(conn) ||
+                               (!path->abandoned && !path->probe_only && path_is_validated(path) &&
+                                application_path_can_send_data(conn, path_index, preferred_path_rank(conn))));
+        exit_cc_limited(conn, path->path_space, can_send_stream);
+    }
 }
 
 int quicly_set_cc(quicly_conn_t *conn, quicly_cc_type_t *cc)
@@ -8735,6 +9138,29 @@ quicly_error_t quicly_close(quicly_conn_t *conn, quicly_error_t err, const char 
     ret = initiate_close(conn, err, QUICLY_FRAME_TYPE_PADDING /* used when err == 0 */, reason_phrase);
     unlock_now(conn);
 
+    return ret;
+}
+
+quicly_error_t quicly_flexicast_handle_receive_error(quicly_conn_t *conn, int result)
+{
+    quicly_error_t error, ret;
+
+    if (conn == NULL)
+        return QUICLY_TRANSPORT_ERROR_INTERNAL;
+    switch (result) {
+    case QUICLY_FLEXICAST_ERROR_PROTOCOL_VIOLATION:
+        error = QUICLY_TRANSPORT_ERROR_PROTOCOL_VIOLATION;
+        break;
+    case QUICLY_FLEXICAST_ERROR_FRAME_ENCODING:
+        error = QUICLY_TRANSPORT_ERROR_FRAME_ENCODING;
+        break;
+    default:
+        /* packet-local errors and unauthenticated AEAD budget exhaustion stay scoped to the flow */
+        return 0;
+    }
+    lock_now(conn, 1);
+    ret = initiate_close(conn, error, QUICLY_FRAME_TYPE_PADDING, "flexicast receive error");
+    unlock_now(conn);
     return ret;
 }
 
@@ -9722,6 +10148,19 @@ static quicly_error_t handle_path_ack_frame(quicly_conn_t *conn, struct st_quicl
                                             state->frame_type == QUICLY_FRAME_TYPE_PATH_ACK_ECN)) != 0)
         return ret;
 
+    if (path_id > conn->super.local.max_path_id && quicly_flexicast_is_negotiated(conn)) {
+        if (quicly_is_client(conn) || state->epoch != QUICLY_EPOCH_1RTT || conn->super.ctx->receive_flexicast_ack == NULL)
+            return QUICLY_TRANSPORT_ERROR_PROTOCOL_VIOLATION;
+        /* convert microsecond PATH_ACK delay to milliseconds without shifting overflow */
+        unsigned exponent = conn->super.remote.transport_params.ack_delay_exponent;
+        frame.ack_delay =
+            frame.ack_delay > ((uint64_t)UINT32_MAX * 1000 >> exponent) ? UINT32_MAX : (frame.ack_delay << exponent) / 1000;
+        ret = conn->super.ctx->receive_flexicast_ack->cb(conn->super.ctx->receive_flexicast_ack, conn, path_id, &frame);
+        if (ret == 0 && conn->super.state >= QUICLY_STATE_CLOSING)
+            return QUICLY_ERROR_IS_CLOSING;
+        return ret;
+    }
+
     return process_ack_frame_core(conn, state, path_id, &frame);
 }
 
@@ -10164,6 +10603,52 @@ static quicly_error_t handle_immediate_ack_frame(quicly_conn_t *conn, struct st_
     return 0;
 }
 
+static quicly_error_t deliver_flexicast_frame(quicly_conn_t *conn, const quicly_flexicast_frame_t *frame)
+{
+    if (conn->super.ctx->receive_flexicast_frame == NULL)
+        return 0;
+    quicly_error_t ret = conn->super.ctx->receive_flexicast_frame->cb(conn->super.ctx->receive_flexicast_frame, conn, frame);
+    if (ret == 0 && conn->super.state >= QUICLY_STATE_CLOSING)
+        return QUICLY_ERROR_IS_CLOSING;
+    return ret;
+}
+
+static quicly_error_t handle_fc_announce_frame(quicly_conn_t *conn, struct st_quicly_handle_payload_state_t *state)
+{
+    quicly_flexicast_frame_t frame = {.type = QUICLY_FRAME_TYPE_FC_ANNOUNCE};
+    quicly_error_t ret;
+
+    if (!quicly_is_client(conn))
+        return QUICLY_TRANSPORT_ERROR_PROTOCOL_VIOLATION;
+    if ((ret = quicly_decode_fc_announce_frame(&state->src, state->end, &frame.data.announce)) != 0)
+        return ret;
+    return deliver_flexicast_frame(conn, &frame);
+}
+
+static quicly_error_t handle_fc_state_frame(quicly_conn_t *conn, struct st_quicly_handle_payload_state_t *state)
+{
+    quicly_flexicast_frame_t frame = {.type = QUICLY_FRAME_TYPE_FC_STATE};
+    quicly_error_t ret;
+
+    if ((ret = quicly_decode_fc_state_frame(&state->src, state->end, &frame.data.state)) != 0)
+        return ret;
+    if (quicly_is_client(conn) && frame.data.state.action != QUICLY_FLEXICAST_STATE_LEAVE)
+        return QUICLY_TRANSPORT_ERROR_PROTOCOL_VIOLATION;
+    return deliver_flexicast_frame(conn, &frame);
+}
+
+static quicly_error_t handle_fc_key_frame(quicly_conn_t *conn, struct st_quicly_handle_payload_state_t *state)
+{
+    quicly_flexicast_frame_t frame = {.type = QUICLY_FRAME_TYPE_FC_KEY};
+    quicly_error_t ret;
+
+    if (!quicly_is_client(conn))
+        return QUICLY_TRANSPORT_ERROR_PROTOCOL_VIOLATION;
+    if ((ret = quicly_decode_fc_key_frame(&state->src, state->end, &frame.data.key)) != 0)
+        return ret;
+    return deliver_flexicast_frame(conn, &frame);
+}
+
 static quicly_error_t handle_payload(quicly_conn_t *conn, size_t epoch, size_t path_index, const quicly_decoded_packet_t *packet,
                                      const uint8_t *_src, size_t _len, uint64_t *offending_frame_type, int *is_ack_only,
                                      int *is_probe_only)
@@ -10261,6 +10746,9 @@ static quicly_error_t handle_payload(quicly_conn_t *conn, size_t epoch, size_t p
         FRAME( MAX_PATH_ID      , max_path_id   ,  0 ,  0,   0,   1 ,             1 ,       0 ),
         FRAME( PATHS_BLOCKED    , paths_blocked ,  0 ,  0,   0,   1 ,             1 ,       0 ),
         FRAME( PATH_CIDS_BLOCKED , path_cids_blocked ,  0 ,  0,   0,   1 ,         1 ,       0 ),
+        FRAME( FC_ANNOUNCE      , fc_announce   ,  0 ,  0,   0,   1 ,             1 ,       0 ),
+        FRAME( FC_STATE         , fc_state      ,  0 ,  0,   0,   1 ,             1 ,       0 ),
+        FRAME( FC_KEY           , fc_key        ,  0 ,  0,   0,   1 ,             1 ,       0 ),
         /*   +------------------+---------------+-------------------+---------------+---------+ */
 #undef FRAME
         {UINT64_MAX},
@@ -10301,6 +10789,12 @@ static quicly_error_t handle_payload(quicly_conn_t *conn, size_t epoch, size_t p
             (state.frame_type >= QUICLY_FRAME_TYPE_PATH_ABANDON && state.frame_type <= QUICLY_FRAME_TYPE_PATH_CIDS_BLOCKED)) {
             if (!quicly_is_multipath(conn)) {
                 ret = QUICLY_TRANSPORT_ERROR_PROTOCOL_VIOLATION;
+                break;
+            }
+        }
+        if (state.frame_type >= QUICLY_FRAME_TYPE_FC_ANNOUNCE && state.frame_type <= QUICLY_FRAME_TYPE_FC_KEY) {
+            if (!quicly_flexicast_is_negotiated(conn)) {
+                ret = QUICLY_TRANSPORT_ERROR_FRAME_ENCODING;
                 break;
             }
         }
