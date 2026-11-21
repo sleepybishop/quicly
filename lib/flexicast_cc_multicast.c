@@ -1,4 +1,4 @@
-#include "quicly/flexicast_cc.h"
+#include "quicly/flexicast.h"
 #include "flexicast_member_map.h"
 
 #include <limits.h>
@@ -6,7 +6,14 @@
 #include <string.h>
 
 #define MULTICAST_NO_SLOT UINT32_MAX
-#define MULTICAST_SENT_RING_SIZE 2048U
+#define MULTICAST_SENT_RING_SIZE QUICLY_FLEXICAST_SENT_WINDOW
+#define MULTICAST_SENT_BLOCK_SIZE 64U
+#define MULTICAST_SENT_BLOCK_COUNT (MULTICAST_SENT_RING_SIZE / MULTICAST_SENT_BLOCK_SIZE)
+
+typedef struct st_multicast_sent_block_t {
+    uint64_t present;
+    int64_t timestamps[MULTICAST_SENT_BLOCK_SIZE];
+} multicast_sent_block_t;
 
 typedef struct st_multicast_member_t {
     uint64_t id;
@@ -43,7 +50,7 @@ typedef struct st_multicast_state_t {
     uint64_t next_expected_pn;
     int64_t first_send_at;
     int64_t max_event_at;
-    int64_t sent_at_ring[MULTICAST_SENT_RING_SIZE];
+    multicast_sent_block_t *sent_at[MULTICAST_SENT_BLOCK_COUNT];
     int has_sent_packets;
     int any_unanswered_probes;
     int any_override_sent_at;
@@ -141,6 +148,36 @@ static int member_awaiting_feedback(const multicast_state_t *state, const multic
     return member->active && state->has_sent_packets && member->next_unacked_pn < state->next_expected_pn;
 }
 
+static void clear_sent_timestamps(multicast_state_t *state)
+{
+    for (size_t i = 0; i != MULTICAST_SENT_BLOCK_COUNT; ++i) {
+        free(state->sent_at[i]);
+        state->sent_at[i] = NULL;
+    }
+}
+
+static int64_t get_sent_at(const multicast_state_t *state, uint64_t pn)
+{
+    size_t slot = pn % MULTICAST_SENT_RING_SIZE;
+    const multicast_sent_block_t *block = state->sent_at[slot / MULTICAST_SENT_BLOCK_SIZE];
+    size_t offset = slot % MULTICAST_SENT_BLOCK_SIZE;
+    if (block == NULL || ((block->present >> offset) & 1) == 0)
+        return state->first_send_at;
+    return block->timestamps[offset];
+}
+
+static void set_sent_at(multicast_state_t *state, uint64_t pn, int64_t now)
+{
+    size_t slot = pn % MULTICAST_SENT_RING_SIZE;
+    multicast_sent_block_t **block = &state->sent_at[slot / MULTICAST_SENT_BLOCK_SIZE];
+    /* The controller callback has no error return. Use the same fallback as for older packets if allocation fails. */
+    if (*block == NULL && (*block = calloc(1, sizeof(**block))) == NULL)
+        return;
+    size_t offset = slot % MULTICAST_SENT_BLOCK_SIZE;
+    (*block)->timestamps[offset] = now;
+    (*block)->present |= UINT64_C(1) << offset;
+}
+
 static int64_t member_pkt_sent_at(const multicast_state_t *state, const multicast_member_t *member)
 {
     if (member->oldest_override_sent_at != INT64_MIN)
@@ -148,7 +185,7 @@ static int64_t member_pkt_sent_at(const multicast_state_t *state, const multicas
     if (member->next_unacked_pn <= state->first_sent_pn ||
         state->next_expected_pn - member->next_unacked_pn > MULTICAST_SENT_RING_SIZE)
         return state->first_send_at;
-    return state->sent_at_ring[member->next_unacked_pn % MULTICAST_SENT_RING_SIZE];
+    return get_sent_at(state, member->next_unacked_pn);
 }
 
 static int64_t member_effective_base(const multicast_state_t *state, const multicast_member_t *member)
@@ -469,6 +506,7 @@ static void multicast_on_member_suspended(quicly_flexicast_cc_t *cc, uint64_t me
 static void multicast_on_epoch_reset(quicly_flexicast_cc_t *cc, int64_t now)
 {
     multicast_state_t *state = (multicast_state_t *)cc;
+    clear_sent_timestamps(state);
     state->has_sent_packets = 0;
     state->any_unanswered_probes = 0;
     state->any_override_sent_at = 0;
@@ -503,14 +541,14 @@ static void multicast_on_packet_sent(quicly_flexicast_cc_t *cc, uint64_t packet_
         state->has_sent_packets = 1;
         state->first_sent_pn = packet_number;
         state->first_send_at = send_at;
-        state->sent_at_ring[packet_number % MULTICAST_SENT_RING_SIZE] = send_at;
+        set_sent_at(state, packet_number, send_at);
         state->next_expected_pn = packet_number < UINT64_MAX ? packet_number + 1 : UINT64_MAX;
     } else if (packet_number >= state->next_expected_pn) {
         uint64_t fill_from = state->next_expected_pn;
         if (packet_number - fill_from >= MULTICAST_SENT_RING_SIZE)
             fill_from = packet_number - (MULTICAST_SENT_RING_SIZE - 1);
         for (uint64_t pn = fill_from;; ++pn) {
-            state->sent_at_ring[pn % MULTICAST_SENT_RING_SIZE] = send_at;
+            set_sent_at(state, pn, send_at);
             if (pn == packet_number)
                 break;
         }
@@ -562,11 +600,11 @@ static void multicast_on_member_pending_updated(quicly_flexicast_cc_t *cc, uint6
             int64_t prev_ring_at =
                 oldest_pending_pn == state->first_sent_pn
                     ? state->first_send_at
-                    : (in_ring ? state->sent_at_ring[oldest_pending_pn % MULTICAST_SENT_RING_SIZE] : state->first_send_at);
+                    : (in_ring ? get_sent_at(state, oldest_pending_pn) : state->first_send_at);
             if (oldest_pending_pn == state->first_sent_pn)
                 state->first_send_at = oldest_sent_at;
             if (in_ring)
-                state->sent_at_ring[oldest_pending_pn % MULTICAST_SENT_RING_SIZE] = oldest_sent_at;
+                set_sent_at(state, oldest_pending_pn, oldest_sent_at);
             if (state->any_unanswered_probes && oldest_sent_at > prev_ring_at) {
                 int still_probing = 0;
                 for (size_t i = 0; i != state->num_members; ++i) {
@@ -748,6 +786,7 @@ void quicly_flexicast_cc_free_multicast(quicly_flexicast_cc_t *cc)
     if (cc == NULL)
         return;
     multicast_state_t *state = (multicast_state_t *)cc;
+    clear_sent_timestamps(state);
     flexicast_member_map_dispose(&state->member_map);
     free(state->members);
     free(state->rate_heap);

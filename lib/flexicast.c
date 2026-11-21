@@ -8,6 +8,8 @@
 #define MAX_SUBMISSION_TIMESTAMPS 4096
 #define FLEXICAST_LIM_INLINE_CAPACITY 4U
 #define FLEXICAST_LIM_MAX_CAPACITY 1024U
+#define FLEXICAST_SENT_BLOCK_SIZE 64U
+#define FLEXICAST_SENT_BLOCK_COUNT (QUICLY_FLEXICAST_SENT_WINDOW / FLEXICAST_SENT_BLOCK_SIZE)
 
 typedef struct st_flexicast_lim_span_t {
     int64_t start;
@@ -36,6 +38,12 @@ typedef struct st_quicly_flexicast_sent_t {
     int has_submission;
     int rtt_untracked;
 } quicly_flexicast_sent_t;
+
+typedef struct st_flexicast_sent_block_t {
+    quicly_flexicast_sent_t packets[FLEXICAST_SENT_BLOCK_SIZE];
+    /* One row per packet, each containing flow->member_word_count words. */
+    uint64_t pending[];
+} flexicast_sent_block_t;
 
 typedef struct st_flexicast_submission_t {
     uint64_t packet_number;
@@ -132,7 +140,7 @@ struct st_quicly_flexicast_flow_t {
     size_t member_capacity;
     size_t member_word_count;
     /* sender-side structures allocated lazily on first attach */
-    quicly_flexicast_sent_t *sent;
+    flexicast_sent_block_t **sent;
     quicly_flexicast_member_t *members;
     uint32_t *free_member_slots;
     size_t num_free_member_slots;
@@ -142,7 +150,6 @@ struct st_quicly_flexicast_flow_t {
     uint32_t inactive_tail;
     flexicast_member_map_t member_map;
     uint64_t *active_member_words;
-    uint64_t *pending_member_words;
     flexicast_submission_t *submissions;
     size_t submission_capacity;
     size_t num_submissions;
@@ -318,10 +325,26 @@ static void remove_submission(quicly_flexicast_flow_t *flow, uint64_t packet_num
     --flow->num_submissions;
 }
 
+static size_t sent_block_index(uint64_t pn)
+{
+    return pn % QUICLY_FLEXICAST_SENT_WINDOW / FLEXICAST_SENT_BLOCK_SIZE;
+}
+
+static size_t sent_block_size(size_t member_words)
+{
+    return sizeof(flexicast_sent_block_t) + FLEXICAST_SENT_BLOCK_SIZE * member_words * sizeof(uint64_t);
+}
+
+static quicly_flexicast_sent_t *get_sent(const quicly_flexicast_flow_t *flow, uint64_t pn)
+{
+    flexicast_sent_block_t *block = flow->sent[sent_block_index(pn)];
+    return block != NULL ? &block->packets[pn % FLEXICAST_SENT_BLOCK_SIZE] : NULL;
+}
+
 static uint64_t *sent_member_words(quicly_flexicast_flow_t *flow, const quicly_flexicast_sent_t *sent)
 {
-    size_t sent_index = (size_t)(sent - flow->sent);
-    return flow->pending_member_words + sent_index * flow->member_word_count;
+    uint64_t pn = sent->packet_number;
+    return flow->sent[sent_block_index(pn)]->pending + pn % FLEXICAST_SENT_BLOCK_SIZE * flow->member_word_count;
 }
 
 static int sent_has_member(quicly_flexicast_flow_t *flow, const quicly_flexicast_sent_t *sent, size_t member_index)
@@ -501,6 +524,14 @@ static void set_member_active(quicly_flexicast_flow_t *flow, size_t member_index
         *word &= ~bit;
 }
 
+static void clear_sent_blocks(quicly_flexicast_flow_t *flow)
+{
+    for (size_t i = 0; i != FLEXICAST_SENT_BLOCK_COUNT; ++i) {
+        free(flow->sent[i]);
+        flow->sent[i] = NULL;
+    }
+}
+
 static void free_sender_state(quicly_flexicast_flow_t *flow)
 {
     if (flow->members != NULL) {
@@ -511,16 +542,17 @@ static void free_sender_state(quicly_flexicast_flow_t *flow)
     }
     lim_ring_dispose(&flow->limitations);
     flexicast_member_map_dispose(&flow->member_map);
-    free(flow->sent);
-    flow->sent = NULL;
+    if (flow->sent != NULL) {
+        clear_sent_blocks(flow);
+        free(flow->sent);
+        flow->sent = NULL;
+    }
     free(flow->members);
     flow->members = NULL;
     free(flow->free_member_slots);
     flow->free_member_slots = NULL;
     free(flow->active_member_words);
     flow->active_member_words = NULL;
-    free(flow->pending_member_words);
-    flow->pending_member_words = NULL;
     free(flow->submissions);
     flow->submissions = NULL;
     flow->member_capacity = 0;
@@ -533,6 +565,28 @@ static void free_sender_state(quicly_flexicast_flow_t *flow)
     flow->num_submissions = 0;
 }
 
+static int grow_sent_member_words(quicly_flexicast_flow_t *flow, size_t words)
+{
+    flexicast_sent_block_t *blocks[FLEXICAST_SENT_BLOCK_COUNT] = {0};
+    for (size_t i = 0; i != FLEXICAST_SENT_BLOCK_COUNT; ++i) {
+        flexicast_sent_block_t *old = flow->sent[i];
+        if (old == NULL)
+            continue;
+        if ((blocks[i] = calloc(1, sent_block_size(words))) == NULL) {
+            for (size_t j = 0; j != i; ++j)
+                free(blocks[j]);
+            return QUICLY_FLEXICAST_ERROR_NO_MEMORY;
+        }
+        memcpy(blocks[i]->packets, old->packets, sizeof(old->packets));
+        for (size_t p = 0; p != FLEXICAST_SENT_BLOCK_SIZE; ++p)
+            memcpy(blocks[i]->pending + p * words, old->pending + p * flow->member_word_count,
+                   flow->member_word_count * sizeof(*old->pending));
+    }
+    clear_sent_blocks(flow);
+    memcpy(flow->sent, blocks, sizeof(blocks));
+    return QUICLY_FLEXICAST_OK;
+}
+
 static int grow_flow_members(quicly_flexicast_flow_t *flow)
 {
     size_t old_capacity = flow->member_capacity, capacity = old_capacity != 0 ? old_capacity * 2 : 8;
@@ -541,19 +595,14 @@ static int grow_flow_members(quicly_flexicast_flow_t *flow)
     size_t old_words = flow->member_word_count, words = (capacity + 63) / 64;
     quicly_flexicast_member_t *members = calloc(capacity, sizeof(*members));
     uint32_t *free_slots = malloc(capacity * sizeof(*free_slots));
-    uint64_t *active = flow->active_member_words, *pending = flow->pending_member_words;
-    if (words != old_words) {
-        active = calloc(words, sizeof(*active));
-        pending = calloc(QUICLY_FLEXICAST_SENT_WINDOW * words, sizeof(*pending));
-    }
-    if (members == NULL || free_slots == NULL || active == NULL || pending == NULL ||
-        flexicast_member_map_reserve(&flow->member_map, capacity) != 0) {
+    uint64_t *active = words != old_words ? calloc(words, sizeof(*active)) : flow->active_member_words;
+    if (members == NULL || free_slots == NULL || active == NULL ||
+        flexicast_member_map_reserve(&flow->member_map, capacity) != 0 ||
+        (words != old_words && grow_sent_member_words(flow, words) != QUICLY_FLEXICAST_OK)) {
         free(members);
         free(free_slots);
-        if (words != old_words) {
+        if (words != old_words)
             free(active);
-            free(pending);
-        }
         return QUICLY_FLEXICAST_ERROR_NO_MEMORY;
     }
 
@@ -576,15 +625,10 @@ static int grow_flow_members(quicly_flexicast_flow_t *flow)
     flow->member_capacity = capacity;
 
     if (words != old_words) {
-        if (old_words != 0) {
+        if (old_words != 0)
             memcpy(active, flow->active_member_words, old_words * sizeof(*active));
-            for (size_t i = 0; i != QUICLY_FLEXICAST_SENT_WINDOW; ++i)
-                memcpy(pending + i * words, flow->pending_member_words + i * old_words, old_words * sizeof(*pending));
-        }
         free(flow->active_member_words);
-        free(flow->pending_member_words);
         flow->active_member_words = active;
-        flow->pending_member_words = pending;
         flow->member_word_count = words;
     }
     return QUICLY_FLEXICAST_OK;
@@ -595,7 +639,7 @@ static int ensure_sender_state(quicly_flexicast_flow_t *flow)
     if (flow->sent != NULL)
         return QUICLY_FLEXICAST_OK;
     flow->inactive_head = flow->inactive_tail = FLEXICAST_NO_SLOT;
-    if ((flow->sent = calloc(QUICLY_FLEXICAST_SENT_WINDOW, sizeof(*flow->sent))) == NULL)
+    if ((flow->sent = calloc(FLEXICAST_SENT_BLOCK_COUNT, sizeof(*flow->sent))) == NULL)
         return QUICLY_FLEXICAST_ERROR_NO_MEMORY;
     int ret = grow_flow_members(flow);
     if (ret != QUICLY_FLEXICAST_OK)
@@ -851,7 +895,7 @@ int quicly_flexicast_flow_rekey(quicly_flexicast_flow_t *flow, ptls_iovec_t traf
     flow->received.largest_received_at = 0;
     lim_ring_dispose(&flow->limitations);
     if (flow->sent != NULL) {
-        memset(flow->sent, 0, QUICLY_FLEXICAST_SENT_WINDOW * sizeof(*flow->sent));
+        clear_sent_blocks(flow);
         if (flow->submissions != NULL && flow->num_submissions != 0)
             memset(flow->submissions, 0, flow->submission_capacity * sizeof(*flow->submissions));
         flow->num_submissions = 0;
@@ -967,8 +1011,8 @@ static void clear_member_pending_slots(quicly_flexicast_flow_t *flow, size_t mem
     if (from_pn < window_start)
         from_pn = window_start;
     for (uint64_t cursor = from_pn; cursor < flow->next_packet_number; ++cursor) {
-        quicly_flexicast_sent_t *sent = flow->sent + cursor % QUICLY_FLEXICAST_SENT_WINDOW;
-        if (sent->pending_count != 0 && sent->packet_number == cursor)
+        quicly_flexicast_sent_t *sent = get_sent(flow, cursor);
+        if (sent != NULL && sent->pending_count != 0 && sent->packet_number == cursor)
             (void)sent_clear_member(flow, sent, member_index);
     }
 }
@@ -991,8 +1035,9 @@ static void compute_member_cc_pending(quicly_flexicast_flow_t *flow, size_t memb
     if (cursor < floor)
         cursor = floor;
     while (cursor < flow->next_packet_number) {
-        const quicly_flexicast_sent_t *sent = flow->sent + cursor % QUICLY_FLEXICAST_SENT_WINDOW;
-        if (sent->pending_count != 0 && sent->packet_number == cursor && sent_has_member(flow, sent, member_index)) {
+        const quicly_flexicast_sent_t *sent = get_sent(flow, cursor);
+        if (sent != NULL && sent->pending_count != 0 && sent->packet_number == cursor &&
+            sent_has_member(flow, sent, member_index)) {
             member->cc_pending_cursor = cursor;
             flexicast_submission_t *sub = find_submission(flow, cursor, member_index);
             *has_pending = 1;
@@ -1194,7 +1239,10 @@ int quicly_flexicast_send_datagram(quicly_flexicast_flow_t *flow, ptls_iovec_t p
         return QUICLY_FLEXICAST_ERROR_INVALID;
 
     pn = flow->next_packet_number;
-    sent = flow->sent + pn % QUICLY_FLEXICAST_SENT_WINDOW;
+    flexicast_sent_block_t **block = &flow->sent[sent_block_index(pn)];
+    if (*block == NULL && (*block = calloc(1, sent_block_size(flow->member_word_count))) == NULL)
+        return QUICLY_FLEXICAST_ERROR_NO_MEMORY;
+    sent = &(*block)->packets[pn % FLEXICAST_SENT_BLOCK_SIZE];
     if (sent->pending_count != 0 && sent->packet_number != pn) {
         if (sent->checked_suspend_epoch != flow->suspend_epoch) {
             retire_inactive_slot_obligations(flow, sent);
@@ -1257,8 +1305,8 @@ static int64_t member_lim_retention_floor(quicly_flexicast_flow_t *flow, size_t 
     if (cursor < win_start)
         cursor = win_start;
     while (cursor < flow->next_packet_number) {
-        const quicly_flexicast_sent_t *s = flow->sent + cursor % QUICLY_FLEXICAST_SENT_WINDOW;
-        if (s->pending_count != 0 && s->packet_number == cursor && sent_has_member(flow, s, member_index)) {
+        const quicly_flexicast_sent_t *s = get_sent(flow, cursor);
+        if (s != NULL && s->pending_count != 0 && s->packet_number == cursor && sent_has_member(flow, s, member_index)) {
             member->cc_pending_cursor = cursor;
             flexicast_submission_t *sub = find_submission(flow, cursor, member_index);
             int64_t s_at = sub != NULL ? sub->submitted_at : s->rtt_untracked ? 0 : s->sent_at;
@@ -1278,8 +1326,8 @@ int quicly_flexicast_mark_submitted(quicly_flexicast_flow_t *flow, uint64_t memb
         return QUICLY_FLEXICAST_ERROR_INVALID;
     if (flow->sent == NULL)
         return QUICLY_FLEXICAST_ERROR_NOT_FOUND;
-    quicly_flexicast_sent_t *sent = flow->sent + packet_number % QUICLY_FLEXICAST_SENT_WINDOW;
-    if (sent->pending_count == 0 || sent->packet_number != packet_number)
+    quicly_flexicast_sent_t *sent = get_sent(flow, packet_number);
+    if (sent == NULL || sent->pending_count == 0 || sent->packet_number != packet_number)
         return QUICLY_FLEXICAST_ERROR_NOT_FOUND;
     int member_index = member_id != 0 ? find_member(flow, member_id) : -1;
     if (member_id != 0 && (member_index < 0 || !sent_has_member(flow, sent, (size_t)member_index)))
@@ -1743,11 +1791,12 @@ static int acknowledge_packet(quicly_flexicast_flow_t *flow, int member_index, u
                               quicly_flexicast_feedback_t *feedback, flexicast_delivery_sample_t *observation,
                               size_t *num_completed, unsigned flags, size_t *total_acked)
 {
-    quicly_flexicast_sent_t *sent = flow->sent + packet_number % QUICLY_FLEXICAST_SENT_WINDOW;
+    quicly_flexicast_sent_t *sent = get_sent(flow, packet_number);
     quicly_flexicast_member_t *member = flow->members + member_index;
     quicly_flexicast_member_stats_t *stats = &member->stats;
 
-    if (sent->pending_count == 0 || sent->packet_number != packet_number || !sent_has_member(flow, sent, (size_t)member_index))
+    if (sent == NULL || sent->pending_count == 0 || sent->packet_number != packet_number ||
+        !sent_has_member(flow, sent, (size_t)member_index))
         return 0;
     if (packet_number >= member->path_sample_floor) {
         flexicast_submission_t *submission = find_submission(flow, packet_number, (size_t)member_index);
@@ -1924,8 +1973,8 @@ static size_t retire_loss_range(quicly_flexicast_flow_t *flow, int member_index,
 {
     size_t retired = 0;
     for (uint64_t packet_number = start_pn;; ++packet_number) {
-        quicly_flexicast_sent_t *sent = flow->sent + packet_number % QUICLY_FLEXICAST_SENT_WINDOW;
-        if (sent->pending_count != 0 && sent->packet_number == packet_number &&
+        quicly_flexicast_sent_t *sent = get_sent(flow, packet_number);
+        if (sent != NULL && sent->pending_count != 0 && sent->packet_number == packet_number &&
             sent_clear_member(flow, sent, (size_t)member_index)) {
             ++retired;
             ++flow->members[member_index].stats.lost_packets;
@@ -1976,8 +2025,8 @@ int quicly_flexicast_ack_packet(quicly_flexicast_flow_t *flow, uint64_t member_i
 
     if (flow == NULL || complete == NULL || flow->sent == NULL || (member_index = find_known_member(flow, member_id)) < 0)
         return QUICLY_FLEXICAST_ERROR_NOT_FOUND;
-    sent = flow->sent + packet_number % QUICLY_FLEXICAST_SENT_WINDOW;
-    if (sent->pending_count == 0 || sent->packet_number != packet_number)
+    sent = get_sent(flow, packet_number);
+    if (sent == NULL || sent->pending_count == 0 || sent->packet_number != packet_number)
         return QUICLY_FLEXICAST_ERROR_NOT_FOUND;
     if (!sent_has_member(flow, sent, (size_t)member_index))
         return QUICLY_FLEXICAST_ERROR_REPLAY;
@@ -2129,8 +2178,8 @@ int quicly_flexicast_get_pending_members(const quicly_flexicast_flow_t *flow, ui
         return QUICLY_FLEXICAST_ERROR_INVALID;
     if (flow->sent == NULL)
         return QUICLY_FLEXICAST_ERROR_NOT_FOUND;
-    sent = flow->sent + packet_number % QUICLY_FLEXICAST_SENT_WINDOW;
-    if (sent->pending_count == 0 || sent->packet_number != packet_number)
+    sent = get_sent(flow, packet_number);
+    if (sent == NULL || sent->pending_count == 0 || sent->packet_number != packet_number)
         return QUICLY_FLEXICAST_ERROR_NOT_FOUND;
     *pending = sent->pending_count;
     return QUICLY_FLEXICAST_OK;
@@ -2142,8 +2191,8 @@ int quicly_flexicast_abandon_datagram(quicly_flexicast_flow_t *flow, uint64_t me
     quicly_flexicast_sent_t *sent;
     if (flow == NULL || complete == NULL || flow->sent == NULL || (member_index = find_known_member(flow, member_id)) < 0)
         return QUICLY_FLEXICAST_ERROR_NOT_FOUND;
-    sent = flow->sent + packet_number % QUICLY_FLEXICAST_SENT_WINDOW;
-    if (sent->pending_count == 0 || sent->packet_number != packet_number)
+    sent = get_sent(flow, packet_number);
+    if (sent == NULL || sent->pending_count == 0 || sent->packet_number != packet_number)
         return QUICLY_FLEXICAST_ERROR_NOT_FOUND;
     if (!sent_has_member(flow, sent, (size_t)member_index))
         return QUICLY_FLEXICAST_ERROR_REPLAY;
