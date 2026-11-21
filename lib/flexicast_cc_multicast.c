@@ -5,9 +5,14 @@
 #include <stdlib.h>
 #include <string.h>
 
+#define MULTICAST_NO_SLOT UINT32_MAX
+
 typedef struct st_multicast_member_t {
     uint64_t id;
     uint64_t rate;
+    uint64_t growth_remainder;
+    uint64_t min_expected_pn;
+    uint64_t highest_acked_pn;
     uint32_t minimum_rtt;
     uint32_t smoothed_rtt;
     uint64_t last_feedback_epoch;
@@ -16,6 +21,9 @@ typedef struct st_multicast_member_t {
     int64_t last_loss_reduction;
     int64_t last_ecn_reduction;
     uint32_t unanswered_feedback_probes;
+    uint32_t prev_inactive;
+    uint32_t next_inactive;
+    int has_acked_in_epoch;
     int rtt_congested;
     int active;
     size_t rate_heap_index;
@@ -28,6 +36,12 @@ typedef struct st_multicast_state_t {
     size_t *rate_heap;
     size_t *timeout_heap;
     size_t num_members;
+    uint32_t inactive_head;
+    uint32_t inactive_tail;
+    uint64_t last_sent_pn;
+    int64_t first_send_at;
+    int64_t last_sent_at;
+    int has_sent_packets;
     flexicast_member_map_t member_map;
 } multicast_state_t;
 
@@ -52,6 +66,60 @@ static inline uint64_t increase_rate(uint64_t rate, uint64_t increase)
     return UINT64_MAX - rate < increase ? UINT64_MAX : rate + increase;
 }
 
+/* compute floor((delivered * gain + *remainder) / window) without 64-bit overflow */
+static uint64_t proportional_rate_increase(uint64_t delivered, uint64_t gain, uint64_t window, uint64_t *remainder)
+{
+    uint64_t whole = delivered / window, rem_delivered = delivered % window;
+    if (whole != 0 && gain > UINT64_MAX / whole) {
+        *remainder = 0;
+        return UINT64_MAX;
+    }
+    uint64_t base_inc = whole * gain;
+    /* split gain = q * window + r so rem_delivered * r fits or decomposes cleanly */
+    uint64_t q = gain / window, r = gain % window;
+    uint64_t sub_inc = rem_delivered * q;
+    uint64_t prod_hi = 0, prod_lo = 0;
+#if defined(__SIZEOF_INT128__)
+    unsigned __int128 total = (unsigned __int128)rem_delivered * r + *remainder;
+    sub_inc += (uint64_t)(total / window);
+    *remainder = (uint64_t)(total % window);
+#else
+    /* portable 64-bit fallback when 128-bit integers are unavailable */
+    uint64_t a_hi = rem_delivered >> 32, a_lo = rem_delivered & UINT32_MAX;
+    uint64_t b_hi = r >> 32, b_lo = r & UINT32_MAX;
+    uint64_t mid1 = a_hi * b_lo, mid2 = a_lo * b_hi;
+    prod_lo = a_lo * b_lo;
+    prod_hi = a_hi * b_hi + (mid1 >> 32) + (mid2 >> 32);
+    uint64_t mid_lo = (mid1 & UINT32_MAX) + (mid2 & UINT32_MAX) + (prod_lo >> 32);
+    prod_hi += mid_lo >> 32;
+    prod_lo = (mid_lo << 32) | (prod_lo & UINT32_MAX);
+    if (UINT64_MAX - prod_lo < *remainder)
+        ++prod_hi;
+    prod_lo += *remainder;
+    uint64_t rem = 0;
+    for (int bit = 63; bit >= 0; --bit) {
+        rem = (rem << 1) | ((prod_hi >> bit) & 1);
+        if (rem >= window)
+            rem -= window;
+    }
+    uint64_t quot = 0;
+    for (int bit = 63; bit >= 0; --bit) {
+        int carry = (rem >> 63) != 0;
+        rem = (rem << 1) | ((prod_lo >> bit) & 1);
+        quot <<= 1;
+        if (carry || rem >= window) {
+            rem -= window;
+            quot |= 1;
+        }
+    }
+    sub_inc += quot;
+    *remainder = rem;
+#endif
+    (void)prod_hi;
+    (void)prod_lo;
+    return increase_rate(base_inc, sub_inc);
+}
+
 static inline int queue_delay_grew(uint32_t minimum_rtt, uint32_t latest_rtt)
 {
     uint32_t margin = minimum_rtt / 4;
@@ -60,15 +128,53 @@ static inline int queue_delay_grew(uint32_t minimum_rtt, uint32_t latest_rtt)
     return minimum_rtt != 0 && (uint64_t)latest_rtt > (uint64_t)minimum_rtt + margin;
 }
 
-static int64_t member_timeout(const multicast_state_t *state, const multicast_member_t *member)
+static int64_t member_timeout_base(const multicast_member_t *member)
 {
-    int64_t base;
-    if (!member->active)
+    return member->last_feedback > member->last_timeout_probe ? member->last_feedback : member->last_timeout_probe;
+}
+
+/* monotone clamp by first_send_at preserves timeout_heap ordering without O(N) updates on send */
+static int64_t member_deadline(const multicast_state_t *state, const multicast_member_t *member)
+{
+    if (!member->active || !state->has_sent_packets)
         return INT64_MAX;
-    base = member->last_feedback > member->last_timeout_probe ? member->last_feedback : member->last_timeout_probe;
-    return base > INT64_MAX - state->super.config.feedback_timeout_msec
-               ? INT64_MAX
-               : base + state->super.config.feedback_timeout_msec;
+    int64_t base = member_timeout_base(member);
+    if (base < state->first_send_at)
+        base = state->first_send_at;
+    return base > INT64_MAX - state->super.config.feedback_timeout_msec ? INT64_MAX
+                                                                        : base + state->super.config.feedback_timeout_msec;
+}
+
+static int member_awaiting_feedback(const multicast_state_t *state, const multicast_member_t *member)
+{
+    return member->active && state->has_sent_packets && state->last_sent_pn >= member->min_expected_pn &&
+           (!member->has_acked_in_epoch || member->highest_acked_pn < state->last_sent_pn);
+}
+
+static void inactive_push_back(multicast_state_t *state, uint32_t slot)
+{
+    multicast_member_t *m = state->members + slot;
+    m->prev_inactive = state->inactive_tail;
+    m->next_inactive = MULTICAST_NO_SLOT;
+    if (state->inactive_tail != MULTICAST_NO_SLOT)
+        state->members[state->inactive_tail].next_inactive = slot;
+    else
+        state->inactive_head = slot;
+    state->inactive_tail = slot;
+}
+
+static void inactive_unlink(multicast_state_t *state, uint32_t slot)
+{
+    multicast_member_t *m = state->members + slot;
+    if (m->prev_inactive != MULTICAST_NO_SLOT)
+        state->members[m->prev_inactive].next_inactive = m->next_inactive;
+    else if (state->inactive_head == slot)
+        state->inactive_head = m->next_inactive;
+    if (m->next_inactive != MULTICAST_NO_SLOT)
+        state->members[m->next_inactive].prev_inactive = m->prev_inactive;
+    else if (state->inactive_tail == slot)
+        state->inactive_tail = m->prev_inactive;
+    m->prev_inactive = m->next_inactive = MULTICAST_NO_SLOT;
 }
 
 static size_t *heap_storage(multicast_state_t *state, multicast_heap_type_t type)
@@ -89,10 +195,10 @@ static int heap_less(const multicast_state_t *state, multicast_heap_type_t type,
     if (type == MULTICAST_HEAP_RATE) {
         if (left->rate != right->rate)
             return left->rate < right->rate;
-    } else {
-        int64_t left_timeout = member_timeout(state, left), right_timeout = member_timeout(state, right);
-        if (left_timeout != right_timeout)
-            return left_timeout < right_timeout;
+    } else if (left->active) {
+        int64_t left_base = member_timeout_base(left), right_base = member_timeout_base(right);
+        if (left_base != right_base)
+            return left_base < right_base;
     }
     return left->id < right->id;
 }
@@ -169,11 +275,25 @@ static multicast_member_t *find_member(multicast_state_t *state, uint64_t id)
 static void remove_member_slot(multicast_state_t *state, multicast_member_t *member)
 {
     size_t slot = (size_t)(member - state->members), last = state->num_members - 1;
+    if (!member->active)
+        inactive_unlink(state, (uint32_t)slot);
     flexicast_member_map_remove(&state->member_map, member->id);
     heap_remove(state, MULTICAST_HEAP_RATE, member);
     heap_remove(state, MULTICAST_HEAP_TIMEOUT, member);
     if (slot != last) {
+        int moved_inactive = !state->members[last].active;
+        uint32_t prev = state->members[last].prev_inactive, next = state->members[last].next_inactive;
         state->members[slot] = state->members[last];
+        if (moved_inactive) {
+            if (prev != MULTICAST_NO_SLOT)
+                state->members[prev].next_inactive = (uint32_t)slot;
+            else
+                state->inactive_head = (uint32_t)slot;
+            if (next != MULTICAST_NO_SLOT)
+                state->members[next].prev_inactive = (uint32_t)slot;
+            else
+                state->inactive_tail = (uint32_t)slot;
+        }
         flexicast_member_map_set(&state->member_map, state->members[slot].id, slot);
         state->rate_heap[state->members[slot].rate_heap_index] = slot;
         state->timeout_heap[state->members[slot].timeout_heap_index] = slot;
@@ -187,7 +307,9 @@ static multicast_member_t *add_member(multicast_state_t *state, uint64_t id, int
     multicast_member_t *member = find_member(state, id);
     if (member != NULL) {
         if (!member->active) {
+            inactive_unlink(state, (uint32_t)(member - state->members));
             member->active = 1;
+            member->min_expected_pn = state->has_sent_packets && state->last_sent_pn < UINT64_MAX ? state->last_sent_pn + 1 : 0;
             member->last_feedback = now;
             member->last_timeout_probe = now;
             member->unanswered_feedback_probes = 0;
@@ -197,19 +319,17 @@ static multicast_member_t *add_member(multicast_state_t *state, uint64_t id, int
         return member;
     }
     if (state->num_members == state->super.config.maximum_members) {
-        for (size_t i = 0; i != state->num_members; ++i) {
-            if (!state->members[i].active) {
-                remove_member_slot(state, state->members + i);
-                break;
-            }
-        }
-        if (state->num_members == state->super.config.maximum_members)
+        if (state->inactive_head == MULTICAST_NO_SLOT)
             return NULL;
+        remove_member_slot(state, state->members + state->inactive_head);
     }
     flexicast_member_map_set(&state->member_map, id, state->num_members);
     member = state->members + state->num_members++;
+    memset(member, 0, sizeof(*member));
     member->id = id;
     member->active = 1;
+    member->prev_inactive = member->next_inactive = MULTICAST_NO_SLOT;
+    member->min_expected_pn = state->has_sent_packets && state->last_sent_pn < UINT64_MAX ? state->last_sent_pn + 1 : 0;
     member->rate = quicly_flexicast_cc_clamp_rate(&state->super.config, state->super.config.startup_rate_bytes_per_second);
     member->last_feedback = now;
     member->last_timeout_probe = now;
@@ -226,7 +346,7 @@ static void update_output(multicast_state_t *state, int64_t now, uint32_t reason
     multicast_member_t *limiting = state->num_members != 0 ? state->members + state->rate_heap[0] : NULL;
     if (limiting != NULL && !limiting->active)
         limiting = NULL;
-    int64_t next_timeout = state->num_members != 0 ? member_timeout(state, state->members + state->timeout_heap[0]) : INT64_MAX;
+    int64_t next_timeout = state->num_members != 0 ? member_deadline(state, state->members + state->timeout_heap[0]) : INT64_MAX;
     uint64_t rate = limiting != NULL          ? limiting->rate
                     : state->num_members != 0 ? output->rate_bytes_per_second
                                               : state->super.config.startup_rate_bytes_per_second;
@@ -241,15 +361,16 @@ static void update_output(multicast_state_t *state, int64_t now, uint32_t reason
     output->burst_bytes = burst;
     output->inflight_bytes = inflight;
     output->limiting_member_id = limiting != NULL ? limiting->id : 0;
-    output->next_timeout = next_timeout > now ? next_timeout : now;
+    output->next_timeout = next_timeout == INT64_MAX ? INT64_MAX : (next_timeout > now ? next_timeout : now);
     output->reason = reason;
 }
 
-static void multicast_on_member_added(quicly_flexicast_cc_t *cc, uint64_t member_id, int64_t now)
+static int multicast_on_member_added(quicly_flexicast_cc_t *cc, uint64_t member_id, int64_t now)
 {
     multicast_state_t *state = (multicast_state_t *)cc;
-    (void)add_member(state, member_id, now);
+    multicast_member_t *member = add_member(state, member_id, now);
     update_output(state, now, QUICLY_FLEXICAST_CC_REASON_NONE);
+    return member != NULL ? 0 : -1;
 }
 
 static void multicast_on_member_removed(quicly_flexicast_cc_t *cc, uint64_t member_id, int64_t now)
@@ -267,6 +388,7 @@ static void multicast_on_member_suspended(quicly_flexicast_cc_t *cc, uint64_t me
     multicast_member_t *member = find_member(state, member_id);
     if (member != NULL && member->active) {
         member->active = 0;
+        inactive_push_back(state, (uint32_t)(member - state->members));
         heap_update(state, MULTICAST_HEAP_RATE, member);
         heap_update(state, MULTICAST_HEAP_TIMEOUT, member);
     }
@@ -276,7 +398,15 @@ static void multicast_on_member_suspended(quicly_flexicast_cc_t *cc, uint64_t me
 static void multicast_on_epoch_reset(quicly_flexicast_cc_t *cc, int64_t now)
 {
     multicast_state_t *state = (multicast_state_t *)cc;
+    state->has_sent_packets = 0;
+    state->last_sent_pn = 0;
+    state->first_send_at = 0;
+    state->last_sent_at = 0;
     for (size_t i = 0; i != state->num_members; ++i) {
+        state->members[i].growth_remainder = 0;
+        state->members[i].min_expected_pn = 0;
+        state->members[i].highest_acked_pn = 0;
+        state->members[i].has_acked_in_epoch = 0;
         state->members[i].last_feedback = now;
         state->members[i].last_feedback_epoch = 0;
         state->members[i].last_timeout_probe = now;
@@ -287,6 +417,23 @@ static void multicast_on_epoch_reset(quicly_flexicast_cc_t *cc, int64_t now)
         heap_update(state, MULTICAST_HEAP_TIMEOUT, state->members + i);
     }
     update_output(state, now, QUICLY_FLEXICAST_CC_REASON_NONE);
+}
+
+static void multicast_on_packet_sent(quicly_flexicast_cc_t *cc, uint64_t packet_number, size_t packet_size, int64_t now)
+{
+    multicast_state_t *state = (multicast_state_t *)cc;
+    int first = !state->has_sent_packets;
+    (void)packet_size;
+    if (first) {
+        state->has_sent_packets = 1;
+        state->first_send_at = now;
+        state->last_sent_pn = packet_number;
+    } else if (packet_number > state->last_sent_pn) {
+        state->last_sent_pn = packet_number;
+    }
+    state->last_sent_at = now;
+    if (first)
+        update_output(state, now, state->super.output.reason);
 }
 
 static int reduction_epoch_ready(const multicast_state_t *state, int64_t previous, int64_t now)
@@ -308,6 +455,11 @@ static void multicast_on_feedback(quicly_flexicast_cc_t *cc, const quicly_flexic
     }
     if (feedback->epoch != 0)
         member->last_feedback_epoch = feedback->epoch;
+    if (feedback->acked_packets != 0 || feedback->lost_packets != 0 || feedback->ecn_ce_count != 0) {
+        if (!member->has_acked_in_epoch || feedback->largest_acknowledged > member->highest_acked_pn)
+            member->highest_acked_pn = feedback->largest_acknowledged;
+        member->has_acked_in_epoch = 1;
+    }
     if (feedback->minimum_rtt_msec != 0)
         member->minimum_rtt = feedback->minimum_rtt_msec;
     if (feedback->smoothed_rtt_msec != 0)
@@ -318,28 +470,47 @@ static void multicast_on_feedback(quicly_flexicast_cc_t *cc, const quicly_flexic
     if (feedback->ecn_ce_count != 0) {
         if (reduction_epoch_ready(state, member->last_ecn_reduction, feedback->now)) {
             member->rate = member->rate - scale_rate(member->rate, 15, 100);
+            member->growth_remainder = 0;
             member->last_ecn_reduction = feedback->now;
         }
         reason |= QUICLY_FLEXICAST_CC_REASON_ECN;
     } else if (feedback->lost_packets != 0) {
         if (reduction_epoch_ready(state, member->last_loss_reduction, feedback->now)) {
             member->rate = scale_rate(member->rate, 7, 10);
+            member->growth_remainder = 0;
             member->last_loss_reduction = feedback->now;
         }
         reason |= QUICLY_FLEXICAST_CC_REASON_LOSS;
     } else if (queue_delay_grew(member->minimum_rtt, feedback->latest_rtt_msec)) {
         /* treat one elevated queue episode as a single reduction until normal RTT rearms */
-        if (!member->rtt_congested)
+        if (!member->rtt_congested) {
             member->rate = scale_rate(member->rate, 7, 10);
+            member->growth_remainder = 0;
+        }
         member->rtt_congested = 1;
         reason |= QUICLY_FLEXICAST_CC_REASON_RTT;
     } else if (feedback->acked_packets != 0) {
         member->rtt_congested = 0;
-        uint32_t rtt = member->smoothed_rtt != 0 ? member->smoothed_rtt : 100;
-        uint64_t increase = (uint64_t)state->super.config.maximum_datagram_size * 1000 / rtt;
-        if (increase < member->rate / 20)
-            increase = member->rate / 20;
-        member->rate = increase_rate(member->rate, increase);
+        uint64_t mss = state->super.config.maximum_datagram_size;
+        uint64_t delivered = feedback->acked_bytes != 0                   ? feedback->acked_bytes
+                             : feedback->acked_packets > UINT64_MAX / mss ? UINT64_MAX
+                                                                          : feedback->acked_packets * mss;
+        int sample_limited =
+            feedback->delivery_rate_sample_epoch != 0 &&
+            (feedback->delivery_sample_flags & (QUICLY_FLEXICAST_SAMPLE_APP_LIMITED | QUICLY_FLEXICAST_SAMPLE_HOST_LIMITED)) != 0 &&
+            feedback->delivery_rate_bytes_per_second < member->rate;
+        if (delivered != 0 && !sample_limited) {
+            uint32_t rtt = member->smoothed_rtt != 0 ? member->smoothed_rtt : 100;
+            uint64_t min_window = mss * 4;
+            uint64_t window = member->rate > UINT64_MAX / rtt ? UINT64_MAX : member->rate * rtt / 1000;
+            if (window < min_window)
+                window = min_window;
+            uint64_t gain = mss * 1000 / rtt;
+            if (gain < member->rate / 20)
+                gain = member->rate / 20;
+            uint64_t inc = proportional_rate_increase(delivered, gain, window, &member->growth_remainder);
+            member->rate = increase_rate(member->rate, inc);
+        }
         reason |= QUICLY_FLEXICAST_CC_REASON_ACK;
     }
     member->rate = quicly_flexicast_cc_clamp_rate(&state->super.config, member->rate);
@@ -352,29 +523,39 @@ static void multicast_on_timeout(quicly_flexicast_cc_t *cc, int64_t now)
 {
     multicast_state_t *state = (multicast_state_t *)cc;
     int reduced = 0;
+    if (!state->has_sent_packets) {
+        update_output(state, now, QUICLY_FLEXICAST_CC_REASON_NONE);
+        return;
+    }
     while (state->num_members != 0) {
         multicast_member_t *member = state->members + state->timeout_heap[0];
-        int64_t deadline = member_timeout(state, member);
+        int64_t deadline = member_deadline(state, member);
         if (deadline == INT64_MAX || deadline > now)
             break;
         member->last_timeout_probe = now;
-        if (++member->unanswered_feedback_probes >= 3) {
-            member->rate = quicly_flexicast_cc_clamp_rate(&state->super.config, member->rate / 2);
+        if (member_awaiting_feedback(state, member)) {
+            if (++member->unanswered_feedback_probes >= 3) {
+                member->rate = quicly_flexicast_cc_clamp_rate(&state->super.config, member->rate / 2);
+                member->growth_remainder = 0;
+                member->unanswered_feedback_probes = 0;
+                heap_update(state, MULTICAST_HEAP_RATE, member);
+                reduced = 1;
+            }
+        } else {
             member->unanswered_feedback_probes = 0;
-            heap_update(state, MULTICAST_HEAP_RATE, member);
-            reduced = 1;
         }
         heap_update(state, MULTICAST_HEAP_TIMEOUT, member);
     }
     update_output(state, now, reduced ? QUICLY_FLEXICAST_CC_REASON_TIMEOUT : QUICLY_FLEXICAST_CC_REASON_NONE);
 }
 
-quicly_flexicast_cc_type_t quicly_flexicast_cc_type_multicast = {
+static quicly_flexicast_cc_type_t quicly_flexicast_cc_type_multicast = {
     .name = "multicast",
     .on_member_added = multicast_on_member_added,
     .on_member_removed = multicast_on_member_removed,
     .on_member_suspended = multicast_on_member_suspended,
     .on_epoch_reset = multicast_on_epoch_reset,
+    .on_packet_sent = multicast_on_packet_sent,
     .on_feedback = multicast_on_feedback,
     .on_timeout = multicast_on_timeout,
 };
@@ -385,6 +566,7 @@ quicly_flexicast_cc_t *quicly_flexicast_cc_new_multicast(const quicly_flexicast_
 
     if ((state = calloc(1, sizeof(*state))) == NULL)
         return NULL;
+    state->inactive_head = state->inactive_tail = MULTICAST_NO_SLOT;
     if (quicly_flexicast_cc_init(&state->super, &quicly_flexicast_cc_type_multicast, config) != 0 ||
         (state->members = calloc(state->super.config.maximum_members, sizeof(*state->members))) == NULL ||
         (state->rate_heap = malloc(state->super.config.maximum_members * sizeof(*state->rate_heap))) == NULL ||

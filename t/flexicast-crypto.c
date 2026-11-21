@@ -5,8 +5,9 @@
 
 static quicly_flexicast_config_t crypto_config(const uint8_t *secret)
 {
+    static const uint8_t fid[5] = {0x01, 0x00, 0x00, 0x00, 0x01};
     return (quicly_flexicast_config_t){
-        .flow_id = UINT64_C(0x100000001),
+        .flow_id = quicly_flexicast_flow_id_init(fid, sizeof(fid)),
         .cipher_suite = &ptls_openssl_aes128gcmsha256,
         .crypto_engine = &quicly_default_crypto_engine,
         .traffic_secret = ptls_iovec_init(secret, ptls_openssl_aes128gcmsha256.hash->digest_size),
@@ -48,17 +49,27 @@ static void test_encryption_budget_and_rekey(void)
     ok(quicly_flexicast_get_crypto_usage(flow, &usage) == QUICLY_FLEXICAST_OK && usage.encrypted_packets == 1);
     ok(quicly_flexicast_attach(flow, 1, 1) == QUICLY_FLEXICAST_OK);
     send_and_release(flow, 60001);
-    send_and_release(flow, 60002);
-    ok(quicly_flexicast_send_datagram(flow, ptls_iovec_init(NULL, 0), packet, sizeof(packet), &size, &pn, 1) ==
-       QUICLY_FLEXICAST_ERROR_KEY_UPDATE_REQUIRED);
-    ok(quicly_flexicast_get_next_packet_number(flow) == 60003);
-    ok(quicly_flexicast_flow_rekey(flow, ptls_iovec_init(secrets[0], 32), 60003, 2) == QUICLY_FLEXICAST_ERROR_KEY_UPDATE_REQUIRED);
-    ok(quicly_flexicast_num_members(flow) == 1);
 
-    /* rekeying to fresh secrets resets per-key encryption budget in O(1) space */
-    ok(quicly_flexicast_flow_rekey(flow, ptls_iovec_init(secrets[1], 32), 60003, 3) == QUICLY_FLEXICAST_OK);
+    /* rotating A -> B -> A preserves A's remaining budget instead of resetting it */
+    ok(quicly_flexicast_flow_rekey(flow, ptls_iovec_init(secrets[1], 32), 60002, 2) == QUICLY_FLEXICAST_OK);
     ok(quicly_flexicast_get_crypto_usage(flow, &usage) == QUICLY_FLEXICAST_OK && usage.encrypted_packets == 0);
-    uint64_t next_pn = 60003;
+    ok(quicly_flexicast_attach(flow, 1, 2) == QUICLY_FLEXICAST_OK);
+    send_and_release(flow, 60002);
+    ok(quicly_flexicast_flow_rekey(flow, ptls_iovec_init(secrets[0], 32), 60003, 3) == QUICLY_FLEXICAST_OK);
+    ok(quicly_flexicast_get_crypto_usage(flow, &usage) == QUICLY_FLEXICAST_OK && usage.encrypted_packets == 2);
+    ok(quicly_flexicast_attach(flow, 1, 3) == QUICLY_FLEXICAST_OK);
+    send_and_release(flow, 60003);
+    ok(quicly_flexicast_send_datagram(flow, ptls_iovec_init(NULL, 0), packet, sizeof(packet), &size, &pn, 3) ==
+       QUICLY_FLEXICAST_ERROR_KEY_UPDATE_REQUIRED);
+    ok(quicly_flexicast_get_next_packet_number(flow) == 60004);
+    ok(quicly_flexicast_flow_rekey(flow, ptls_iovec_init(secrets[0], 32), 60004, 4) == QUICLY_FLEXICAST_ERROR_KEY_UPDATE_REQUIRED);
+
+    /* rotating back to B preserves B's prior count (1) and rejects exhausted A on return */
+    ok(quicly_flexicast_flow_rekey(flow, ptls_iovec_init(secrets[1], 32), 60004, 5) == QUICLY_FLEXICAST_OK);
+    ok(quicly_flexicast_get_crypto_usage(flow, &usage) == QUICLY_FLEXICAST_OK && usage.encrypted_packets == 1);
+    ok(quicly_flexicast_flow_rekey(flow, ptls_iovec_init(secrets[0], 32), 60004, 6) == QUICLY_FLEXICAST_ERROR_KEY_UPDATE_REQUIRED);
+
+    uint64_t next_pn = 60004;
     for (size_t i = 3; i != 130; ++i) {
         new_secret[0] = (uint8_t)i;
         ok(quicly_flexicast_flow_rekey(flow, ptls_iovec_init(new_secret, sizeof(new_secret)), next_pn, (int64_t)i) ==
@@ -296,10 +307,13 @@ static void test_decryption_budget_and_receive_floor(void)
        QUICLY_FLEXICAST_ERROR_AEAD_LIMIT_REACHED);
     ok(quicly_flexicast_flow_rekey(rx, ptls_iovec_init(secrets[0], 32), 70002, 2) == QUICLY_FLEXICAST_ERROR_AEAD_LIMIT_REACHED);
 
-    /* rekeying to a fresh secret resets per-key decryption attempts without allocating sender tables */
+    /* rekeying to a fresh secret resets per-key decryption attempts, while returning to secrets[0] stays blocked */
     ok(quicly_flexicast_flow_rekey(rx, ptls_iovec_init(secrets[1], 32), 70002, 2) == QUICLY_FLEXICAST_OK);
     ok(quicly_flexicast_get_crypto_usage(rx, &usage) == QUICLY_FLEXICAST_OK && usage.decryption_attempts == 0);
     ok(!quicly_flexicast_flow_has_sender_state(rx));
+    ok(quicly_flexicast_set_decryption_attempts(rx, 2) == QUICLY_FLEXICAST_OK);
+    ok(quicly_flexicast_flow_rekey(rx, ptls_iovec_init(secrets[0], 32), 70003, 3) == QUICLY_FLEXICAST_ERROR_AEAD_LIMIT_REACHED);
+    ok(quicly_flexicast_get_crypto_usage(rx, &usage) == QUICLY_FLEXICAST_OK && usage.decryption_attempts == 2);
 
     quicly_flexicast_flow_free(rx);
     quicly_flexicast_flow_free(tx);
@@ -324,22 +338,23 @@ static void test_invalid_pn_before_aead(void)
     ok(quicly_default_crypto_engine.setup_cipher(&quicly_default_crypto_engine, NULL, QUICLY_EPOCH_1RTT, 1, &hp, &aead,
                                                  ptls_openssl_aes128gcmsha256.aead, ptls_openssl_aes128gcmsha256.hash,
                                                  secret) == 0);
+    size_t fid_len = cfg.flow_id.len;
     packet[0] = QUICLY_QUIC_BIT | 1; /* 2-byte PN */
-    quicly_encode64(packet + 1, cfg.flow_id);
+    memcpy(packet + 1, cfg.flow_id.bytes, fid_len);
     /* PTLS_QUICINT_MAX has low 16 bits 0xffff; 0x0000 reconstructs to PTLS_QUICINT_MAX + 1 */
-    packet[9] = 0;
-    packet[10] = 0;
-    memset(packet + 11, 0x55, 20);
+    packet[1 + fid_len] = 0;
+    packet[2 + fid_len] = 0;
+    memset(packet + 3 + fid_len, 0x55, 20);
     uint8_t mask[5] = {0};
-    ptls_cipher_init(hp, packet + 13);
+    ptls_cipher_init(hp, packet + 1 + fid_len + QUICLY_MAX_PN_SIZE);
     ptls_cipher_encrypt(hp, mask, mask, sizeof(mask));
     packet[0] ^= mask[0] & 0x1f;
-    packet[9] ^= mask[1];
-    packet[10] ^= mask[2];
+    packet[1 + fid_len] ^= mask[1];
+    packet[2 + fid_len] ^= mask[2];
     ptls_cipher_free(hp);
     ptls_aead_free(aead);
 
-    ok(quicly_flexicast_receive_datagram(rx, packet, 31, &payload, &pn, 0, 0) == QUICLY_FLEXICAST_ERROR_INVALID);
+    ok(quicly_flexicast_receive_datagram(rx, packet, 23 + fid_len, &payload, &pn, 0, 0) == QUICLY_FLEXICAST_ERROR_INVALID);
     ok(quicly_flexicast_get_crypto_usage(rx, &usage) == QUICLY_FLEXICAST_OK);
     ok(usage.decryption_attempts == 0 && usage.authentication_failures == 0);
     quicly_flexicast_flow_free(rx);

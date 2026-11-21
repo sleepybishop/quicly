@@ -5,6 +5,8 @@
 #include "quicly/flexicast_cc.h"
 #include "../lib/flexicast_member_map.h"
 
+#include <time.h>
+
 static quicly_flexicast_cc_config_t regression_config(void)
 {
     return (quicly_flexicast_cc_config_t){.maximum_members = 64,
@@ -15,46 +17,113 @@ static quicly_flexicast_cc_config_t regression_config(void)
                                           .feedback_timeout_msec = 100};
 }
 
-static void test_multicast_zero_time(void)
+static void test_multicast_zero_time_and_idle(void)
 {
     quicly_flexicast_cc_config_t config = regression_config();
     quicly_flexicast_cc_t *cc = quicly_flexicast_cc_new_multicast(&config, 0);
     quicly_flexicast_cc_output_t output;
 
     ok(cc != NULL);
-    quicly_flexicast_cc_on_member_added(cc, 1, 0);
+    ok(quicly_flexicast_cc_on_member_added(cc, 1, 0) == 0);
+    quicly_flexicast_cc_get_output(cc, &output);
+    /* idle group has no packets awaiting feedback and does not decay its rate */
+    ok(output.next_timeout == INT64_MAX);
+    for (int64_t now = 100; now <= 600; now += 100)
+        quicly_flexicast_cc_on_timeout(cc, now);
+    quicly_flexicast_cc_get_output(cc, &output);
+    ok(output.rate_bytes_per_second == 100000 && output.reason == QUICLY_FLEXICAST_CC_REASON_NONE);
+
+    /* sending a packet arms the feedback deadline at 0 + 100 ms */
+    quicly_flexicast_cc_on_packet_sent(cc, 0, 1200, 0);
     quicly_flexicast_cc_get_output(cc, &output);
     ok(output.next_timeout == 100);
     for (int64_t now = 100; now <= 300; now += 100)
         quicly_flexicast_cc_on_timeout(cc, now);
     quicly_flexicast_cc_get_output(cc, &output);
     ok(output.rate_bytes_per_second == 50000 && output.reason == QUICLY_FLEXICAST_CC_REASON_TIMEOUT);
+
+    /* once the sent packet is acknowledged, further idle periods do not halve the rate */
+    quicly_flexicast_feedback_t caught_up = {
+        .member_id = 1, .epoch = 1, .largest_acknowledged = 0, .acked_packets = 1, .acked_bytes = 1200, .now = 310};
+    quicly_flexicast_cc_on_feedback(cc, &caught_up);
+    quicly_flexicast_cc_get_output(cc, &output);
+    uint64_t post_ack_rate = output.rate_bytes_per_second;
+    for (int64_t now = 410; now <= 1010; now += 100)
+        quicly_flexicast_cc_on_timeout(cc, now);
+    quicly_flexicast_cc_get_output(cc, &output);
+    ok(output.rate_bytes_per_second == post_ack_rate && output.reason == QUICLY_FLEXICAST_CC_REASON_NONE);
+
     quicly_flexicast_cc_on_epoch_reset(cc, 0);
     quicly_flexicast_cc_get_output(cc, &output);
-    ok(output.next_timeout == 100);
+    ok(output.next_timeout == INT64_MAX);
 
     quicly_flexicast_feedback_t feedback = {.member_id = 1, .epoch = 1, .lost_packets = 1, .now = 0};
     quicly_flexicast_cc_on_feedback(cc, &feedback);
     quicly_flexicast_cc_get_output(cc, &output);
-    ok(output.rate_bytes_per_second == 35000 && output.reason == QUICLY_FLEXICAST_CC_REASON_LOSS);
+    uint64_t after_loss = post_ack_rate * 7 / 10;
+    ok(output.rate_bytes_per_second == after_loss && output.reason == QUICLY_FLEXICAST_CC_REASON_LOSS);
     feedback.epoch = 2;
     feedback.now = 1;
     quicly_flexicast_cc_on_feedback(cc, &feedback);
     quicly_flexicast_cc_get_output(cc, &output);
-    ok(output.rate_bytes_per_second == 35000);
+    ok(output.rate_bytes_per_second == after_loss);
 
     quicly_flexicast_cc_on_epoch_reset(cc, 0);
     feedback = (quicly_flexicast_feedback_t){.member_id = 1, .epoch = 1, .ecn_ce_count = 1, .now = 0};
     quicly_flexicast_cc_on_feedback(cc, &feedback);
     quicly_flexicast_cc_get_output(cc, &output);
     uint64_t rate = output.rate_bytes_per_second;
-    ok(rate < 35000 && output.reason == QUICLY_FLEXICAST_CC_REASON_ECN);
+    ok(rate < after_loss && output.reason == QUICLY_FLEXICAST_CC_REASON_ECN);
     feedback.epoch = 2;
     feedback.now = 1;
     quicly_flexicast_cc_on_feedback(cc, &feedback);
     quicly_flexicast_cc_get_output(cc, &output);
     ok(output.rate_bytes_per_second == rate);
     quicly_flexicast_cc_free_multicast(cc);
+}
+
+static void test_multicast_ack_grouping_invariance(void)
+{
+    uint64_t rates[2] = {0};
+    for (int split = 0; split != 2; ++split) {
+        quicly_flexicast_cc_config_t config = regression_config();
+        quicly_flexicast_cc_t *cc = quicly_flexicast_cc_new_multicast(&config, 100);
+        quicly_flexicast_cc_output_t output;
+        ok(cc != NULL);
+        ok(quicly_flexicast_cc_on_member_added(cc, 1, 100) == 0);
+        if (!split) {
+            quicly_flexicast_feedback_t fb = {.member_id = 1,
+                                              .epoch = 1,
+                                              .largest_acknowledged = 7,
+                                              .acked_packets = 8,
+                                              .acked_bytes = 8 * 1200,
+                                              .minimum_rtt_msec = 20,
+                                              .latest_rtt_msec = 20,
+                                              .smoothed_rtt_msec = 20,
+                                              .now = 120};
+            quicly_flexicast_cc_on_feedback(cc, &fb);
+        } else {
+            for (uint64_t i = 0; i != 8; ++i) {
+                quicly_flexicast_feedback_t fb = {.member_id = 1,
+                                                  .epoch = i + 1,
+                                                  .largest_acknowledged = i,
+                                                  .acked_packets = 1,
+                                                  .acked_bytes = 1200,
+                                                  .minimum_rtt_msec = 20,
+                                                  .latest_rtt_msec = 20,
+                                                  .smoothed_rtt_msec = 20,
+                                                  .now = 120 + (int64_t)i};
+                quicly_flexicast_cc_on_feedback(cc, &fb);
+            }
+        }
+        quicly_flexicast_cc_get_output(cc, &output);
+        rates[split] = output.rate_bytes_per_second;
+        quicly_flexicast_cc_free_multicast(cc);
+    }
+    ok(rates[0] > 100000 && rates[1] > 100000);
+    /* 1x8-packet ACK and 8x1-packet ACKs for the same 9600 bytes stay tightly aligned */
+    uint64_t diff = rates[0] > rates[1] ? rates[0] - rates[1] : rates[1] - rates[0];
+    ok(diff <= rates[0] / 20);
 }
 
 static void test_multicast_feedback_epochs(void)
@@ -64,11 +133,13 @@ static void test_multicast_feedback_epochs(void)
     config.startup_rate_bytes_per_second = 2000000;
     quicly_flexicast_cc_t *cc = quicly_flexicast_cc_new_multicast(&config, 100);
     ok(cc != NULL);
-    quicly_flexicast_cc_on_member_added(cc, 1, 100);
-    quicly_flexicast_feedback_t feedback = {.member_id = 1, .epoch = 2, .lost_packets = 1, .now = 200};
+    ok(quicly_flexicast_cc_on_member_added(cc, 1, 100) == 0);
+    quicly_flexicast_cc_on_packet_sent(cc, 0, 1200, 150);
+    quicly_flexicast_feedback_t feedback = {.member_id = 1, .epoch = 2, .largest_acknowledged = 0, .lost_packets = 1, .now = 200};
     quicly_flexicast_cc_on_feedback(cc, &feedback);
     quicly_flexicast_cc_get_output(cc, &output);
     ok(output.rate_bytes_per_second == 700000); /* reduce the clamped starting rate */
+    quicly_flexicast_cc_on_packet_sent(cc, 1, 1200, 210);
     feedback.now = 400;
     quicly_flexicast_cc_on_feedback(cc, &feedback);
     feedback.epoch = 1;
@@ -88,6 +159,7 @@ static void test_multicast_feedback_epochs(void)
     feedback.epoch = 2;
     feedback.lost_packets = 0;
     feedback.acked_packets = 1;
+    feedback.acked_bytes = 1200;
     feedback.now = 530;
     quicly_flexicast_cc_on_feedback(cc, &feedback);
     quicly_flexicast_cc_get_output(cc, &output);
@@ -129,11 +201,12 @@ static void test_member_map_collisions(void)
 
 static quicly_flexicast_flow_t *create_regression_flow(quicly_flexicast_cc_t **out_cc)
 {
+    static const uint8_t fid[2] = {0x03, 0xe8};
     uint8_t secret[PTLS_MAX_DIGEST_SIZE] = {0};
     quicly_flexicast_cc_config_t cc_cfg = regression_config();
     quicly_flexicast_cc_t *cc = quicly_flexicast_cc_new_multicast(&cc_cfg, 100);
     quicly_flexicast_flow_t *flow = NULL;
-    quicly_flexicast_config_t config = {.flow_id = 1000,
+    quicly_flexicast_config_t config = {.flow_id = quicly_flexicast_flow_id_init(fid, sizeof(fid)),
                                         .cipher_suite = &ptls_openssl_aes128gcmsha256,
                                         .crypto_engine = &quicly_default_crypto_engine,
                                         .traffic_secret = ptls_iovec_init(secret, ptls_openssl_aes128gcmsha256.hash->digest_size),
@@ -182,7 +255,7 @@ static void test_rekey_inactive_members(void)
     /* suspended member 1 does not constrain rate or collect missing-feedback probes */
     ok(quicly_flexicast_attach(flow, 2, 1400) == QUICLY_FLEXICAST_OK);
     quicly_flexicast_cc_get_flow_output(flow, &output);
-    ok(output.next_timeout > 1400 && output.next_timeout != INT64_MAX);
+    ok(output.next_timeout == INT64_MAX);
     for (int64_t now = 1500; now <= 1700; now += 100) {
         ok(quicly_flexicast_send_datagram(flow, ptls_iovec_init(NULL, 0), packet, sizeof(packet), &size, &pn, now - 10) ==
            QUICLY_FLEXICAST_OK);
@@ -198,8 +271,41 @@ static void test_rekey_inactive_members(void)
     ok(quicly_flexicast_detach(flow, 2, 1800) == QUICLY_FLEXICAST_OK);
     ok(quicly_flexicast_attach(flow, 1, 1800) == QUICLY_FLEXICAST_OK);
     quicly_flexicast_cc_get_flow_output(flow, &output);
-    ok(output.rate_bytes_per_second == learned_rate && output.next_timeout > 1800);
+    ok(output.rate_bytes_per_second == learned_rate);
     ok(quicly_flexicast_get_member_stats(flow, 1, &stats) == QUICLY_FLEXICAST_OK && stats.delivered_packets == 1);
+    quicly_flexicast_flow_free(flow);
+    quicly_flexicast_cc_free_multicast(cc);
+}
+
+static void test_rekey_16k_member_replacement(void)
+{
+    static const uint8_t fid[4] = {0x16, 0x38, 0x40, 0x01};
+    uint8_t secret0[32] = {1}, secret1[32] = {2};
+    quicly_flexicast_cc_config_t cc_cfg = regression_config();
+    cc_cfg.maximum_members = QUICLY_FLEXICAST_HARD_MAX_MEMBERS;
+    quicly_flexicast_cc_t *cc = quicly_flexicast_cc_new_multicast(&cc_cfg, 0);
+    quicly_flexicast_flow_t *flow = NULL;
+    quicly_flexicast_config_t cfg = {.flow_id = quicly_flexicast_flow_id_init(fid, sizeof(fid)),
+                                     .cipher_suite = &ptls_openssl_aes128gcmsha256,
+                                     .crypto_engine = &quicly_default_crypto_engine,
+                                     .traffic_secret = ptls_iovec_init(secret0, sizeof(secret0)),
+                                     .max_members = QUICLY_FLEXICAST_HARD_MAX_MEMBERS,
+                                     .cc = cc};
+    ok(cc != NULL && quicly_flexicast_flow_create(&flow, &cfg) == QUICLY_FLEXICAST_OK);
+    int attached = 1;
+    for (uint64_t id = 1; id <= QUICLY_FLEXICAST_HARD_MAX_MEMBERS; ++id)
+        attached &= quicly_flexicast_attach(flow, id, 0) == QUICLY_FLEXICAST_OK;
+    ok(attached && quicly_flexicast_num_members(flow) == QUICLY_FLEXICAST_HARD_MAX_MEMBERS);
+    ok(quicly_flexicast_flow_rekey(flow, ptls_iovec_init(secret1, sizeof(secret1)), 1, 1) == QUICLY_FLEXICAST_OK);
+
+    clock_t start = clock();
+    int replaced = 1;
+    for (uint64_t id = 1; id <= QUICLY_FLEXICAST_HARD_MAX_MEMBERS; ++id)
+        replaced &= quicly_flexicast_attach(flow, QUICLY_FLEXICAST_HARD_MAX_MEMBERS + id, 2) == QUICLY_FLEXICAST_OK;
+    double elapsed_ms = (double)(clock() - start) * 1000.0 / CLOCKS_PER_SEC;
+    ok(replaced && quicly_flexicast_num_members(flow) == QUICLY_FLEXICAST_HARD_MAX_MEMBERS);
+    ok(elapsed_ms < 100.0);
+
     quicly_flexicast_flow_free(flow);
     quicly_flexicast_cc_free_multicast(cc);
 }
@@ -241,32 +347,61 @@ static void test_duplicate_ack_delivery_clock(void)
     }
 }
 
+typedef struct st_legacy_cc_t {
+    quicly_flexicast_cc_t super;
+    uint64_t active_member;
+} legacy_cc_t;
+
+static int legacy_on_member_added(quicly_flexicast_cc_t *_cc, uint64_t member_id, int64_t now)
+{
+    legacy_cc_t *cc = (legacy_cc_t *)_cc;
+    cc->active_member = member_id;
+    cc->super.output.limiting_member_id = member_id;
+    cc->super.output.next_timeout = now + cc->super.config.feedback_timeout_msec;
+    return 0;
+}
+
+static void legacy_on_member_removed(quicly_flexicast_cc_t *_cc, uint64_t member_id, int64_t now)
+{
+    legacy_cc_t *cc = (legacy_cc_t *)_cc;
+    (void)now;
+    if (cc->active_member == member_id) {
+        cc->active_member = 0;
+        cc->super.output.limiting_member_id = 0;
+        cc->super.output.next_timeout = INT64_MAX;
+    }
+}
+
 static void test_suspend_legacy_controller(void)
 {
-    struct st_quicly_flexicast_cc_type_t type = quicly_flexicast_cc_type_multicast;
+    static quicly_flexicast_cc_type_t type = {
+        .name = "legacy",
+        .on_member_added = legacy_on_member_added,
+        .on_member_removed = legacy_on_member_removed,
+    };
+    legacy_cc_t cc = {0};
     quicly_flexicast_cc_config_t config = regression_config();
-    quicly_flexicast_cc_t *cc = quicly_flexicast_cc_new_multicast(&config, 100);
     quicly_flexicast_cc_output_t output;
 
-    ok(cc != NULL);
-    type.on_member_suspended = NULL;
-    cc->type = &type;
-    quicly_flexicast_cc_on_member_added(cc, 1, 100);
-    quicly_flexicast_cc_on_member_suspended(cc, 1, 200);
-    quicly_flexicast_cc_get_output(cc, &output);
+    ok(quicly_flexicast_cc_init(&cc.super, &type, &config) == 0);
+    ok(quicly_flexicast_cc_on_member_added(&cc.super, 1, 100) == 0);
+    /* controller without on_member_suspended falls back cleanly to on_member_removed */
+    quicly_flexicast_cc_on_member_suspended(&cc.super, 1, 200);
+    quicly_flexicast_cc_get_output(&cc.super, &output);
     ok(output.next_timeout == INT64_MAX && output.limiting_member_id == 0);
-    quicly_flexicast_cc_on_member_added(cc, 1, 300);
-    quicly_flexicast_cc_get_output(cc, &output);
+    ok(quicly_flexicast_cc_on_member_added(&cc.super, 1, 300) == 0);
+    quicly_flexicast_cc_get_output(&cc.super, &output);
     ok(output.next_timeout == 400 && output.limiting_member_id == 1);
-    quicly_flexicast_cc_free_multicast(cc);
 }
 
 void test_flexicast_cc_regressions(void)
 {
-    subtest("multicast-zero-time", test_multicast_zero_time);
+    subtest("multicast-zero-time-and-idle", test_multicast_zero_time_and_idle);
+    subtest("multicast-ack-grouping-invariance", test_multicast_ack_grouping_invariance);
     subtest("multicast-feedback-epochs", test_multicast_feedback_epochs);
     subtest("member-map-collisions", test_member_map_collisions);
     subtest("rekey-inactive-members", test_rekey_inactive_members);
+    subtest("rekey-16k-member-replacement", test_rekey_16k_member_replacement);
     subtest("duplicate-ack-delivery-clock", test_duplicate_ack_delivery_clock);
     subtest("suspend-legacy-controller", test_suspend_legacy_controller);
 }

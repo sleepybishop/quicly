@@ -95,6 +95,8 @@ IF (BUILD_FLEXICAST)
         t/flexicast-cc-regression.c
         t/flexicast-crypto.c
         t/flexicast-packet.c)
+ELSE ()
+    SET(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -DQUICLY_HAVE_FLEXICAST=0")
 ENDIF ()
 
 IF (WITH_DTRACE)
@@ -142,12 +144,6 @@ ELSE ()
     TARGET_LINK_LIBRARIES(test.t quicly ${OPENSSL_CRYPTO_LIBRARIES} ${CMAKE_DL_LIBS})
 ENDIF ()
 
-IF (BUILD_FLEXICAST)
-    ADD_EXECUTABLE(flexicast-test.t ${PICOTLS_OPENSSL_FILES} deps/picotest/picotest.c t/flexicast.c t/flexicast-cc-regression.c
-        t/flexicast-crypto.c t/flexicast-packet.c t/flexicast-main.c)
-    TARGET_LINK_LIBRARIES(flexicast-test.t quicly-flexicast quicly ${OPENSSL_CRYPTO_LIBRARIES} ${CMAKE_DL_LIBS})
-ENDIF ()
-
 ADD_EXECUTABLE(simulator ${PICOTLS_OPENSSL_FILES} ${QUICLY_LIBRARY_FILES} t/simulator.c)
 TARGET_LINK_LIBRARIES(simulator ${OPENSSL_CRYPTO_LIBRARIES} ${CMAKE_DL_LIBS} m)
 
@@ -168,15 +164,13 @@ ADD_EXECUTABLE(http09 EXCLUDE_FROM_ALL t/http09.c ${PICOTLS_OPENSSL_FILES})
 TARGET_LINK_LIBRARIES(http09 ${OPENSSL_CRYPTO_LIBRARIES} ${CMAKE_DL_LIBS})
 
 SET(CHECK_DEPENDS cli udpfw test.t)
-IF (BUILD_FLEXICAST)
-    LIST(APPEND CHECK_DEPENDS flexicast-test.t)
-ENDIF ()
 
 ADD_CUSTOM_TARGET(check
     sh -c
         "PERL5LIB='${CMAKE_CURRENT_SOURCE_DIR}'\${PERL5LIB:+:\$PERL5LIB} \
          BINARY_DIR='${CMAKE_CURRENT_BINARY_DIR}' \
          WITH_DTRACE=${WITH_DTRACE} \
+         BUILD_FLEXICAST=${BUILD_FLEXICAST} \
          exec prove --exec 'sh -c' -v ${CMAKE_CURRENT_BINARY_DIR}/*.t t/*.t"
     WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}
     DEPENDS ${CHECK_DEPENDS}

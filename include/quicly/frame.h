@@ -74,9 +74,11 @@ extern "C" {
 #define QUICLY_FRAME_TYPE_MAX_PATH_ID 0x3e7a
 #define QUICLY_FRAME_TYPE_PATHS_BLOCKED 0x3e7b
 #define QUICLY_FRAME_TYPE_PATH_CIDS_BLOCKED 0x3e7c
+#if QUICLY_HAVE_FLEXICAST
 #define QUICLY_FRAME_TYPE_FC_ANNOUNCE 0x173e00
 #define QUICLY_FRAME_TYPE_FC_STATE 0x173e01
 #define QUICLY_FRAME_TYPE_FC_KEY 0x173e02
+#endif
 
 #define QUICLY_FRAME_TYPE_STREAM_BITS 0x7
 #define QUICLY_FRAME_TYPE_STREAM_BIT_OFF 0x4
@@ -1096,12 +1098,32 @@ Error:
     return QUICLY_TRANSPORT_ERROR_FRAME_ENCODING;
 }
 
+#if QUICLY_HAVE_FLEXICAST
 #define QUICLY_FLEXICAST_MAX_FLOW_ID_SIZE 20
 
 typedef struct st_quicly_flexicast_flow_id_t {
     uint8_t len;
     uint8_t bytes[QUICLY_FLEXICAST_MAX_FLOW_ID_SIZE];
 } quicly_flexicast_flow_id_t;
+
+static inline int quicly_flexicast_flow_id_is_valid(const quicly_flexicast_flow_id_t *flow_id)
+{
+    return flow_id != NULL && flow_id->len >= 1 && flow_id->len <= QUICLY_FLEXICAST_MAX_FLOW_ID_SIZE;
+}
+
+static inline int quicly_flexicast_flow_id_equal(const quicly_flexicast_flow_id_t *a, const quicly_flexicast_flow_id_t *b)
+{
+    return a != NULL && b != NULL && a->len == b->len && memcmp(a->bytes, b->bytes, a->len) == 0;
+}
+
+static inline quicly_flexicast_flow_id_t quicly_flexicast_flow_id_init(const void *bytes, uint8_t len)
+{
+    quicly_flexicast_flow_id_t id = {0};
+    assert(bytes != NULL && len >= 1 && len <= QUICLY_FLEXICAST_MAX_FLOW_ID_SIZE);
+    id.len = len;
+    memcpy(id.bytes, bytes, len);
+    return id;
+}
 
 typedef struct st_quicly_flexicast_announce_frame_t {
     quicly_flexicast_flow_id_t flow_id;
@@ -1152,6 +1174,7 @@ quicly_error_t quicly_decode_fc_state_frame(const uint8_t **src, const uint8_t *
 size_t quicly_fc_key_frame_capacity(const quicly_flexicast_key_frame_t *frame);
 uint8_t *quicly_encode_fc_key_frame(uint8_t *dst, const quicly_flexicast_key_frame_t *frame);
 quicly_error_t quicly_decode_fc_key_frame(const uint8_t **src, const uint8_t *end, quicly_flexicast_key_frame_t *frame);
+#endif
 
 #ifdef __cplusplus
 }

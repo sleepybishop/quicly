@@ -8,7 +8,9 @@
 extern "C" {
 #endif
 
-#define QUICLY_FLEXICAST_FLOW_ID_SIZE 8
+/* standalone multicast flow engine scoped to DATAGRAM, PING, and PADDING frames;
+ * stream and control frames on multicast packets are rejected by design */
+
 #define QUICLY_FLEXICAST_DEFAULT_MAX_MEMBERS QUICLY_FLEXICAST_CC_DEFAULT_MAX_MEMBERS
 #define QUICLY_FLEXICAST_HARD_MAX_MEMBERS QUICLY_FLEXICAST_CC_HARD_MAX_MEMBERS
 #define QUICLY_FLEXICAST_SENT_WINDOW 2048
@@ -23,7 +25,8 @@ extern "C" {
 typedef struct st_quicly_flexicast_flow_t quicly_flexicast_flow_t;
 
 typedef struct st_quicly_flexicast_config_t {
-    uint64_t flow_id;
+    /* 1..20 byte flexicast flow ID encoded verbatim as the multicast short-header DCID */
+    quicly_flexicast_flow_id_t flow_id;
     /* initial egress PN and expected first ingress PN from FC_KEY */
     uint64_t first_packet_number;
     ptls_cipher_suite_t *cipher_suite;
@@ -37,7 +40,7 @@ typedef struct st_quicly_flexicast_config_t {
     quicly_flexicast_cc_t *cc;
     uint32_t ack_delay_msec;
     uint16_t ack_frequency;
-    /* packet reordering threshold before declaring loss; zero selects 3 */
+    /* packet reordering threshold (< QUICLY_FLEXICAST_SENT_WINDOW); zero selects 3 */
     uint16_t packet_reordering_threshold;
     int64_t now;
     /* optional lower cryptographic usage limits; zero selects suite-specific QUIC defaults */
@@ -80,12 +83,19 @@ typedef struct st_quicly_flexicast_send_context_t {
     uint32_t flags;
 } quicly_flexicast_send_context_t;
 
+typedef struct st_quicly_flexicast_decrypted_t {
+    const uint8_t *src;
+    const uint8_t *end;
+    uint64_t packet_number;
+    size_t num_datagrams;
+} quicly_flexicast_decrypted_t;
+
 int quicly_flexicast_flow_create(quicly_flexicast_flow_t **flow, const quicly_flexicast_config_t *config);
 int quicly_flexicast_flow_rekey(quicly_flexicast_flow_t *flow, ptls_iovec_t traffic_secret, uint64_t first_packet_number,
                                 int64_t now);
 void quicly_flexicast_flow_free(quicly_flexicast_flow_t *flow);
 
-uint64_t quicly_flexicast_get_flow_id(const quicly_flexicast_flow_t *flow);
+const quicly_flexicast_flow_id_t *quicly_flexicast_get_flow_id(const quicly_flexicast_flow_t *flow);
 uint64_t quicly_flexicast_get_next_packet_number(const quicly_flexicast_flow_t *flow);
 int quicly_flexicast_flow_has_sender_state(const quicly_flexicast_flow_t *flow);
 
@@ -111,10 +121,16 @@ int quicly_flexicast_send_datagram(quicly_flexicast_flow_t *flow, ptls_iovec_t p
 int quicly_flexicast_mark_submitted(quicly_flexicast_flow_t *flow, uint64_t member_id, uint64_t packet_number, int64_t now,
                                     const quicly_flexicast_send_context_t *context);
 
-/* decrypts in place and outputs all DATAGRAM payload views without copying */
-int quicly_flexicast_receive_datagrams(quicly_flexicast_flow_t *flow, uint8_t *packet, size_t packet_size,
-                                       ptls_iovec_t *payloads, size_t *num_payloads, uint64_t *packet_number, uint8_t ecn,
-                                       int64_t now);
+/* decrypts in place, validates all frames, commits receive state, and prepares zero-copy iteration */
+int quicly_flexicast_receive_packet(quicly_flexicast_flow_t *flow, uint8_t *packet, size_t packet_size,
+                                    quicly_flexicast_decrypted_t *decrypted, uint8_t ecn, int64_t now);
+/* yields 1 with the next DATAGRAM view, 0 at end of packet, or a negative error on invalid cursor */
+int quicly_flexicast_next_datagram(quicly_flexicast_decrypted_t *decrypted, ptls_iovec_t *payload);
+
+/* decrypts in place and outputs all DATAGRAM payload views; note that packet bytes are already decrypted in place on
+ * BUFFER_TOO_SMALL, so callers with unknown frame counts should prefer quicly_flexicast_receive_packet + next_datagram */
+int quicly_flexicast_receive_datagrams(quicly_flexicast_flow_t *flow, uint8_t *packet, size_t packet_size, ptls_iovec_t *payloads,
+                                       size_t *num_payloads, uint64_t *packet_number, uint8_t ecn, int64_t now);
 
 static inline int quicly_flexicast_receive_datagram(quicly_flexicast_flow_t *flow, uint8_t *packet, size_t packet_size,
                                                     ptls_iovec_t *payload, uint64_t *packet_number, uint8_t ecn, int64_t now)
@@ -131,8 +147,8 @@ static inline int quicly_flexicast_receive_datagram(quicly_flexicast_flow_t *flo
 int64_t quicly_flexicast_get_ack_deadline(const quicly_flexicast_flow_t *flow);
 int quicly_flexicast_ack_is_due(const quicly_flexicast_flow_t *flow, int64_t now);
 int quicly_flexicast_send_pending_ack(quicly_flexicast_flow_t *flow, quicly_conn_t *conn, int64_t now, int force);
-int quicly_flexicast_encode_pending_ack(quicly_flexicast_flow_t *flow, uint8_t *dst, size_t capacity, int64_t now,
-                                        size_t *encoded_size);
+int quicly_flexicast_encode_pending_ack(quicly_flexicast_flow_t *flow, uint64_t ack_path_id, uint8_t *dst, size_t capacity,
+                                        int64_t now, size_t *encoded_size);
 void quicly_flexicast_ack_sent(quicly_flexicast_flow_t *flow);
 int quicly_flexicast_get_receive_state(const quicly_flexicast_flow_t *flow, const quicly_range_t **ranges, size_t *num_ranges,
                                        uint64_t *history_lower_bound, int64_t *largest_received_at, uint64_t ecn_counts[3]);
@@ -144,8 +160,8 @@ int quicly_flexicast_get_receive_state(const quicly_flexicast_flow_t *flow, cons
 
 int quicly_flexicast_ack_packet(quicly_flexicast_flow_t *flow, uint64_t member_id, uint64_t packet_number, int *complete,
                                 int64_t now);
-int quicly_flexicast_ack_frame(quicly_flexicast_flow_t *flow, uint64_t member_id, const quicly_ack_frame_t *frame,
-                               unsigned flags, size_t *num_acked, size_t *num_lost, size_t *num_completed, int64_t now);
+int quicly_flexicast_ack_frame(quicly_flexicast_flow_t *flow, uint64_t member_id, const quicly_ack_frame_t *frame, unsigned flags,
+                               size_t *num_acked, size_t *num_lost, size_t *num_completed, int64_t now);
 int quicly_flexicast_commit_ack_loss(quicly_flexicast_flow_t *flow, uint64_t member_id, uint64_t coverage_lower_bound,
                                      uint64_t largest_received, size_t *num_lost, size_t *num_completed, int64_t now);
 

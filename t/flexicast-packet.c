@@ -4,12 +4,18 @@
 #include "quicly/frame.h"
 #include "test.h"
 
-static const uint64_t packet_flow_id = UINT64_C(0x1020304050607080);
+static const uint8_t packet_flow_bytes[8] = {0x10, 0x20, 0x30, 0x40, 0x50, 0x60, 0x70, 0x80};
 static uint8_t packet_secret[32] = {1};
 
-static quicly_flexicast_flow_t *packet_flow(uint64_t first_packet_number, size_t max_packet_size)
+static quicly_flexicast_flow_id_t default_packet_flow_id(void)
 {
-    quicly_flexicast_config_t config = {.flow_id = packet_flow_id,
+    return quicly_flexicast_flow_id_init(packet_flow_bytes, sizeof(packet_flow_bytes));
+}
+
+static quicly_flexicast_flow_t *packet_flow_with_id(quicly_flexicast_flow_id_t flow_id, uint64_t first_packet_number,
+                                                    size_t max_packet_size)
+{
+    quicly_flexicast_config_t config = {.flow_id = flow_id,
                                         .first_packet_number = first_packet_number,
                                         .cipher_suite = &ptls_openssl_aes128gcmsha256,
                                         .crypto_engine = &quicly_default_crypto_engine,
@@ -20,9 +26,14 @@ static quicly_flexicast_flow_t *packet_flow(uint64_t first_packet_number, size_t
     return flow;
 }
 
-/* construct independent wire packets */
-static size_t protect_packet(uint8_t *packet, unsigned pn_length, uint64_t pn, uint8_t flags, const uint8_t *plain,
-                             size_t plain_size)
+static quicly_flexicast_flow_t *packet_flow(uint64_t first_packet_number, size_t max_packet_size)
+{
+    return packet_flow_with_id(default_packet_flow_id(), first_packet_number, max_packet_size);
+}
+
+/* construct independent wire packets for arbitrary flow_id lengths */
+static size_t protect_packet_id(const quicly_flexicast_flow_id_t *flow_id, uint8_t *packet, unsigned pn_length, uint64_t pn,
+                                uint8_t flags, const uint8_t *plain, size_t plain_size)
 {
     ptls_cipher_context_t *hp = NULL;
     ptls_aead_context_t *aead = NULL;
@@ -30,28 +41,68 @@ static size_t protect_packet(uint8_t *packet, unsigned pn_length, uint64_t pn, u
                                                         ptls_openssl_aes128gcmsha256.aead, ptls_openssl_aes128gcmsha256.hash,
                                                         packet_secret);
     assert(ret == 0);
+    size_t pn_offset = 1 + flow_id->len;
     packet[0] = QUICLY_QUIC_BIT | (pn_length - 1) | flags;
-    quicly_encode64(packet + 1, packet_flow_id);
+    memcpy(packet + 1, flow_id->bytes, flow_id->len);
     for (unsigned i = 0; i != pn_length; ++i)
-        packet[9 + i] = pn >> (8 * (pn_length - i - 1));
-    size_t header_size = 9 + pn_length;
+        packet[pn_offset + i] = pn >> (8 * (pn_length - i - 1));
+    size_t header_size = pn_offset + pn_length;
     size_t size = header_size + ptls_aead_encrypt(aead, packet + header_size, plain, plain_size, pn, packet, header_size);
-    assert(size >= 13 + hp->algo->iv_size);
+    assert(size >= pn_offset + QUICLY_MAX_PN_SIZE + hp->algo->iv_size);
     uint8_t mask[5] = {0};
-    ptls_cipher_init(hp, packet + 13);
+    ptls_cipher_init(hp, packet + pn_offset + QUICLY_MAX_PN_SIZE);
     ptls_cipher_encrypt(hp, mask, mask, sizeof(mask));
     packet[0] ^= mask[0] & 0x1f;
     for (unsigned i = 0; i != pn_length; ++i)
-        packet[9 + i] ^= mask[i + 1];
+        packet[pn_offset + i] ^= mask[i + 1];
     ptls_cipher_free(hp);
     ptls_aead_free(aead);
     return size;
 }
 
+static size_t protect_packet(uint8_t *packet, unsigned pn_length, uint64_t pn, uint8_t flags, const uint8_t *plain,
+                             size_t plain_size)
+{
+    quicly_flexicast_flow_id_t fid = default_packet_flow_id();
+    return protect_packet_id(&fid, packet, pn_length, pn, flags, plain, plain_size);
+}
+
+static void test_wire_flow_id_lengths(void)
+{
+    static const uint8_t lengths[] = {1, 4, 8, 20};
+    static const uint8_t payload[] = "wire-fid";
+    for (size_t i = 0; i != PTLS_ELEMENTSOF(lengths); ++i) {
+        uint8_t raw[QUICLY_FLEXICAST_MAX_FLOW_ID_SIZE];
+        for (uint8_t b = 0; b != lengths[i]; ++b)
+            raw[b] = (uint8_t)(0xc0 + b); /* exercise high bits above PTLS_QUICINT_MAX */
+        quicly_flexicast_flow_id_t fid = quicly_flexicast_flow_id_init(raw, lengths[i]);
+        quicly_flexicast_flow_t *tx = packet_flow_with_id(fid, 10, 0);
+        quicly_flexicast_flow_t *rx = packet_flow_with_id(fid, 10, 0);
+        ok(quicly_flexicast_flow_id_equal(quicly_flexicast_get_flow_id(tx), &fid));
+        ok(quicly_flexicast_attach(tx, 1, 0) == 0);
+        uint8_t packet[256];
+        size_t size;
+        uint64_t pn;
+        ok(quicly_flexicast_send_datagram(tx, ptls_iovec_init(payload, sizeof(payload)), packet, sizeof(packet), &size, &pn, 0) ==
+           0);
+        /* verify advertised flow_id bytes sit verbatim in the short-header DCID */
+        ok(memcmp(packet + 1, raw, lengths[i]) == 0);
+        quicly_flexicast_decrypted_t decrypted;
+        ptls_iovec_t view;
+        ok(quicly_flexicast_receive_packet(rx, packet, size, &decrypted, 0, 1) == 0);
+        ok(decrypted.packet_number == 10 && decrypted.num_datagrams == 1);
+        ok(quicly_flexicast_next_datagram(&decrypted, &view) == 1);
+        ok(view.len == sizeof(payload) && memcmp(view.base, payload, sizeof(payload)) == 0);
+        ok(quicly_flexicast_next_datagram(&decrypted, &view) == 0);
+        quicly_flexicast_flow_free(rx);
+        quicly_flexicast_flow_free(tx);
+    }
+}
+
 static void test_packet_layouts(void)
 {
     static const uint8_t layouts[][16] = {
-        {0x31, 4, 't', 'e', 's', 't'}, {0x30, 't', 'e', 's', 't'},       {0, 0x31, 4, 't', 'e', 's', 't'},
+        {0x31, 4, 't', 'e', 's', 't'},    {0x30, 't', 'e', 's', 't'},      {0, 0x31, 4, 't', 'e', 's', 't'},
         {1, 0x31, 4, 't', 'e', 's', 't'}, {0x31, 1, 'a', 0, 1, 0x30, 'b'}, {0, 0x31, 0, 0x31, 0},
     };
     const size_t sizes[] = {6, 5, 7, 7, 7, 5};
@@ -80,43 +131,57 @@ static void test_packet_layouts(void)
             }
             ok(payloads[0].base >= packet && payloads[0].base < packet + size);
             count = PTLS_ELEMENTSOF(payloads);
-            ok(quicly_flexicast_receive_datagrams(flow, copy, size, payloads, &count, &pn, 0, 11) ==
-               QUICLY_FLEXICAST_ERROR_REPLAY);
+            ok(quicly_flexicast_receive_datagrams(flow, copy, size, payloads, &count, &pn, 0, 11) == QUICLY_FLEXICAST_ERROR_REPLAY);
         }
         quicly_flexicast_flow_free(flow);
     }
 }
 
-static void test_packet_atomicity(void)
+static void test_packet_iterator_and_atomicity(void)
 {
+    static const uint8_t multi[] = {0, 0x31, 1, 'a', 1, 0x31, 1, 'b', 0x30, 'c'};
     static const uint8_t two[] = {0x31, 1, 'a', 0x31, 1, 'b'};
     static const uint8_t truncated[] = {0x31, 1, 'a', 0x31, 8, 'b'};
     quicly_flexicast_flow_t *flow = packet_flow(0, 0);
     uint8_t packet[256];
     ptls_iovec_t payloads[2] = {{NULL, 99}, {NULL, 99}};
+    quicly_flexicast_decrypted_t decrypted;
     uint64_t pn;
+
+    /* malformed frames are rejected before committing receive state */
     size_t size = protect_packet(packet, 2, 0, 0, truncated, sizeof(truncated)), count = 2;
-    ok(quicly_flexicast_receive_datagrams(flow, packet, size, payloads, &count, &pn, 0, 10) ==
-       QUICLY_FLEXICAST_ERROR_FRAME_ENCODING);
-    ok(payloads[0].base == NULL && payloads[0].len == 99);
+    ok(quicly_flexicast_receive_packet(flow, packet, size, &decrypted, 0, 10) == QUICLY_FLEXICAST_ERROR_FRAME_ENCODING);
     ok(quicly_flexicast_get_ack_deadline(flow) == INT64_MAX);
-    size = protect_packet(packet, 2, 0, 0, two, sizeof(two));
-    ok(quicly_flexicast_receive_datagram(flow, packet, size, payloads, &pn, 0, 10) == QUICLY_FLEXICAST_ERROR_BUFFER_TOO_SMALL);
+
+    /* receive_packet + next_datagram enumerates arbitrary frame counts in one pass without pre-sizing or re-protecting */
+    size = protect_packet(packet, 2, 0, 0, multi, sizeof(multi));
+    ok(quicly_flexicast_receive_packet(flow, packet, size, &decrypted, 0, 10) == 0);
+    ok(decrypted.packet_number == 0 && decrypted.num_datagrams == 3);
+    ptls_iovec_t *dynamic = calloc(decrypted.num_datagrams, sizeof(*dynamic));
+    size_t seen = 0;
+    ptls_iovec_t view;
+    int step;
+    while ((step = quicly_flexicast_next_datagram(&decrypted, &view)) > 0)
+        dynamic[seen++] = view;
+    ok(step == 0 && seen == 3 && decrypted.num_datagrams == 0);
+    ok(dynamic[0].len == 1 && *dynamic[0].base == 'a');
+    ok(dynamic[1].len == 1 && *dynamic[1].base == 'b');
+    ok(dynamic[2].len == 1 && *dynamic[2].base == 'c');
+    free(dynamic);
+    ok(quicly_flexicast_ack_is_due(flow, 10) && quicly_flexicast_get_ack_deadline(flow) == 10);
+
+    /* fixed-array convenience wrapper still preserves replay atomicity when BUFFER_TOO_SMALL occurs */
+    size = protect_packet(packet, 2, 1, 0, two, sizeof(two));
+    ok(quicly_flexicast_receive_datagram(flow, packet, size, payloads, &pn, 0, 20) == QUICLY_FLEXICAST_ERROR_BUFFER_TOO_SMALL);
     ok(payloads[0].base == NULL && payloads[0].len == 99);
-    ok(quicly_flexicast_get_ack_deadline(flow) == INT64_MAX);
-    size = protect_packet(packet, 2, 0, 0, two, sizeof(two));
-    count = 0;
-    ok(quicly_flexicast_receive_datagrams(flow, packet, size, NULL, &count, &pn, 0, 10) ==
-       QUICLY_FLEXICAST_ERROR_BUFFER_TOO_SMALL);
-    ok(count == 2);
-    size = protect_packet(packet, 2, 0, 0, two, sizeof(two));
+    size = protect_packet(packet, 2, 1, 0, two, sizeof(two));
     count = 2;
-    ok(quicly_flexicast_receive_datagrams(flow, packet, size, payloads, &count, &pn, 0, 10) == 0);
-    ok(count == 2 && pn == 0 && quicly_flexicast_ack_is_due(flow, 10) && quicly_flexicast_get_ack_deadline(flow) == 10);
-    size = protect_packet(packet, 2, 0, 0, two, sizeof(two));
+    ok(quicly_flexicast_receive_datagrams(flow, packet, size, payloads, &count, &pn, 0, 20) == 0);
+    ok(count == 2 && pn == 1);
+    size = protect_packet(packet, 2, 1, 0, two, sizeof(two));
     payloads[0] = ptls_iovec_init(NULL, 99);
     count = 1;
-    ok(quicly_flexicast_receive_datagrams(flow, packet, size, payloads, &count, &pn, 0, 11) == QUICLY_FLEXICAST_ERROR_REPLAY);
+    ok(quicly_flexicast_receive_datagrams(flow, packet, size, payloads, &count, &pn, 0, 21) == QUICLY_FLEXICAST_ERROR_REPLAY);
     ok(count == 1 && payloads[0].base == NULL && payloads[0].len == 99);
     quicly_flexicast_flow_free(flow);
 }
@@ -124,7 +189,7 @@ static void test_packet_atomicity(void)
 static void test_packet_errors(void)
 {
     static const uint8_t data[] = {0x31, 4, 't', 'e', 's', 't'};
-    static const uint64_t prohibited[] = {QUICLY_FRAME_TYPE_FC_ANNOUNCE, QUICLY_FRAME_TYPE_FC_STATE,   QUICLY_FRAME_TYPE_FC_KEY,
+    static const uint64_t prohibited[] = {QUICLY_FRAME_TYPE_FC_ANNOUNCE, QUICLY_FRAME_TYPE_FC_STATE,     QUICLY_FRAME_TYPE_FC_KEY,
                                           QUICLY_FRAME_TYPE_PATH_ACK,    QUICLY_FRAME_TYPE_PATH_ACK_ECN, QUICLY_FRAME_TYPE_ACK};
     quicly_flexicast_flow_t *flow = packet_flow(0, 0);
     uint8_t packet[256];
@@ -181,7 +246,8 @@ static void test_packet_size_limits(void)
         ok(quicly_flexicast_datagram_size(flow, payload_size) == limits[i]);
         ok(quicly_flexicast_datagram_size(flow, payload_size + 1) == 0);
         ok(quicly_flexicast_send_datagram(flow, ptls_iovec_init(payload, payload_size + 1), packet,
-                                          QUICLY_FLEXICAST_MAX_DATAGRAM_SIZE + 64, &size, &pn, 0) == QUICLY_FLEXICAST_ERROR_INVALID);
+                                          QUICLY_FLEXICAST_MAX_DATAGRAM_SIZE + 64, &size, &pn,
+                                          0) == QUICLY_FLEXICAST_ERROR_INVALID);
         ok(quicly_flexicast_get_next_packet_number(flow) == 0);
         ok(quicly_flexicast_send_datagram(flow, ptls_iovec_init(payload, payload_size), packet,
                                           QUICLY_FLEXICAST_MAX_DATAGRAM_SIZE + 64, &size, &pn, 0) == 0);
@@ -196,7 +262,7 @@ static void test_padding_history_bound(void)
 {
     quicly_flexicast_flow_t *flow = packet_flow(0, 0);
     uint8_t packet[256], plain[4] = {0}, encoded[QUICLY_FLEXICAST_MAX_ACK_ENCODED_SIZE];
-    uint64_t pn;
+    uint64_t pn, ack_path_id = 777;
     size_t count, size, encoded_size;
     const unsigned num_padding = QUICLY_FLEXICAST_SENT_WINDOW + 8;
     int received = 1;
@@ -213,10 +279,10 @@ static void test_padding_history_bound(void)
     count = 0;
     ok(quicly_flexicast_receive_datagrams(flow, packet, size, NULL, &count, &pn, 0, num_padding) == 0);
     ok(quicly_flexicast_ack_is_due(flow, num_padding));
-    ok(quicly_flexicast_encode_pending_ack(flow, encoded, sizeof(encoded), num_padding, &encoded_size) == 0);
+    ok(quicly_flexicast_encode_pending_ack(flow, ack_path_id, encoded, sizeof(encoded), num_padding, &encoded_size) == 0);
     const uint8_t *src = encoded, *end = src + encoded_size;
     ok(quicly_decodev(&src, end) == QUICLY_FRAME_TYPE_PATH_ACK);
-    ok(quicly_decodev(&src, end) == packet_flow_id);
+    ok(quicly_decodev(&src, end) == ack_path_id);
     quicly_ack_frame_t ack;
     ok(quicly_decode_ack_frame(&src, end, &ack, 0) == 0);
     ok(ack.num_gaps + 1 == QUICLY_MAX_ACK_BLOCKS);
@@ -228,8 +294,9 @@ static void test_padding_history_bound(void)
 
 void test_flexicast_packets(void)
 {
+    subtest("wire-flow-id-lengths", test_wire_flow_id_lengths);
     subtest("packet-layouts", test_packet_layouts);
-    subtest("packet-atomicity", test_packet_atomicity);
+    subtest("packet-iterator-and-atomicity", test_packet_iterator_and_atomicity);
     subtest("packet-errors", test_packet_errors);
     subtest("packet-ack-elicitation", test_packet_ack_elicitation);
     subtest("packet-size-limits", test_packet_size_limits);
