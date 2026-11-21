@@ -180,7 +180,7 @@ static void test_member_map_collisions(void)
 {
     flexicast_member_map_t map = {0};
     uint64_t ids[32];
-    ok(flexicast_member_map_init(&map, 32) == 0);
+    ok(flexicast_member_map_reserve(&map, 32) == 0);
     /* all probe chains wrap around the end of the table */
     for (uint64_t id = 1, count = 0; count != 32; ++id) {
         if ((flexicast_member_hash(id) & (map.capacity - 1)) == map.capacity - 1)

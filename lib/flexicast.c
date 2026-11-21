@@ -129,6 +129,7 @@ struct st_quicly_flexicast_flow_t {
     } received;
     quicly_flexicast_cc_t *cc;
     size_t max_members;
+    size_t member_capacity;
     size_t member_word_count;
     /* sender-side structures allocated lazily on first attach */
     quicly_flexicast_sent_t *sent;
@@ -522,6 +523,8 @@ static void free_sender_state(quicly_flexicast_flow_t *flow)
     flow->pending_member_words = NULL;
     free(flow->submissions);
     flow->submissions = NULL;
+    flow->member_capacity = 0;
+    flow->member_word_count = 0;
     flow->num_free_member_slots = 0;
     flow->member_slot_watermark = 0;
     flow->num_members = 0;
@@ -530,26 +533,74 @@ static void free_sender_state(quicly_flexicast_flow_t *flow)
     flow->num_submissions = 0;
 }
 
+static int grow_flow_members(quicly_flexicast_flow_t *flow)
+{
+    size_t old_capacity = flow->member_capacity, capacity = old_capacity != 0 ? old_capacity * 2 : 8;
+    if (capacity > flow->max_members)
+        capacity = flow->max_members;
+    size_t old_words = flow->member_word_count, words = (capacity + 63) / 64;
+    quicly_flexicast_member_t *members = calloc(capacity, sizeof(*members));
+    uint32_t *free_slots = malloc(capacity * sizeof(*free_slots));
+    uint64_t *active = flow->active_member_words, *pending = flow->pending_member_words;
+    if (words != old_words) {
+        active = calloc(words, sizeof(*active));
+        pending = calloc(QUICLY_FLEXICAST_SENT_WINDOW * words, sizeof(*pending));
+    }
+    if (members == NULL || free_slots == NULL || active == NULL || pending == NULL ||
+        flexicast_member_map_reserve(&flow->member_map, capacity) != 0) {
+        free(members);
+        free(free_slots);
+        if (words != old_words) {
+            free(active);
+            free(pending);
+        }
+        return QUICLY_FLEXICAST_ERROR_NO_MEMORY;
+    }
+
+    for (size_t i = 0; i != flow->member_slot_watermark; ++i) {
+        members[i] = flow->members[i];
+        if (members[i].ecn_unreported_retired.ranges == &flow->members[i].ecn_unreported_retired._initial)
+            members[i].ecn_unreported_retired.ranges = &members[i].ecn_unreported_retired._initial;
+    }
+    /* Push newly allocated slots in reverse order. Repeat attachments still prefer previously freed slots. */
+    size_t added = capacity - old_capacity;
+    for (size_t i = 0; i != added; ++i)
+        free_slots[i] = (uint32_t)(capacity - 1 - i);
+    if (flow->num_free_member_slots != 0)
+        memcpy(free_slots + added, flow->free_member_slots, flow->num_free_member_slots * sizeof(*free_slots));
+    flow->num_free_member_slots += added;
+    free(flow->members);
+    free(flow->free_member_slots);
+    flow->members = members;
+    flow->free_member_slots = free_slots;
+    flow->member_capacity = capacity;
+
+    if (words != old_words) {
+        if (old_words != 0) {
+            memcpy(active, flow->active_member_words, old_words * sizeof(*active));
+            for (size_t i = 0; i != QUICLY_FLEXICAST_SENT_WINDOW; ++i)
+                memcpy(pending + i * words, flow->pending_member_words + i * old_words, old_words * sizeof(*pending));
+        }
+        free(flow->active_member_words);
+        free(flow->pending_member_words);
+        flow->active_member_words = active;
+        flow->pending_member_words = pending;
+        flow->member_word_count = words;
+    }
+    return QUICLY_FLEXICAST_OK;
+}
+
 static int ensure_sender_state(quicly_flexicast_flow_t *flow)
 {
     if (flow->sent != NULL)
         return QUICLY_FLEXICAST_OK;
     flow->inactive_head = flow->inactive_tail = FLEXICAST_NO_SLOT;
-    if ((flow->sent = calloc(QUICLY_FLEXICAST_SENT_WINDOW, sizeof(*flow->sent))) == NULL ||
-        (flow->members = calloc(flow->max_members, sizeof(*flow->members))) == NULL ||
-        (flow->free_member_slots = malloc(flow->max_members * sizeof(*flow->free_member_slots))) == NULL ||
-        flexicast_member_map_init(&flow->member_map, flow->max_members) != 0 ||
-        (flow->active_member_words = calloc(flow->member_word_count, sizeof(*flow->active_member_words))) == NULL ||
-        (flow->pending_member_words =
-             calloc(QUICLY_FLEXICAST_SENT_WINDOW * flow->member_word_count, sizeof(*flow->pending_member_words))) == NULL) {
-        free_sender_state(flow);
+    if ((flow->sent = calloc(QUICLY_FLEXICAST_SENT_WINDOW, sizeof(*flow->sent))) == NULL)
         return QUICLY_FLEXICAST_ERROR_NO_MEMORY;
-    }
-    for (size_t i = 0; i != flow->max_members; ++i) {
-        flow->members[i].prev_inactive = flow->members[i].next_inactive = FLEXICAST_NO_SLOT;
-        flow->free_member_slots[flow->num_free_member_slots++] = (uint32_t)(flow->max_members - i - 1);
-    }
-    return QUICLY_FLEXICAST_OK;
+    int ret = grow_flow_members(flow);
+    if (ret != QUICLY_FLEXICAST_OK)
+        free_sender_state(flow);
+    return ret;
 }
 
 static void dispose_cipher(ptls_cipher_context_t **hp, ptls_aead_context_t **aead)
@@ -644,7 +695,6 @@ int quicly_flexicast_flow_create(quicly_flexicast_flow_t **flow, const quicly_fl
     new_flow->max_packet_size = config->max_packet_size != 0 ? config->max_packet_size : QUICLY_FLEXICAST_DEFAULT_MAX_PACKET_SIZE;
     new_flow->packet_reordering_threshold = config->packet_reordering_threshold != 0 ? config->packet_reordering_threshold : 3;
     new_flow->max_members = max_members;
-    new_flow->member_word_count = (max_members + 63) / 64;
     new_flow->received.ack_delay_msec = config->ack_delay_msec != 0 ? config->ack_delay_msec : 25;
     new_flow->received.ack_frequency = config->ack_frequency != 0 ? config->ack_frequency : QUICLY_FLEXICAST_DEFAULT_ACK_FREQUENCY;
     quicly_ranges_init(&new_flow->received.ack_ranges);
@@ -991,6 +1041,9 @@ int quicly_flexicast_attach(quicly_flexicast_flow_t *flow, uint64_t member_id, i
     }
     if (flow->num_members >= flow->max_members)
         return QUICLY_FLEXICAST_ERROR_MEMBER_LIMIT;
+    if (flow->num_free_member_slots == 0 && flow->member_capacity < flow->max_members &&
+        (ret = grow_flow_members(flow)) != QUICLY_FLEXICAST_OK)
+        return ret;
     if (flow->num_free_member_slots != 0) {
         if (quicly_flexicast_cc_on_member_added(flow->cc, member_id, now) != 0)
             return QUICLY_FLEXICAST_ERROR_MEMBER_LIMIT;

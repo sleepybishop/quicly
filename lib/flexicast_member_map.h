@@ -24,14 +24,6 @@ static inline size_t flexicast_member_hash(uint64_t id)
     return (size_t)(id ^ (id >> 31));
 }
 
-static inline int flexicast_member_map_init(flexicast_member_map_t *map, size_t maximum_members)
-{
-    /* at most half full so every probe reaches an empty entry */
-    for (map->capacity = 2; map->capacity < maximum_members * 2; map->capacity *= 2)
-        ;
-    return (map->entries = calloc(map->capacity, sizeof(*map->entries))) != NULL ? 0 : -1;
-}
-
 static inline void flexicast_member_map_dispose(flexicast_member_map_t *map)
 {
     free(map->entries);
@@ -46,6 +38,25 @@ static inline flexicast_member_entry_t *flexicast_member_map_entry(const flexica
     while (map->entries[i].id != 0 && map->entries[i].id != id)
         i = (i + 1) & mask;
     return map->entries + i;
+}
+
+/* Keep the map at most half full so every probe reaches an empty entry. */
+static inline int flexicast_member_map_reserve(flexicast_member_map_t *map, size_t members)
+{
+    if (map->capacity >= members * 2)
+        return 0;
+    size_t capacity = 2;
+    while (capacity < members * 2)
+        capacity *= 2;
+    flexicast_member_map_t grown = {.entries = calloc(capacity, sizeof(*grown.entries)), .capacity = capacity};
+    if (grown.entries == NULL)
+        return -1;
+    for (size_t i = 0; i != map->capacity; ++i)
+        if (map->entries[i].id != 0)
+            *flexicast_member_map_entry(&grown, map->entries[i].id) = map->entries[i];
+    free(map->entries);
+    *map = grown;
+    return 0;
 }
 
 static inline int flexicast_member_map_find(const flexicast_member_map_t *map, uint64_t id)

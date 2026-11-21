@@ -36,6 +36,7 @@ typedef struct st_multicast_state_t {
     size_t *rate_heap;
     size_t *timeout_heap;
     size_t num_members;
+    size_t member_capacity;
     uint32_t inactive_head;
     uint32_t inactive_tail;
     uint64_t first_sent_pn;
@@ -337,6 +338,35 @@ static void remove_member_slot(multicast_state_t *state, multicast_member_t *mem
     --state->num_members;
 }
 
+static int grow_multicast_members(multicast_state_t *state)
+{
+    size_t capacity = state->member_capacity != 0 ? state->member_capacity * 2 : 8;
+    if (capacity > state->super.config.maximum_members)
+        capacity = state->super.config.maximum_members;
+    multicast_member_t *members = malloc(capacity * sizeof(*members));
+    size_t *rate_heap = malloc(capacity * sizeof(*rate_heap)), *timeout_heap = malloc(capacity * sizeof(*timeout_heap));
+    if (members == NULL || rate_heap == NULL || timeout_heap == NULL ||
+        flexicast_member_map_reserve(&state->member_map, capacity) != 0) {
+        free(members);
+        free(rate_heap);
+        free(timeout_heap);
+        return -1;
+    }
+    if (state->num_members != 0) {
+        memcpy(members, state->members, state->num_members * sizeof(*members));
+        memcpy(rate_heap, state->rate_heap, state->num_members * sizeof(*rate_heap));
+        memcpy(timeout_heap, state->timeout_heap, state->num_members * sizeof(*timeout_heap));
+    }
+    free(state->members);
+    free(state->rate_heap);
+    free(state->timeout_heap);
+    state->members = members;
+    state->rate_heap = rate_heap;
+    state->timeout_heap = timeout_heap;
+    state->member_capacity = capacity;
+    return 0;
+}
+
 static multicast_member_t *add_member(multicast_state_t *state, uint64_t id, int64_t now)
 {
     multicast_member_t *member = find_member(state, id);
@@ -359,6 +389,8 @@ static multicast_member_t *add_member(multicast_state_t *state, uint64_t id, int
         if (state->inactive_head == MULTICAST_NO_SLOT)
             return NULL;
         remove_member_slot(state, state->members + state->inactive_head);
+    } else if (state->num_members == state->member_capacity && grow_multicast_members(state) != 0) {
+        return NULL;
     }
     flexicast_member_map_set(&state->member_map, id, state->num_members);
     member = state->members + state->num_members++;
@@ -703,11 +735,7 @@ quicly_flexicast_cc_t *quicly_flexicast_cc_new_multicast(const quicly_flexicast_
         return NULL;
     state->inactive_head = state->inactive_tail = MULTICAST_NO_SLOT;
     state->max_event_at = now;
-    if (quicly_flexicast_cc_init(&state->super, &quicly_flexicast_cc_type_multicast, config) != 0 ||
-        (state->members = calloc(state->super.config.maximum_members, sizeof(*state->members))) == NULL ||
-        (state->rate_heap = malloc(state->super.config.maximum_members * sizeof(*state->rate_heap))) == NULL ||
-        (state->timeout_heap = malloc(state->super.config.maximum_members * sizeof(*state->timeout_heap))) == NULL ||
-        flexicast_member_map_init(&state->member_map, state->super.config.maximum_members) != 0) {
+    if (quicly_flexicast_cc_init(&state->super, &quicly_flexicast_cc_type_multicast, config) != 0) {
         quicly_flexicast_cc_free_multicast(&state->super);
         return NULL;
     }

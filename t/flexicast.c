@@ -321,10 +321,16 @@ static void test_scalable_members(void)
 
     memset(secret, 0x6b, ptls_openssl_aes128gcmsha256.hash->digest_size);
     ok(cc != NULL && quicly_flexicast_flow_create(&flow, &config) == QUICLY_FLEXICAST_OK);
-    for (size_t i = 0; i != member_count; ++i)
+    ok(quicly_flexicast_attach(flow, first_member_id, 0) == QUICLY_FLEXICAST_OK);
+    uint64_t before_growth;
+    ok(quicly_flexicast_send_datagram(flow, ptls_iovec_init(payload, sizeof(payload)), packet, sizeof(packet), &packet_size,
+                                      &before_growth, 0) == QUICLY_FLEXICAST_OK);
+    for (size_t i = 1; i != member_count; ++i)
         if (quicly_flexicast_attach(flow, first_member_id + i, 0) != QUICLY_FLEXICAST_OK)
             all_ok = 0;
     ok(all_ok && quicly_flexicast_num_members(flow) == member_count);
+    ok(quicly_flexicast_get_pending_members(flow, before_growth, &pending) == QUICLY_FLEXICAST_OK && pending == 1);
+    ok(quicly_flexicast_ack_packet(flow, first_member_id, before_growth, &complete, 0) == QUICLY_FLEXICAST_OK && complete);
     ok(quicly_flexicast_attach(flow, first_member_id + member_count, 0) == QUICLY_FLEXICAST_ERROR_MEMBER_LIMIT);
     ok(quicly_flexicast_send_datagram(flow, ptls_iovec_init(payload, sizeof(payload)), packet, sizeof(packet), &packet_size,
                                       &packet_number, 0) == QUICLY_FLEXICAST_OK);
