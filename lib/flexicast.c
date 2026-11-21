@@ -5,7 +5,12 @@
 
 #define FLEXICAST_NO_SLOT UINT32_MAX
 #define MAX_SUBMISSION_TIMESTAMPS 4096
-#define MAX_RETIRED_KEYS 4096
+
+typedef struct st_flexicast_limitation_event_t {
+    int64_t at;
+    uint64_t member_id;
+    uint32_t flags;
+} flexicast_limitation_event_t;
 
 typedef struct st_quicly_flexicast_sent_t {
     uint64_t packet_number;
@@ -44,6 +49,10 @@ typedef struct st_flexicast_delivery_sample_t {
 typedef struct st_quicly_flexicast_member_t {
     uint64_t loss_cursor;
     uint64_t path_sample_floor;
+    uint64_t active_since_pn;
+    uint64_t suspended_at_pn;
+    uint64_t excluded_packets;
+    uint64_t retired_packets;
     flexicast_delivery_sample_t rate_sample;
     flexicast_delivery_sample_t published_rate_sample;
     uint64_t rate_sample_epoch;
@@ -83,7 +92,6 @@ struct st_quicly_flexicast_flow_t {
     uint64_t first_packet_number;
     size_t max_packet_size;
     uint16_t packet_reordering_threshold;
-    int64_t app_limited_at, host_limited_at;
     struct {
         uint64_t largest;
         uint64_t history_lower_bound;
@@ -118,6 +126,9 @@ struct st_quicly_flexicast_flow_t {
     flexicast_submission_t *submissions;
     size_t submission_capacity;
     size_t num_submissions;
+    flexicast_limitation_event_t *limitations;
+    size_t limitation_head;
+    size_t num_limitations;
 };
 
 static size_t retired_key_hash(const uint8_t *secret_hash)
@@ -149,8 +160,8 @@ static int ensure_retired_key_slot(quicly_flexicast_flow_t *flow, const uint8_t 
 {
     if (find_retired_key(flow, secret_hash, digest_size) != NULL)
         return QUICLY_FLEXICAST_OK;
-    if (flow->crypto.num_retired_keys >= MAX_RETIRED_KEYS)
-        return QUICLY_FLEXICAST_ERROR_KEY_UPDATE_REQUIRED;
+    if (flow->crypto.num_retired_keys >= QUICLY_FLEXICAST_MAX_RETIRED_KEYS)
+        return QUICLY_FLEXICAST_ERROR_STATE_EXHAUSTION;
     if (flow->crypto.retired_key_capacity == 0 || flow->crypto.num_retired_keys * 2 >= flow->crypto.retired_key_capacity) {
         size_t capacity = flow->crypto.retired_key_capacity != 0 ? flow->crypto.retired_key_capacity * 2 : 8;
         flexicast_retired_key_t *entries = calloc(capacity, sizeof(*entries));
@@ -309,7 +320,33 @@ static int sent_clear_member(quicly_flexicast_flow_t *flow, quicly_flexicast_sen
     *word &= ~bit;
     remove_submission(flow, sent->packet_number, member_index);
     --sent->pending_count;
+    ++flow->members[member_index].retired_packets;
     return 1;
+}
+
+static uint64_t member_pending_packets(const quicly_flexicast_flow_t *flow, const quicly_flexicast_member_t *member)
+{
+    uint64_t active_end = member->active ? flow->next_packet_number : member->suspended_at_pn;
+    uint64_t sent_while_attached = active_end - flow->first_packet_number;
+    uint64_t total_assigned = sent_while_attached - member->excluded_packets;
+    return total_assigned > member->retired_packets ? total_assigned - member->retired_packets : 0;
+}
+
+static void record_limitation_event(quicly_flexicast_flow_t *flow, uint64_t member_id, int64_t now, uint32_t flags)
+{
+    if (flow->limitations == NULL)
+        return;
+    if (flow->num_limitations != 0) {
+        size_t prev = (flow->limitation_head + QUICLY_FLEXICAST_SENT_WINDOW - 1) % QUICLY_FLEXICAST_SENT_WINDOW;
+        if (flow->limitations[prev].at == now && flow->limitations[prev].member_id == member_id) {
+            flow->limitations[prev].flags |= flags;
+            return;
+        }
+    }
+    flow->limitations[flow->limitation_head] = (flexicast_limitation_event_t){.at = now, .member_id = member_id, .flags = flags};
+    flow->limitation_head = (flow->limitation_head + 1) % QUICLY_FLEXICAST_SENT_WINDOW;
+    if (flow->num_limitations < QUICLY_FLEXICAST_SENT_WINDOW)
+        ++flow->num_limitations;
 }
 
 static void set_member_active(quicly_flexicast_flow_t *flow, size_t member_index, int active)
@@ -337,12 +374,16 @@ static void free_sender_state(quicly_flexicast_flow_t *flow)
     flow->pending_member_words = NULL;
     free(flow->submissions);
     flow->submissions = NULL;
+    free(flow->limitations);
+    flow->limitations = NULL;
     flow->num_free_member_slots = 0;
     flow->member_slot_watermark = 0;
     flow->num_members = 0;
     flow->inactive_head = flow->inactive_tail = FLEXICAST_NO_SLOT;
     flow->submission_capacity = 0;
     flow->num_submissions = 0;
+    flow->limitation_head = 0;
+    flow->num_limitations = 0;
 }
 
 static int ensure_sender_state(quicly_flexicast_flow_t *flow)
@@ -356,7 +397,8 @@ static int ensure_sender_state(quicly_flexicast_flow_t *flow)
         flexicast_member_map_init(&flow->member_map, flow->max_members) != 0 ||
         (flow->active_member_words = calloc(flow->member_word_count, sizeof(*flow->active_member_words))) == NULL ||
         (flow->pending_member_words =
-             calloc(QUICLY_FLEXICAST_SENT_WINDOW * flow->member_word_count, sizeof(*flow->pending_member_words))) == NULL) {
+             calloc(QUICLY_FLEXICAST_SENT_WINDOW * flow->member_word_count, sizeof(*flow->pending_member_words))) == NULL ||
+        (flow->limitations = calloc(QUICLY_FLEXICAST_SENT_WINDOW, sizeof(*flow->limitations))) == NULL) {
         free_sender_state(flow);
         return QUICLY_FLEXICAST_ERROR_NO_MEMORY;
     }
@@ -438,7 +480,7 @@ int quicly_flexicast_flow_create(quicly_flexicast_flow_t **flow, const quicly_fl
         config->max_packet_size > QUICLY_FLEXICAST_MAX_PACKET_SIZE ||
         (config->max_packet_size != 0 && config->max_packet_size < QUICLY_FLEXICAST_DEFAULT_MAX_PACKET_SIZE))
         return QUICLY_FLEXICAST_ERROR_INVALID;
-    if (config->cc != NULL && config->cc->type == NULL)
+    if (config->cc != NULL && (config->cc->type == NULL || config->cc->bound_flow != NULL))
         return QUICLY_FLEXICAST_ERROR_INVALID;
     if (!get_aead_limits(config, &max_packets_per_key, &max_authentication_failures, &max_decryption_attempts))
         return QUICLY_FLEXICAST_ERROR_INVALID;
@@ -464,11 +506,13 @@ int quicly_flexicast_flow_create(quicly_flexicast_flow_t **flow, const quicly_fl
     new_flow->received.ack_frequency = config->ack_frequency != 0 ? config->ack_frequency : QUICLY_FLEXICAST_DEFAULT_ACK_FREQUENCY;
     quicly_ranges_init(&new_flow->received.ack_ranges);
 
+    new_flow->cc = config->cc;
+    if (new_flow->cc != NULL)
+        new_flow->cc->bound_flow = new_flow;
     if ((ret = quicly_flexicast_flow_rekey(new_flow, config->traffic_secret, config->first_packet_number, config->now)) != 0) {
         quicly_flexicast_flow_free(new_flow);
         return ret;
     }
-    new_flow->cc = config->cc;
     *flow = new_flow;
     return QUICLY_FLEXICAST_OK;
 }
@@ -599,7 +643,6 @@ int quicly_flexicast_flow_rekey(quicly_flexicast_flow_t *flow, ptls_iovec_t traf
     flow->crypto.has_key = 1;
     flow->first_packet_number = first_packet_number;
     flow->next_packet_number = first_packet_number;
-    flow->app_limited_at = flow->host_limited_at = 0;
     flow->received.history_lower_bound = first_packet_number;
     flow->received.bootstrap_floor = first_packet_number;
     flow->received.largest = 0;
@@ -614,11 +657,11 @@ int quicly_flexicast_flow_rekey(quicly_flexicast_flow_t *flow, ptls_iovec_t traf
     flow->received.largest_received_at = 0;
     if (flow->sent != NULL) {
         memset(flow->sent, 0, QUICLY_FLEXICAST_SENT_WINDOW * sizeof(*flow->sent));
-        if (flow->submissions != NULL)
+        if (flow->submissions != NULL && flow->num_submissions != 0)
             memset(flow->submissions, 0, flow->submission_capacity * sizeof(*flow->submissions));
         flow->num_submissions = 0;
-        memset(flow->pending_member_words, 0,
-               QUICLY_FLEXICAST_SENT_WINDOW * flow->member_word_count * sizeof(*flow->pending_member_words));
+        flow->limitation_head = 0;
+        flow->num_limitations = 0;
         memset(flow->active_member_words, 0, flow->member_word_count * sizeof(*flow->active_member_words));
         flow->num_members = 0;
         flow->inactive_head = flow->inactive_tail = FLEXICAST_NO_SLOT;
@@ -632,6 +675,10 @@ int quicly_flexicast_flow_rekey(quicly_flexicast_flow_t *flow, ptls_iovec_t traf
             inactive_member_push_back(flow, (uint32_t)i);
             flow->members[i].loss_cursor = first_packet_number;
             flow->members[i].path_sample_floor = first_packet_number;
+            flow->members[i].active_since_pn = first_packet_number;
+            flow->members[i].suspended_at_pn = first_packet_number;
+            flow->members[i].excluded_packets = 0;
+            flow->members[i].retired_packets = 0;
             flow->members[i].stats.largest_acknowledged = 0;
             flow->members[i].stats.last_feedback_at = 0;
             flow->members[i].rate_sample = (flexicast_delivery_sample_t){0};
@@ -663,11 +710,16 @@ void quicly_flexicast_flow_free(quicly_flexicast_flow_t *flow)
 {
     if (flow == NULL)
         return;
-    if (flow->members != NULL && flow->cc != NULL) {
-        for (size_t i = 0; i != flow->member_slot_watermark; ++i) {
-            if (flow->members[i].stats.member_id != 0)
-                quicly_flexicast_cc_on_member_removed(flow->cc, flow->members[i].stats.member_id, 0);
+    if (flow->cc != NULL) {
+        if (flow->members != NULL) {
+            for (size_t i = 0; i != flow->member_slot_watermark; ++i) {
+                if (flow->members[i].stats.member_id != 0)
+                    quicly_flexicast_cc_on_member_removed(flow->cc, flow->members[i].stats.member_id, 0);
+            }
         }
+        quicly_flexicast_cc_on_epoch_reset(flow->cc, 0);
+        if (flow->cc->bound_flow == flow)
+            flow->cc->bound_flow = NULL;
     }
     quicly_ranges_clear(&flow->received.ack_ranges);
     dispose_cipher(&flow->egress.header_protection, &flow->egress.aead);
@@ -738,6 +790,8 @@ int quicly_flexicast_attach(quicly_flexicast_flow_t *flow, uint64_t member_id, i
             if (quicly_flexicast_cc_on_member_added(flow->cc, member_id, now) != 0)
                 return QUICLY_FLEXICAST_ERROR_MEMBER_LIMIT;
             inactive_member_unlink(flow, (uint32_t)index);
+            flow->members[index].excluded_packets += flow->next_packet_number - flow->members[index].suspended_at_pn;
+            flow->members[index].active_since_pn = flow->next_packet_number;
             flow->members[index].active = 1;
             set_member_active(flow, (size_t)index, 1);
             ++flow->num_members;
@@ -760,9 +814,9 @@ int quicly_flexicast_attach(quicly_flexicast_flow_t *flow, uint64_t member_id, i
         inactive_member_unlink(flow, reclaimed);
         quicly_flexicast_cc_on_member_removed(flow->cc, old_id, now);
         flexicast_member_map_remove(&flow->member_map, old_id);
+        clear_member_pending_slots(flow, reclaimed, old_cursor);
         memset(&flow->members[reclaimed], 0, sizeof(flow->members[reclaimed]));
         flow->members[reclaimed].prev_inactive = flow->members[reclaimed].next_inactive = FLEXICAST_NO_SLOT;
-        clear_member_pending_slots(flow, reclaimed, old_cursor);
         if (quicly_flexicast_cc_on_member_added(flow->cc, member_id, now) != 0) {
             flow->free_member_slots[flow->num_free_member_slots++] = reclaimed;
             return QUICLY_FLEXICAST_ERROR_MEMBER_LIMIT;
@@ -775,6 +829,10 @@ int quicly_flexicast_attach(quicly_flexicast_flow_t *flow, uint64_t member_id, i
     flow->members[index].stats.member_id = member_id;
     flow->members[index].loss_cursor = flow->next_packet_number;
     flow->members[index].path_sample_floor = flow->first_packet_number;
+    flow->members[index].active_since_pn = flow->next_packet_number;
+    flow->members[index].suspended_at_pn = flow->next_packet_number;
+    flow->members[index].excluded_packets = flow->next_packet_number - flow->first_packet_number;
+    flow->members[index].retired_packets = 0;
     flow->members[index].active = 1;
     flexicast_member_map_set(&flow->member_map, member_id, (size_t)index);
     set_member_active(flow, (size_t)index, 1);
@@ -799,10 +857,10 @@ int quicly_flexicast_detach(quicly_flexicast_flow_t *flow, uint64_t member_id, i
     }
     old_cursor = flow->members[member_index].loss_cursor;
     flexicast_member_map_remove(&flow->member_map, member_id);
+    clear_member_pending_slots(flow, (size_t)member_index, old_cursor);
     memset(&flow->members[member_index], 0, sizeof(flow->members[member_index]));
     flow->members[member_index].prev_inactive = flow->members[member_index].next_inactive = FLEXICAST_NO_SLOT;
     flow->free_member_slots[flow->num_free_member_slots++] = (uint32_t)member_index;
-    clear_member_pending_slots(flow, (size_t)member_index, old_cursor);
     return QUICLY_FLEXICAST_OK;
 }
 
@@ -831,6 +889,34 @@ size_t quicly_flexicast_datagram_size(const quicly_flexicast_flow_t *flow, size_
     return size <= flow->max_packet_size ? size : 0;
 }
 
+static void retire_inactive_slot_obligations(quicly_flexicast_flow_t *flow, quicly_flexicast_sent_t *sent)
+{
+    size_t word_limit = (flow->member_slot_watermark + 63) / 64;
+    uint64_t *words = sent_member_words(flow, sent);
+    for (size_t wi = 0; wi < word_limit && sent->pending_count != 0; ++wi) {
+        uint64_t w = words[wi];
+        while (w != 0) {
+            unsigned bit_idx = 0;
+            uint64_t low = w & (~w + 1);
+            while ((low >> bit_idx) > 1)
+                ++bit_idx;
+            w &= w - 1;
+            size_t slot = wi * 64 + bit_idx;
+            if (slot >= flow->member_slot_watermark)
+                continue;
+            quicly_flexicast_member_t *m = flow->members + slot;
+            if (m->stats.member_id == 0 || !m->active || sent->packet_number < m->active_since_pn) {
+                if (sent_clear_member(flow, sent, slot) && m->stats.member_id != 0) {
+                    ++m->stats.lost_packets;
+                    m->stats.lost_bytes += sent->packet_size;
+                    if (m->loss_cursor <= sent->packet_number)
+                        m->loss_cursor = sent->packet_number + 1;
+                }
+            }
+        }
+    }
+}
+
 int quicly_flexicast_send_datagram(quicly_flexicast_flow_t *flow, ptls_iovec_t payload, uint8_t *packet, size_t packet_capacity,
                                    size_t *packet_size, uint64_t *packet_number, int64_t now)
 {
@@ -855,8 +941,11 @@ int quicly_flexicast_send_datagram(quicly_flexicast_flow_t *flow, ptls_iovec_t p
 
     pn = flow->next_packet_number;
     sent = flow->sent + pn % QUICLY_FLEXICAST_SENT_WINDOW;
-    if (sent->pending_count != 0 && sent->packet_number != pn)
-        return QUICLY_FLEXICAST_ERROR_SEND_WINDOW;
+    if (sent->pending_count != 0 && sent->packet_number != pn) {
+        retire_inactive_slot_obligations(flow, sent);
+        if (sent->pending_count != 0)
+            return QUICLY_FLEXICAST_ERROR_SEND_WINDOW;
+    }
 
     dst = packet;
     *dst++ = QUICLY_QUIC_BIT | (QUICLY_SEND_PN_SIZE - 1);
@@ -908,11 +997,10 @@ int quicly_flexicast_mark_submitted(quicly_flexicast_flow_t *flow, uint64_t memb
     if (member_id != 0 && (member_index < 0 || !sent_has_member(flow, sent, (size_t)member_index)))
         return QUICLY_FLEXICAST_ERROR_NOT_FOUND;
     quicly_flexicast_send_context_t normalized = context != NULL ? *context : (quicly_flexicast_send_context_t){0};
-    /* preserve limitation watermarks even if the flagged packet is lost */
-    if ((normalized.flags & QUICLY_FLEXICAST_SAMPLE_APP_LIMITED) && now > flow->app_limited_at)
-        flow->app_limited_at = now;
-    if ((normalized.flags & QUICLY_FLEXICAST_SAMPLE_HOST_LIMITED) && now > flow->host_limited_at)
-        flow->host_limited_at = now;
+    /* record limitation timestamps so lost limited packets mark only overlapping intervals */
+    uint32_t lim_flags = normalized.flags & (QUICLY_FLEXICAST_SAMPLE_APP_LIMITED | QUICLY_FLEXICAST_SAMPLE_HOST_LIMITED);
+    if (lim_flags != 0 && now > 0)
+        record_limitation_event(flow, member_id, now, lim_flags);
     if (normalized.pacing_rate_bytes_per_second == 0 || normalized.physical_fanout == 0 || now <= 0)
         normalized.flags &= ~QUICLY_FLEXICAST_SAMPLE_VALID;
     if (member_id == 0 || !sent->has_submission) {
@@ -1006,44 +1094,60 @@ static void update_replay_window(quicly_flexicast_flow_t *flow, uint64_t packet_
     flow->received.mask |= (uint64_t)1 << distance;
 }
 
+static int decode_next_multicast_frame(const uint8_t **src, const uint8_t *end, ptls_iovec_t *payload, int *is_datagram,
+                                       int *ack_eliciting)
+{
+    uint64_t frame_type;
+    quicly_datagram_frame_t frame;
+
+    *is_datagram = 0;
+    if ((frame_type = quicly_decodev(src, end)) == UINT64_MAX)
+        return QUICLY_FLEXICAST_ERROR_FRAME_ENCODING;
+    switch (frame_type) {
+    case QUICLY_FRAME_TYPE_PADDING:
+        return QUICLY_FLEXICAST_OK;
+    case QUICLY_FRAME_TYPE_PING:
+        *ack_eliciting = 1;
+        return QUICLY_FLEXICAST_OK;
+    case QUICLY_FRAME_TYPE_DATAGRAM_NOLEN:
+    case QUICLY_FRAME_TYPE_DATAGRAM_WITHLEN:
+        if (quicly_decode_datagram_frame(frame_type, src, end, &frame) != 0)
+            return QUICLY_FLEXICAST_ERROR_FRAME_ENCODING;
+        *payload = frame.payload;
+        *is_datagram = 1;
+        *ack_eliciting = 1;
+        return QUICLY_FLEXICAST_OK;
+    case QUICLY_FRAME_TYPE_FC_ANNOUNCE:
+    case QUICLY_FRAME_TYPE_FC_STATE:
+    case QUICLY_FRAME_TYPE_FC_KEY:
+    case QUICLY_FRAME_TYPE_PATH_ACK:
+    case QUICLY_FRAME_TYPE_PATH_ACK_ECN:
+    case QUICLY_FRAME_TYPE_ACK:
+    case QUICLY_FRAME_TYPE_ACK_ECN:
+        return QUICLY_FLEXICAST_ERROR_PROTOCOL_VIOLATION;
+    default:
+        return QUICLY_FLEXICAST_ERROR_FRAME_ENCODING;
+    }
+}
+
 /* validate packet frames before exposing payloads or committing receive state */
 static int decode_datagrams(const uint8_t *src, const uint8_t *end, ptls_iovec_t *payloads, size_t capacity, size_t *count,
                             int *ack_eliciting)
 {
-    uint64_t frame_type;
-    quicly_datagram_frame_t frame;
+    ptls_iovec_t payload;
+    int ret, is_datagram;
+
     *count = 0;
     *ack_eliciting = 0;
     if (src == end)
         return QUICLY_FLEXICAST_ERROR_PROTOCOL_VIOLATION;
     while (src != end) {
-        if ((frame_type = quicly_decodev(&src, end)) == UINT64_MAX)
-            return QUICLY_FLEXICAST_ERROR_FRAME_ENCODING;
-        switch (frame_type) {
-        case QUICLY_FRAME_TYPE_PADDING:
-            break;
-        case QUICLY_FRAME_TYPE_PING:
-            *ack_eliciting = 1;
-            break;
-        case QUICLY_FRAME_TYPE_DATAGRAM_NOLEN:
-        case QUICLY_FRAME_TYPE_DATAGRAM_WITHLEN:
-            if (quicly_decode_datagram_frame(frame_type, &src, end, &frame) != 0)
-                return QUICLY_FLEXICAST_ERROR_FRAME_ENCODING;
+        if ((ret = decode_next_multicast_frame(&src, end, &payload, &is_datagram, ack_eliciting)) != QUICLY_FLEXICAST_OK)
+            return ret;
+        if (is_datagram) {
             if (*count < capacity)
-                payloads[*count] = frame.payload;
+                payloads[*count] = payload;
             ++*count;
-            *ack_eliciting = 1;
-            break;
-        case QUICLY_FRAME_TYPE_FC_ANNOUNCE:
-        case QUICLY_FRAME_TYPE_FC_STATE:
-        case QUICLY_FRAME_TYPE_FC_KEY:
-        case QUICLY_FRAME_TYPE_PATH_ACK:
-        case QUICLY_FRAME_TYPE_PATH_ACK_ECN:
-        case QUICLY_FRAME_TYPE_ACK:
-        case QUICLY_FRAME_TYPE_ACK_ECN:
-            return QUICLY_FLEXICAST_ERROR_PROTOCOL_VIOLATION;
-        default:
-            return QUICLY_FLEXICAST_ERROR_FRAME_ENCODING;
         }
     }
     return QUICLY_FLEXICAST_OK;
@@ -1117,39 +1221,20 @@ int quicly_flexicast_receive_packet(quicly_flexicast_flow_t *flow, uint8_t *pack
 
 int quicly_flexicast_next_datagram(quicly_flexicast_decrypted_t *decrypted, ptls_iovec_t *payload)
 {
-    uint64_t frame_type;
-    quicly_datagram_frame_t frame;
+    int ret, is_datagram, ack_eliciting = 0;
 
     if (decrypted == NULL || payload == NULL || (decrypted->src == NULL && decrypted->end != NULL) ||
         decrypted->src > decrypted->end)
         return QUICLY_FLEXICAST_ERROR_INVALID;
     const uint8_t *src = decrypted->src, *end = decrypted->end;
     while (src != end) {
-        if ((frame_type = quicly_decodev(&src, end)) == UINT64_MAX)
-            return QUICLY_FLEXICAST_ERROR_FRAME_ENCODING;
-        switch (frame_type) {
-        case QUICLY_FRAME_TYPE_PADDING:
-        case QUICLY_FRAME_TYPE_PING:
-            break;
-        case QUICLY_FRAME_TYPE_DATAGRAM_NOLEN:
-        case QUICLY_FRAME_TYPE_DATAGRAM_WITHLEN:
-            if (quicly_decode_datagram_frame(frame_type, &src, end, &frame) != 0)
-                return QUICLY_FLEXICAST_ERROR_FRAME_ENCODING;
+        if ((ret = decode_next_multicast_frame(&src, end, payload, &is_datagram, &ack_eliciting)) != QUICLY_FLEXICAST_OK)
+            return ret;
+        if (is_datagram) {
             decrypted->src = src;
             if (decrypted->num_datagrams != 0)
                 --decrypted->num_datagrams;
-            *payload = frame.payload;
             return 1;
-        case QUICLY_FRAME_TYPE_FC_ANNOUNCE:
-        case QUICLY_FRAME_TYPE_FC_STATE:
-        case QUICLY_FRAME_TYPE_FC_KEY:
-        case QUICLY_FRAME_TYPE_PATH_ACK:
-        case QUICLY_FRAME_TYPE_PATH_ACK_ECN:
-        case QUICLY_FRAME_TYPE_ACK:
-        case QUICLY_FRAME_TYPE_ACK_ECN:
-            return QUICLY_FLEXICAST_ERROR_PROTOCOL_VIOLATION;
-        default:
-            return QUICLY_FLEXICAST_ERROR_FRAME_ENCODING;
         }
     }
     decrypted->src = src;
@@ -1196,6 +1281,14 @@ int quicly_flexicast_receive_datagrams(quicly_flexicast_flow_t *flow, uint8_t *p
     return commit_received_packet(flow, *packet_number, ack_eliciting, ecn, now);
 }
 
+int quicly_flexicast_set_ack_delay(quicly_flexicast_flow_t *flow, uint64_t ack_delay_msec)
+{
+    if (flow == NULL || ack_delay_msec > PTLS_QUICINT_MAX)
+        return QUICLY_FLEXICAST_ERROR_INVALID;
+    flow->received.ack_delay_msec = ack_delay_msec > UINT32_MAX ? UINT32_MAX : (uint32_t)ack_delay_msec;
+    return QUICLY_FLEXICAST_OK;
+}
+
 int64_t quicly_flexicast_get_ack_deadline(const quicly_flexicast_flow_t *flow)
 {
     if (flow == NULL || flow->received.ack_ranges.num_ranges == 0 || flow->received.ack_eliciting_since_ack == 0)
@@ -1203,9 +1296,9 @@ int64_t quicly_flexicast_get_ack_deadline(const quicly_flexicast_flow_t *flow)
     if (flow->received.ack_frames_sent == 0 || flow->received.ack_eliciting_since_ack >= flow->received.ack_frequency ||
         flow->received.ack_ranges_since_ack >= QUICLY_MAX_ACK_BLOCKS)
         return flow->received.ack_pending_since;
-    if (flow->received.ack_pending_since > INT64_MAX - flow->received.ack_delay_msec)
+    if (flow->received.ack_pending_since > INT64_MAX - (int64_t)flow->received.ack_delay_msec)
         return INT64_MAX;
-    return flow->received.ack_pending_since + flow->received.ack_delay_msec;
+    return flow->received.ack_pending_since + (int64_t)flow->received.ack_delay_msec;
 }
 
 int quicly_flexicast_ack_is_due(const quicly_flexicast_flow_t *flow, int64_t now)
@@ -1408,11 +1501,17 @@ static void sample_delivery_rate(quicly_flexicast_flow_t *flow, quicly_flexicast
             uint64_t bytes = bucket->bytes;
             uint64_t sample = bytes > UINT64_MAX / 1000 ? UINT64_MAX : bytes * 1000 / elapsed;
             bucket->rate = sample;
-            /* mark intervals whose send start precedes limitation watermarks */
-            if (flow->app_limited_at > 0 && bucket->sent_at_start <= flow->app_limited_at)
-                bucket->context.flags |= QUICLY_FLEXICAST_SAMPLE_APP_LIMITED;
-            if (flow->host_limited_at > 0 && bucket->sent_at_start <= flow->host_limited_at)
-                bucket->context.flags |= QUICLY_FLEXICAST_SAMPLE_HOST_LIMITED;
+            /* mark intervals only when a recorded limitation falls within [sent_at_start, sent_at_end] */
+            if (bucket->timestamps_valid && bucket->sent_at_start > 0 && bucket->sent_at_end >= bucket->sent_at_start) {
+                const uint32_t both = QUICLY_FLEXICAST_SAMPLE_APP_LIMITED | QUICLY_FLEXICAST_SAMPLE_HOST_LIMITED;
+                for (size_t li = 0; li < flow->num_limitations && (bucket->context.flags & both) != both; ++li) {
+                    size_t slot = (flow->limitation_head + QUICLY_FLEXICAST_SENT_WINDOW - 1 - li) % QUICLY_FLEXICAST_SENT_WINDOW;
+                    const flexicast_limitation_event_t *ev = flow->limitations + slot;
+                    if (ev->at >= bucket->sent_at_start && ev->at <= bucket->sent_at_end &&
+                        (ev->member_id == 0 || ev->member_id == member->stats.member_id))
+                        bucket->context.flags |= ev->flags;
+                }
+            }
             member->published_rate_sample = *bucket;
             quicly_flexicast_member_stats_t *stats = &member->stats;
             if (stats->delivery_rate_bytes_per_second == 0)
@@ -1458,8 +1557,12 @@ static void finish_feedback(quicly_flexicast_flow_t *flow, int member_index, qui
     if (feedback->now > 0)
         stats->last_feedback_at = feedback->now;
     feedback->epoch = ++stats->feedback_epoch;
-    if (!has_route_event)
+    if (!has_route_event) {
+        if (member->active && member_pending_packets(flow, member) == 0)
+            quicly_flexicast_cc_on_packet_retired(flow->cc, member->stats.member_id, feedback->largest_acknowledged, 1,
+                                                  feedback->now);
         return;
+    }
     feedback->delivered_bytes = stats->delivered_bytes;
     /* publish sample epoch only for completed buckets on the current path */
     int has_rate_sample = !(flags & QUICLY_FLEXICAST_ACK_OMIT_DELIVERY_RATE) && member->published_rate_sample.acked_at_end != 0;
@@ -1491,8 +1594,12 @@ static void finish_feedback(quicly_flexicast_flow_t *flow, int member_index, qui
         feedback->applied_ack_delay_msec = member->applied_ack_delay_msec;
         feedback->rtt_sample_flags = member->rtt_sample_flags;
     }
-    if (member->active)
+    if (member->active) {
         quicly_flexicast_cc_on_feedback(flow->cc, feedback);
+        if (member_pending_packets(flow, member) == 0)
+            quicly_flexicast_cc_on_packet_retired(flow->cc, member->stats.member_id, feedback->largest_acknowledged, 1,
+                                                  feedback->now);
+    }
 }
 
 static size_t retire_loss_range(quicly_flexicast_flow_t *flow, int member_index, uint64_t start_pn, uint64_t end_pn,
@@ -1630,8 +1737,7 @@ int quicly_flexicast_ack_frame(quicly_flexicast_flow_t *flow, uint64_t member_id
         *num_completed = 0;
     if (flow == NULL || flow->sent == NULL)
         return QUICLY_FLEXICAST_ERROR_NOT_FOUND;
-    if (flags & ~(QUICLY_FLEXICAST_ACK_OMIT_RTT | QUICLY_FLEXICAST_ACK_OMIT_DELIVERY_RATE | QUICLY_FLEXICAST_ACK_DEFER_LOSS |
-                  QUICLY_FLEXICAST_ACK_ALLOW_INACTIVE))
+    if (flags & ~(QUICLY_FLEXICAST_ACK_OMIT_RTT | QUICLY_FLEXICAST_ACK_OMIT_DELIVERY_RATE | QUICLY_FLEXICAST_ACK_DEFER_LOSS))
         return QUICLY_FLEXICAST_ERROR_INVALID;
     /* permit known suspended members to retire pre-suspension packets */
     if ((member_index = find_known_member(flow, member_id)) < 0)
@@ -1662,8 +1768,11 @@ int quicly_flexicast_ack_frame(quicly_flexicast_flow_t *flow, uint64_t member_id
     if (frame->largest_acknowledged > flow->members[member_index].stats.largest_acknowledged)
         flow->members[member_index].stats.largest_acknowledged = frame->largest_acknowledged;
     if (frame->ecn_counts[2] > flow->members[member_index].stats.ecn_ce_count) {
-        feedback.ecn_ce_count = frame->ecn_counts[2] - flow->members[member_index].stats.ecn_ce_count;
+        uint64_t ce_delta = frame->ecn_counts[2] - flow->members[member_index].stats.ecn_ce_count;
         flow->members[member_index].stats.ecn_ce_count = frame->ecn_counts[2];
+        /* absorb old-route CE baseline without cutting the new route's rate */
+        if (frame->largest_acknowledged >= flow->members[member_index].path_sample_floor)
+            feedback.ecn_ce_count = ce_delta;
     }
     if (total_acked != 0 && observation.bytes == 0 && feedback.lost_packets == 0 && feedback.ecn_ce_count == 0)
         flags |= QUICLY_FLEXICAST_ACK_OMIT_RTT | QUICLY_FLEXICAST_ACK_OMIT_DELIVERY_RATE;
@@ -1705,6 +1814,10 @@ int quicly_flexicast_abandon_datagram(quicly_flexicast_flow_t *flow, uint64_t me
         return QUICLY_FLEXICAST_ERROR_REPLAY;
     (void)sent_clear_member(flow, sent, (size_t)member_index);
     *complete = sent->pending_count == 0;
+    if (flow->members[member_index].active) {
+        int caught_up = member_pending_packets(flow, &flow->members[member_index]) == 0;
+        quicly_flexicast_cc_on_packet_retired(flow->cc, member_id, packet_number, caught_up, 0);
+    }
     return QUICLY_FLEXICAST_OK;
 }
 
@@ -1726,6 +1839,7 @@ int quicly_flexicast_suspend(quicly_flexicast_flow_t *flow, uint64_t member_id, 
         return QUICLY_FLEXICAST_ERROR_NOT_FOUND;
     if (flow->members[index].active) {
         flow->members[index].active = 0;
+        flow->members[index].suspended_at_pn = flow->next_packet_number;
         set_member_active(flow, (size_t)index, 0);
         --flow->num_members;
         inactive_member_push_back(flow, (uint32_t)index);
@@ -1771,28 +1885,30 @@ int quicly_flexicast_reset_member_path(quicly_flexicast_flow_t *flow, uint64_t m
     member->raw_rtt_msec = member->rtt_ack_delay_msec = member->applied_ack_delay_msec = member->rtt_sample_flags = 0;
     /* recreate controller member to drop cached RTT/rate baselines without touching sent bits */
     quicly_flexicast_cc_on_member_removed(flow->cc, member_id, now);
-    if (member->active && quicly_flexicast_cc_on_member_added(flow->cc, member_id, now) != 0)
+    if (member->active && quicly_flexicast_cc_on_member_added(flow->cc, member_id, now) != 0) {
+        member->active = 0;
+        member->suspended_at_pn = flow->next_packet_number;
+        set_member_active(flow, (size_t)index, 0);
+        --flow->num_members;
+        inactive_member_push_back(flow, (uint32_t)index);
         return QUICLY_FLEXICAST_ERROR_MEMBER_LIMIT;
+    }
     return QUICLY_FLEXICAST_OK;
 }
 
 int quicly_flexicast_resume(quicly_flexicast_flow_t *flow, uint64_t member_id, int64_t now)
 {
-    int index, ret;
+    int index;
     if (flow == NULL || (index = find_known_member(flow, member_id)) < 0)
         return QUICLY_FLEXICAST_ERROR_NOT_FOUND;
     if (!flow->members[index].active) {
         inactive_member_unlink(flow, (uint32_t)index);
+        flow->members[index].excluded_packets += flow->next_packet_number - flow->members[index].suspended_at_pn;
+        flow->members[index].active_since_pn = flow->next_packet_number;
         flow->members[index].active = 1;
         set_member_active(flow, (size_t)index, 1);
         ++flow->num_members;
-        if ((ret = quicly_flexicast_reset_member_path(flow, member_id, now)) != QUICLY_FLEXICAST_OK) {
-            flow->members[index].active = 0;
-            set_member_active(flow, (size_t)index, 0);
-            --flow->num_members;
-            inactive_member_push_back(flow, (uint32_t)index);
-            return ret;
-        }
+        return quicly_flexicast_reset_member_path(flow, member_id, now);
     }
     return QUICLY_FLEXICAST_OK;
 }

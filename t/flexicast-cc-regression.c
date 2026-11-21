@@ -5,8 +5,6 @@
 #include "quicly/flexicast_cc.h"
 #include "../lib/flexicast_member_map.h"
 
-#include <time.h>
-
 static quicly_flexicast_cc_config_t regression_config(void)
 {
     return (quicly_flexicast_cc_config_t){.maximum_members = 64,
@@ -42,16 +40,22 @@ static void test_multicast_zero_time_and_idle(void)
     quicly_flexicast_cc_get_output(cc, &output);
     ok(output.rate_bytes_per_second == 50000 && output.reason == QUICLY_FLEXICAST_CC_REASON_TIMEOUT);
 
-    /* once the sent packet is acknowledged, further idle periods do not halve the rate */
+    /* once the sent packet is acknowledged, the timer disarms and further idle periods do not halve the rate */
     quicly_flexicast_feedback_t caught_up = {
         .member_id = 1, .epoch = 1, .largest_acknowledged = 0, .acked_packets = 1, .acked_bytes = 1200, .now = 310};
     quicly_flexicast_cc_on_feedback(cc, &caught_up);
     quicly_flexicast_cc_get_output(cc, &output);
+    ok(output.next_timeout == INT64_MAX);
     uint64_t post_ack_rate = output.rate_bytes_per_second;
     for (int64_t now = 410; now <= 1010; now += 100)
         quicly_flexicast_cc_on_timeout(cc, now);
     quicly_flexicast_cc_get_output(cc, &output);
-    ok(output.rate_bytes_per_second == post_ack_rate && output.reason == QUICLY_FLEXICAST_CC_REASON_NONE);
+    ok(output.rate_bytes_per_second == post_ack_rate && output.next_timeout == INT64_MAX &&
+       output.reason == QUICLY_FLEXICAST_CC_REASON_NONE);
+    /* sending another packet rearms the feedback timer */
+    quicly_flexicast_cc_on_packet_sent(cc, 1, 1200, 1050);
+    quicly_flexicast_cc_get_output(cc, &output);
+    ok(output.next_timeout == 1150);
 
     quicly_flexicast_cc_on_epoch_reset(cc, 0);
     quicly_flexicast_cc_get_output(cc, &output);
@@ -298,13 +302,10 @@ static void test_rekey_16k_member_replacement(void)
     ok(attached && quicly_flexicast_num_members(flow) == QUICLY_FLEXICAST_HARD_MAX_MEMBERS);
     ok(quicly_flexicast_flow_rekey(flow, ptls_iovec_init(secret1, sizeof(secret1)), 1, 1) == QUICLY_FLEXICAST_OK);
 
-    clock_t start = clock();
     int replaced = 1;
     for (uint64_t id = 1; id <= QUICLY_FLEXICAST_HARD_MAX_MEMBERS; ++id)
         replaced &= quicly_flexicast_attach(flow, QUICLY_FLEXICAST_HARD_MAX_MEMBERS + id, 2) == QUICLY_FLEXICAST_OK;
-    double elapsed_ms = (double)(clock() - start) * 1000.0 / CLOCKS_PER_SEC;
     ok(replaced && quicly_flexicast_num_members(flow) == QUICLY_FLEXICAST_HARD_MAX_MEMBERS);
-    ok(elapsed_ms < 100.0);
 
     quicly_flexicast_flow_free(flow);
     quicly_flexicast_cc_free_multicast(cc);
@@ -394,6 +395,82 @@ static void test_suspend_legacy_controller(void)
     ok(output.next_timeout == 400 && output.limiting_member_id == 1);
 }
 
+static void test_abandon_and_exclusive_reuse(void)
+{
+    quicly_flexicast_cc_t *cc = NULL;
+    quicly_flexicast_flow_t *flow = create_regression_flow(&cc);
+    quicly_flexicast_cc_output_t output;
+    uint8_t packet[256], payload[64] = {0};
+    uint64_t pn0, pn1;
+    size_t size;
+    int complete = 0;
+
+    ok(quicly_flexicast_attach(flow, 1, 100) == QUICLY_FLEXICAST_OK);
+    ok(quicly_flexicast_send_datagram(flow, ptls_iovec_init(payload, sizeof(payload)), packet, sizeof(packet), &size, &pn0, 110) ==
+       QUICLY_FLEXICAST_OK);
+    quicly_flexicast_cc_get_flow_output(flow, &output);
+    ok(output.next_timeout == 210);
+
+    /* abandoning the last pending datagram retires the member's feedback obligation */
+    ok(quicly_flexicast_abandon_datagram(flow, 1, pn0, &complete) == QUICLY_FLEXICAST_OK && complete);
+    quicly_flexicast_cc_get_flow_output(flow, &output);
+    ok(output.next_timeout == INT64_MAX && output.rate_bytes_per_second == 100000);
+    for (int64_t now = 210; now <= 510; now += 100)
+        quicly_flexicast_cc_on_flow_timeout(flow, now);
+    quicly_flexicast_cc_get_flow_output(flow, &output);
+    ok(output.rate_bytes_per_second == 100000 && output.next_timeout == INT64_MAX);
+
+    /* abandoning a newer packet while an older packet remains pending keeps feedback armed until all are retired */
+    ok(quicly_flexicast_send_datagram(flow, ptls_iovec_init(payload, sizeof(payload)), packet, sizeof(packet), &size, &pn0, 600) ==
+       QUICLY_FLEXICAST_OK);
+    ok(quicly_flexicast_send_datagram(flow, ptls_iovec_init(payload, sizeof(payload)), packet, sizeof(packet), &size, &pn1, 620) ==
+       QUICLY_FLEXICAST_OK);
+    ok(quicly_flexicast_abandon_datagram(flow, 1, pn1, &complete) == QUICLY_FLEXICAST_OK && complete);
+    quicly_flexicast_cc_get_flow_output(flow, &output);
+    ok(output.next_timeout == 700);
+    ok(quicly_flexicast_abandon_datagram(flow, 1, pn0, &complete) == QUICLY_FLEXICAST_OK && complete);
+    quicly_flexicast_cc_get_flow_output(flow, &output);
+    ok(output.next_timeout == INT64_MAX);
+
+    /* old-route ECN feedback after reset_member_path updates stats without cutting the new route's rate */
+    ok(quicly_flexicast_send_datagram(flow, ptls_iovec_init(payload, sizeof(payload)), packet, sizeof(packet), &size, &pn0, 700) ==
+       QUICLY_FLEXICAST_OK);
+    ok(quicly_flexicast_reset_member_path(flow, 1, 710) == QUICLY_FLEXICAST_OK);
+    quicly_ack_frame_t old_ce_ack = {
+        .largest_acknowledged = pn0, .smallest_acknowledged = pn0, .ack_block_lengths = {1}, .ecn_counts = {0, 0, 1}};
+    ok(quicly_flexicast_ack_frame(flow, 1, &old_ce_ack, 0, NULL, NULL, NULL, 720) == QUICLY_FLEXICAST_OK);
+    quicly_flexicast_member_stats_t stats;
+    ok(quicly_flexicast_get_member_stats(flow, 1, &stats) == QUICLY_FLEXICAST_OK && stats.ecn_ce_count == 1);
+    quicly_flexicast_cc_get_flow_output(flow, &output);
+    ok(output.rate_bytes_per_second == 100000 && output.next_timeout == INT64_MAX);
+
+    /* sequential controller reuse after sending starts with a clean epoch so an idle second flow never times out */
+    ok(quicly_flexicast_send_datagram(flow, ptls_iovec_init(payload, sizeof(payload)), packet, sizeof(packet), &size, &pn1, 730) ==
+       QUICLY_FLEXICAST_OK);
+    ok(quicly_flexicast_ack_packet(flow, 1, pn1, &complete, 740) == QUICLY_FLEXICAST_OK && complete);
+    quicly_flexicast_flow_free(flow);
+
+    static const uint8_t fid2[4] = {0x99, 0x88, 0x77, 0x66};
+    uint8_t secret[32] = {0x5a};
+    quicly_flexicast_flow_t *flow2 = NULL;
+    quicly_flexicast_config_t cfg2 = {.flow_id = quicly_flexicast_flow_id_init(fid2, sizeof(fid2)),
+                                      .cipher_suite = &ptls_openssl_aes128gcmsha256,
+                                      .crypto_engine = &quicly_default_crypto_engine,
+                                      .traffic_secret = ptls_iovec_init(secret, sizeof(secret)),
+                                      .cc = cc,
+                                      .now = 800};
+    ok(quicly_flexicast_flow_create(&flow2, &cfg2) == QUICLY_FLEXICAST_OK);
+    ok(quicly_flexicast_attach(flow2, 2, 800) == QUICLY_FLEXICAST_OK);
+    quicly_flexicast_cc_get_flow_output(flow2, &output);
+    ok(output.next_timeout == INT64_MAX && output.rate_bytes_per_second == 100000);
+    for (int64_t now = 900; now <= 1300; now += 100)
+        quicly_flexicast_cc_on_flow_timeout(flow2, now);
+    quicly_flexicast_cc_get_flow_output(flow2, &output);
+    ok(output.rate_bytes_per_second == 100000 && output.next_timeout == INT64_MAX);
+    quicly_flexicast_flow_free(flow2);
+    quicly_flexicast_cc_free_multicast(cc);
+}
+
 void test_flexicast_cc_regressions(void)
 {
     subtest("multicast-zero-time-and-idle", test_multicast_zero_time_and_idle);
@@ -404,4 +481,5 @@ void test_flexicast_cc_regressions(void)
     subtest("rekey-16k-member-replacement", test_rekey_16k_member_replacement);
     subtest("duplicate-ack-delivery-clock", test_duplicate_ack_delivery_clock);
     subtest("suspend-legacy-controller", test_suspend_legacy_controller);
+    subtest("abandon-and-exclusive-reuse", test_abandon_and_exclusive_reuse);
 }

@@ -233,14 +233,19 @@ static void test_flexicast_control_queue(void)
     conn.super.ctx = &ctx;
     conn.super.version = QUICLY_PROTOCOL_VERSION_1;
     conn.local_multipath_enabled = 1;
+    conn.local_flexicast_ipv4 = 1;
     conn.super.remote.transport_params.enable_multipath = 1;
     conn.super.remote.transport_params.flexicast_support.ipv4 = 1;
     ok(quicly_flexicast_is_negotiated(&conn));
     conn.super.remote.transport_params.flexicast_support.ipv4 = 0;
     conn.super.remote.transport_params.flexicast_support.ipv6 = 1;
     ok(!quicly_flexicast_is_negotiated(&conn));
+    /* mutating shared ctx after connection setup does not alter negotiated per-connection families */
     ctx.transport_params.flexicast_support.ipv6 = 1;
+    ok(!quicly_flexicast_is_negotiated(&conn));
+    conn.local_flexicast_ipv6 = 1;
     ok(quicly_flexicast_is_negotiated(&conn));
+    conn.local_flexicast_ipv6 = 0;
     ctx.transport_params.flexicast_support.ipv6 = 0;
     conn.super.remote.transport_params.flexicast_support.ipv4 = 1;
     conn.super.remote.transport_params.flexicast_support.ipv6 = 0;
@@ -288,8 +293,9 @@ static void test_flexicast_control_queue(void)
         free_flexicast_control(control);
     }
     ok(quicly_flexicast_unbind_ack_path(&conn, &max_fid) == 0);
-    /* unbound flow_id is rejected */
+    /* unbound flow_id is rejected and retired ack_path_id cannot be reused */
     ok(send_single_fc_path_ack(&conn, &max_fid, 0, 1) == QUICLY_TRANSPORT_ERROR_PROTOCOL_VIOLATION);
+    ok(quicly_flexicast_bind_ack_path(&conn, PTLS_QUICINT_MAX, &other_fid) == PTLS_ERROR_LIBRARY);
     ok(quicly_flexicast_bind_ack_path(&conn, PTLS_QUICINT_MAX + 1, &other_fid) == PTLS_ERROR_LIBRARY);
 
     quicly_flexicast_flow_id_t coalesce_fid = {.len = 3, .bytes = {0xfc, 0x01, 0x00}};
@@ -367,6 +373,7 @@ static void test_flexicast_control_queue(void)
     ok(conn.egress.flexicast_control.count == 0 && conn.egress.flexicast_control.head == NULL);
     sent.data.flexicast_control.generation = 3;
     ok(on_ack_flexicast_control(&path_space.loss.sentmap, &packet, 1, &sent) == 0);
+    free(conn.egress.flexicast_control.retired_ids);
 }
 
 static uint64_t test_flexicast_ack_delay;
@@ -394,6 +401,7 @@ static void test_flexicast_control_receive(void)
     conn.super.ctx = &ctx;
     conn.super.version = QUICLY_PROTOCOL_VERSION_1;
     conn.local_multipath_enabled = 1;
+    conn.local_flexicast_ipv4 = 1;
     conn.super.remote.transport_params.enable_multipath = 1;
     conn.super.remote.transport_params.flexicast_support.ipv4 = 1;
 
@@ -459,6 +467,24 @@ static void test_flexicast_control_receive(void)
     payload.src = path_ack;
     ok(handle_path_ack_frame(&conn, &payload) == QUICLY_TRANSPORT_ERROR_PROTOCOL_VIOLATION);
     ok(quicly_flexicast_unbind_ack_path(&conn, &bound_fid) == 0);
+    /* delayed PATH_ACK after unbind is ignored on server even when ack_path_id > local.max_path_id */
+    conn.super.local.bidi.next_stream_id = 1;
+    conn.super.local.max_path_id = 4;
+    test_received_ack_flow_id = (quicly_flexicast_flow_id_t){0};
+    payload.src = path_ack;
+    ok(handle_path_ack_frame(&conn, &payload) == 0);
+    ok(test_received_ack_flow_id.len == 0);
+    /* retired ack_path_id cannot be reused for another flow or unicast PATH_ABANDON */
+    quicly_flexicast_flow_id_t new_fid = {.len = 2, .bytes = {0xaa, 0xbb}};
+    ok(quicly_flexicast_bind_ack_path(&conn, 9, &new_fid) == PTLS_ERROR_LIBRARY);
+    uint8_t abandon_retired[] = {9, 0};
+    struct st_quicly_handle_payload_state_t abandon_state = {.src = abandon_retired,
+                                                             .end = abandon_retired + sizeof(abandon_retired),
+                                                             .frame_type = QUICLY_FRAME_TYPE_PATH_ABANDON,
+                                                             .epoch = QUICLY_EPOCH_1RTT};
+    conn.super.local.max_path_id = 12;
+    ok(handle_path_abandon_frame(&conn, &abandon_state) == QUICLY_TRANSPORT_ERROR_PROTOCOL_VIOLATION);
+    free(conn.egress.flexicast_control.retired_ids);
 }
 
 struct st_test_flexicast_announce_order_t {
@@ -503,6 +529,7 @@ static void test_flexicast_announce_order(void)
     conn.super.ctx = &ctx;
     conn.super.version = QUICLY_PROTOCOL_VERSION_1;
     conn.local_multipath_enabled = 1;
+    conn.local_flexicast_ipv4 = 1;
     conn.super.remote.transport_params.enable_multipath = 1;
     conn.super.remote.transport_params.flexicast_support.ipv4 = 1;
     quicly_flexicast_announce_frame_t announce = {.flow_id = {.len = 1, .bytes = {1}}, .ip_version = 4, .udp_port = 443};
@@ -4359,6 +4386,16 @@ static void test_flexicast_control_exchange(void)
     quicly_conn_t *client, *server;
     test_setup_connected_peers(&client, &server);
     ok(quicly_flexicast_is_negotiated(client) && quicly_flexicast_is_negotiated(server));
+    /* mutating shared context after handshake must not change negotiated families on existing connections */
+    quic_ctx.transport_params.flexicast_support.ipv4 = 0;
+    quic_ctx.transport_params.flexicast_support.ipv6 = 1;
+    ok(quicly_flexicast_is_negotiated(client) && quicly_flexicast_is_negotiated(server));
+    quicly_flexicast_announce_frame_t unadvertised_v6 = {.flow_id = {.bytes = {0xfc, 0x06}, .len = 2}, .ip_version = 6};
+    server->super.remote.transport_params.flexicast_support.ipv6 = 1;
+    ok(quicly_flexicast_send_announce(server, &unadvertised_v6) == QUICLY_TRANSPORT_ERROR_PROTOCOL_VIOLATION);
+    server->super.remote.transport_params.flexicast_support.ipv6 = 0;
+    quic_ctx.transport_params.flexicast_support.ipv4 = 1;
+    quic_ctx.transport_params.flexicast_support.ipv6 = 0;
 
     /* announce a 4-byte flow ID, bind ack_path_id = 3 (above initial_max_path_id = 2), install key, and deliver multicast data */
     quicly_flexicast_announce_frame_t announce = {.flow_id = {.bytes = {0xfc, 0x01, 0x02, 0x03}, .len = 4},

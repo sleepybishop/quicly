@@ -360,6 +360,27 @@ static void test_invalid_pn_before_aead(void)
     quicly_flexicast_flow_free(rx);
 }
 
+static void test_retired_key_state_exhaustion(void)
+{
+    uint8_t secret[32] = {0};
+    quicly_flexicast_config_t cfg = crypto_config(secret);
+    quicly_flexicast_flow_t *flow = NULL;
+
+    ok(quicly_flexicast_flow_create(&flow, &cfg) == QUICLY_FLEXICAST_OK);
+    int rotated = 1;
+    for (uint32_t i = 1; i <= QUICLY_FLEXICAST_MAX_RETIRED_KEYS; ++i) {
+        memcpy(secret, &i, sizeof(i));
+        rotated &= quicly_flexicast_flow_rekey(flow, ptls_iovec_init(secret, sizeof(secret)), i, (int64_t)i) == QUICLY_FLEXICAST_OK;
+    }
+    ok(rotated);
+    /* 4097th fresh rotation reports STATE_EXHAUSTION rather than KEY_UPDATE_REQUIRED */
+    uint32_t overflow_idx = QUICLY_FLEXICAST_MAX_RETIRED_KEYS + 1;
+    memcpy(secret, &overflow_idx, sizeof(overflow_idx));
+    ok(quicly_flexicast_flow_rekey(flow, ptls_iovec_init(secret, sizeof(secret)), overflow_idx, 5000) ==
+       QUICLY_FLEXICAST_ERROR_STATE_EXHAUSTION);
+    quicly_flexicast_flow_free(flow);
+}
+
 void test_flexicast_crypto(void)
 {
     test_encryption_budget_and_rekey();
@@ -369,4 +390,5 @@ void test_flexicast_crypto(void)
     test_rekey_setup_failure();
     test_decryption_budget_and_receive_floor();
     test_invalid_pn_before_aead();
+    test_retired_key_state_exhaustion();
 }

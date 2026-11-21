@@ -13,3 +13,4 @@ xcuserdata
 tmp/
 *.o
 *.d
+/include/quicly/config.h

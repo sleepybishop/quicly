@@ -37,6 +37,7 @@ INCLUDE_DIRECTORIES(
     deps/klib
     deps/picotls/include
     deps/picotest
+    ${CMAKE_CURRENT_BINARY_DIR}/include
     include
     ${CMAKE_CURRENT_BINARY_DIR})
 
@@ -47,6 +48,10 @@ SET(PICOTLS_OPENSSL_FILES
     deps/picotls/lib/picotls.c)
 
 OPTION(BUILD_FLEXICAST "Build flexicast support" ON)
+SET(QUICLY_HAVE_FLEXICAST ${BUILD_FLEXICAST})
+CONFIGURE_FILE(
+    ${CMAKE_CURRENT_SOURCE_DIR}/include/quicly/config.h.in
+    ${CMAKE_CURRENT_BINARY_DIR}/include/quicly/config.h)
 
 SET(QUICLY_LIBRARY_FILES
     lib/bplus_ranges.c
@@ -86,7 +91,6 @@ SET(UNITTEST_SOURCE_FILES
     t/test.c)
 
 IF (BUILD_FLEXICAST)
-    SET(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -DQUICLY_HAVE_FLEXICAST=1")
     SET(FLEXICAST_LIBRARY_FILES
         lib/flexicast.c
         lib/flexicast_cc_multicast.c)
@@ -95,8 +99,6 @@ IF (BUILD_FLEXICAST)
         t/flexicast-cc-regression.c
         t/flexicast-crypto.c
         t/flexicast-packet.c)
-ELSE ()
-    SET(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -DQUICLY_HAVE_FLEXICAST=0")
 ENDIF ()
 
 IF (WITH_DTRACE)
@@ -120,10 +122,12 @@ ADD_CUSTOM_COMMAND(
     VERBATIM)
 
 ADD_LIBRARY(quicly ${QUICLY_LIBRARY_FILES})
+TARGET_INCLUDE_DIRECTORIES(quicly PUBLIC ${CMAKE_CURRENT_BINARY_DIR}/include ${CMAKE_CURRENT_SOURCE_DIR}/include)
 TARGET_LINK_LIBRARIES(quicly LINK_PUBLIC m)
 
 IF (BUILD_FLEXICAST)
     ADD_LIBRARY(quicly-flexicast ${FLEXICAST_LIBRARY_FILES})
+    TARGET_INCLUDE_DIRECTORIES(quicly-flexicast PUBLIC ${CMAKE_CURRENT_BINARY_DIR}/include ${CMAKE_CURRENT_SOURCE_DIR}/include)
     TARGET_LINK_LIBRARIES(quicly-flexicast quicly)
 ENDIF ()
 
@@ -170,7 +174,6 @@ ADD_CUSTOM_TARGET(check
         "PERL5LIB='${CMAKE_CURRENT_SOURCE_DIR}'\${PERL5LIB:+:\$PERL5LIB} \
          BINARY_DIR='${CMAKE_CURRENT_BINARY_DIR}' \
          WITH_DTRACE=${WITH_DTRACE} \
-         BUILD_FLEXICAST=${BUILD_FLEXICAST} \
          exec prove --exec 'sh -c' -v ${CMAKE_CURRENT_BINARY_DIR}/*.t t/*.t"
     WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}
     DEPENDS ${CHECK_DEPENDS}

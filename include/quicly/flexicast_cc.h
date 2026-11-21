@@ -1,6 +1,11 @@
 #ifndef quicly_flexicast_cc_h
 #define quicly_flexicast_cc_h
 
+#include "quicly/config.h"
+#if !QUICLY_HAVE_FLEXICAST
+#error "flexicast support is disabled in this build"
+#endif
+
 #ifdef __cplusplus
 extern "C" {
 #endif
@@ -94,12 +99,16 @@ struct st_quicly_flexicast_cc_type_t {
     void (*on_member_suspended)(quicly_flexicast_cc_t *cc, uint64_t member_id, int64_t now);
     void (*on_epoch_reset)(quicly_flexicast_cc_t *cc, int64_t now);
     void (*on_packet_sent)(quicly_flexicast_cc_t *cc, uint64_t packet_number, size_t packet_size, int64_t now);
+    void (*on_packet_retired)(quicly_flexicast_cc_t *cc, uint64_t member_id, uint64_t packet_number, int member_caught_up,
+                              int64_t now);
     void (*on_feedback)(quicly_flexicast_cc_t *cc, const quicly_flexicast_feedback_t *feedback);
     void (*on_timeout)(quicly_flexicast_cc_t *cc, int64_t now);
 };
 
 struct st_quicly_flexicast_cc_t {
     quicly_flexicast_cc_type_t *type;
+    /* flow instance currently attached to this controller; NULL when unbound */
+    void *bound_flow;
     quicly_flexicast_cc_config_t config;
     quicly_flexicast_cc_output_t output;
 };
@@ -226,6 +235,17 @@ static inline void quicly_flexicast_cc_on_packet_sent(quicly_flexicast_cc_t *cc,
         return;
     if (cc->type->on_packet_sent != NULL) {
         cc->type->on_packet_sent(cc, packet_number, packet_size, now);
+        quicly_flexicast_cc_normalize_output(cc);
+    }
+}
+
+static inline void quicly_flexicast_cc_on_packet_retired(quicly_flexicast_cc_t *cc, uint64_t member_id, uint64_t packet_number,
+                                                         int member_caught_up, int64_t now)
+{
+    if (cc == NULL || member_id == 0)
+        return;
+    if (cc->type->on_packet_retired != NULL) {
+        cc->type->on_packet_retired(cc, member_id, packet_number, member_caught_up, now);
         quicly_flexicast_cc_normalize_output(cc);
     }
 }

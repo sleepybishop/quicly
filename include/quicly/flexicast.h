@@ -1,6 +1,11 @@
 #ifndef quicly_flexicast_h
 #define quicly_flexicast_h
 
+#include "quicly/config.h"
+#if !QUICLY_HAVE_FLEXICAST
+#error "flexicast support is disabled in this build"
+#endif
+
 #include "quicly.h"
 #include "quicly/flexicast_cc.h"
 
@@ -21,6 +26,7 @@ extern "C" {
 #define QUICLY_FLEXICAST_MAX_PACKET_SIZE 65507
 #define QUICLY_FLEXICAST_DEFAULT_ACK_FREQUENCY 8
 #define QUICLY_FLEXICAST_MAX_ACK_ENCODED_SIZE 2048
+#define QUICLY_FLEXICAST_MAX_RETIRED_KEYS 4096
 
 typedef struct st_quicly_flexicast_flow_t quicly_flexicast_flow_t;
 
@@ -91,6 +97,7 @@ typedef struct st_quicly_flexicast_decrypted_t {
 } quicly_flexicast_decrypted_t;
 
 int quicly_flexicast_flow_create(quicly_flexicast_flow_t **flow, const quicly_flexicast_config_t *config);
+/* rotates traffic keys; returns STATE_EXHAUSTION once QUICLY_FLEXICAST_MAX_RETIRED_KEYS distinct retired keys accumulate */
 int quicly_flexicast_flow_rekey(quicly_flexicast_flow_t *flow, ptls_iovec_t traffic_secret, uint64_t first_packet_number,
                                 int64_t now);
 void quicly_flexicast_flow_free(quicly_flexicast_flow_t *flow);
@@ -144,6 +151,8 @@ static inline int quicly_flexicast_receive_datagram(quicly_flexicast_flow_t *flo
     return ret;
 }
 
+/* updates receiver ACK timer delay in place; zero sets immediate ACK (0 ms) and >UINT32_MAX clamps to UINT32_MAX */
+int quicly_flexicast_set_ack_delay(quicly_flexicast_flow_t *flow, uint64_t ack_delay_msec);
 int64_t quicly_flexicast_get_ack_deadline(const quicly_flexicast_flow_t *flow);
 int quicly_flexicast_ack_is_due(const quicly_flexicast_flow_t *flow, int64_t now);
 int quicly_flexicast_send_pending_ack(quicly_flexicast_flow_t *flow, quicly_conn_t *conn, int64_t now, int force);
@@ -156,7 +165,6 @@ int quicly_flexicast_get_receive_state(const quicly_flexicast_flow_t *flow, cons
 #define QUICLY_FLEXICAST_ACK_OMIT_RTT 1u
 #define QUICLY_FLEXICAST_ACK_OMIT_DELIVERY_RATE 2u
 #define QUICLY_FLEXICAST_ACK_DEFER_LOSS 4u
-#define QUICLY_FLEXICAST_ACK_ALLOW_INACTIVE 8u
 
 int quicly_flexicast_ack_packet(quicly_flexicast_flow_t *flow, uint64_t member_id, uint64_t packet_number, int *complete,
                                 int64_t now);
