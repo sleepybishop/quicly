@@ -237,6 +237,7 @@ static void test_flexicast_control_queue(void)
     conn.super.remote.transport_params.enable_multipath = 1;
     conn.super.remote.transport_params.flexicast_support.ipv4 = 1;
     ok(quicly_flexicast_is_negotiated(&conn));
+    ok(conn.egress.flexicast_control == NULL);
     conn.super.remote.transport_params.flexicast_support.ipv4 = 0;
     conn.super.remote.transport_params.flexicast_support.ipv6 = 1;
     ok(!quicly_flexicast_is_negotiated(&conn));
@@ -261,7 +262,7 @@ static void test_flexicast_control_queue(void)
     uint64_t packet_numbers[] = {0, 63, 64, 16383, 16384, PTLS_QUICINT_MAX};
     for (size_t i = 0; i != PTLS_ELEMENTSOF(packet_numbers); ++i) {
         ok(send_single_fc_path_ack(&conn, &max_fid, packet_numbers[i], 1) == 0);
-        quicly_flexicast_control_t *control = conn.egress.flexicast_control.head;
+        quicly_flexicast_control_t *control = conn.egress.flexicast_control->head;
         const uint8_t *src = control->encoded, *end = src + control->encoded_size;
         size_t initial_size = control->encoded_size;
         quicly_ack_frame_t ack;
@@ -287,9 +288,9 @@ static void test_flexicast_control_queue(void)
             ok(ack.largest_acknowledged == packet_numbers[i] && ack.smallest_acknowledged == packet_numbers[i]);
             ok(src + 1 == end && *src == QUICLY_FRAME_TYPE_PING);
         }
-        conn.egress.flexicast_control.head = NULL;
-        conn.egress.flexicast_control.tail_ref = NULL;
-        conn.egress.flexicast_control.count = 0;
+        conn.egress.flexicast_control->head = NULL;
+        conn.egress.flexicast_control->tail_ref = NULL;
+        conn.egress.flexicast_control->count = 0;
         free_flexicast_control(control);
     }
     ok(quicly_flexicast_unbind_ack_path(&conn, &max_fid) == 0);
@@ -305,8 +306,8 @@ static void test_flexicast_control_queue(void)
     /* repeated PATH_ACKs for the same bound flow coalesce into one slot without starving FC_STATE */
     for (uint64_t pn = 0; pn != 300; ++pn)
         ok(send_single_fc_path_ack(&conn, &coalesce_fid, pn, 10 + (int64_t)pn) == 0);
-    ok(conn.egress.flexicast_control.count == 1);
-    quicly_flexicast_control_t *coalesced = conn.egress.flexicast_control.head;
+    ok(conn.egress.flexicast_control->count == 1);
+    quicly_flexicast_control_t *coalesced = conn.egress.flexicast_control->head;
     const uint8_t *csrc = coalesced->encoded, *cend = csrc + coalesced->encoded_size;
     quicly_ack_frame_t cack;
     ok(quicly_decodev(&csrc, cend) == QUICLY_FRAME_TYPE_PATH_ACK && quicly_decodev(&csrc, cend) == 100);
@@ -316,30 +317,30 @@ static void test_flexicast_control_queue(void)
     uint64_t superseded_id = coalesced->id;
     coalesced->sender = QUICLY_SENDER_STATE_UNACKED;
     ok(send_single_fc_path_ack(&conn, &coalesce_fid, 300, 400) == 0);
-    coalesced = conn.egress.flexicast_control.head;
+    coalesced = conn.egress.flexicast_control->head;
     ok(coalesced->id != superseded_id && coalesced->sender == QUICLY_SENDER_STATE_SEND);
     quicly_path_space_t path_space = {.conn = &conn};
     quicly_path_recovery_t recovery = {.path_space = &path_space};
     quicly_sent_packet_t stale_pkt = {.frames_in_flight = 1};
     quicly_sent_t stale_sent = {.data.flexicast_control = {.id = superseded_id, .generation = 1}};
     ok(on_ack_flexicast_control(&recovery.loss.sentmap, &stale_pkt, 1, &stale_sent) == 0);
-    ok(conn.egress.flexicast_control.count == 1 && conn.egress.flexicast_control.head != NULL);
+    ok(conn.egress.flexicast_control->count == 1 && conn.egress.flexicast_control->head != NULL);
     /* unbinding also removes queued PATH_ACK entries for that flow */
     ok(quicly_flexicast_unbind_ack_path(&conn, &coalesce_fid) == 0);
-    ok(conn.egress.flexicast_control.count == 0 && conn.egress.flexicast_control.head == NULL);
+    ok(conn.egress.flexicast_control->count == 0 && conn.egress.flexicast_control->head == NULL);
 
     quicly_flexicast_state_frame_t state = {.flow_id = {.bytes = {1}, .len = 1}, .action = QUICLY_FLEXICAST_STATE_JOIN};
     quicly_flexicast_state_frame_t decoded;
     ok(quicly_flexicast_send_state(&conn, &state) == 0);
-    quicly_flexicast_control_t *control = conn.egress.flexicast_control.head;
+    quicly_flexicast_control_t *control = conn.egress.flexicast_control->head;
     csrc = control->encoded;
     cend = csrc + control->encoded_size;
     ok(quicly_decodev(&csrc, cend) == QUICLY_FRAME_TYPE_FC_STATE);
     ok(quicly_decode_fc_state_frame(&csrc, cend, &decoded) == 0 && csrc == cend && decoded.action == state.action);
     free_flexicast_control(control);
-    conn.egress.flexicast_control.head = NULL;
-    conn.egress.flexicast_control.tail_ref = NULL;
-    conn.egress.flexicast_control.count = 0;
+    conn.egress.flexicast_control->head = NULL;
+    conn.egress.flexicast_control->tail_ref = NULL;
+    conn.egress.flexicast_control->count = 0;
 
     /* frames cannot be split across QUIC packets; reject oversized keys before queueing */
     conn.super.local.bidi.next_stream_id = 1;
@@ -347,18 +348,18 @@ static void test_flexicast_control_queue(void)
     quicly_flexicast_key_frame_t key = {
         .flow_id = state.flow_id, .key = ptls_iovec_init(oversized_key, sizeof(oversized_key)), .algorithm = 0x1301};
     ok(quicly_flexicast_send_key(&conn, &key) == PTLS_ERROR_LIBRARY);
-    ok(conn.egress.flexicast_control.count == 0 && conn.egress.flexicast_control.head == NULL);
+    ok(conn.egress.flexicast_control->count == 0 && conn.egress.flexicast_control->head == NULL);
 
     quicly_flexicast_announce_frame_t announce = {.flow_id = state.flow_id, .ip_version = 6};
     ok(quicly_flexicast_send_announce(&conn, &announce) == QUICLY_TRANSPORT_ERROR_PROTOCOL_VIOLATION);
     conn.super.remote.transport_params.flexicast_support.ipv6 = 1;
     ok(quicly_flexicast_send_announce(&conn, &announce) == QUICLY_TRANSPORT_ERROR_PROTOCOL_VIOLATION);
-    ok(conn.egress.flexicast_control.count == 0);
+    ok(conn.egress.flexicast_control->count == 0);
 
     /* retransmission generation prevents an older lost copy from rescheduling the latest copy */
     conn.super.local.bidi.next_stream_id = 0;
     ok(quicly_flexicast_send_state(&conn, &state) == 0);
-    control = conn.egress.flexicast_control.head;
+    control = conn.egress.flexicast_control->head;
     control->generation = 2;
     control->sender = QUICLY_SENDER_STATE_UNACKED;
     quicly_sent_packet_t packet = {.frames_in_flight = 1};
@@ -371,7 +372,7 @@ static void test_flexicast_control_queue(void)
     control->generation = 3;
     control->sender = QUICLY_SENDER_STATE_UNACKED;
     ok(on_ack_flexicast_control(&recovery.loss.sentmap, &packet, 1, &sent) == 0);
-    ok(conn.egress.flexicast_control.count == 0 && conn.egress.flexicast_control.head == NULL);
+    ok(conn.egress.flexicast_control->count == 0 && conn.egress.flexicast_control->head == NULL);
     sent.data.flexicast_control.generation = 3;
     ok(on_ack_flexicast_control(&recovery.loss.sentmap, &packet, 1, &sent) == 0);
     /* sequential ack_path_ids coalesce into a single retired range without hitting a 4096 bind cap */
@@ -380,23 +381,23 @@ static void test_flexicast_control_queue(void)
         ok(quicly_flexicast_bind_ack_path(&conn, pid, &seq_fid) == 0);
         ok(quicly_flexicast_unbind_ack_path(&conn, &seq_fid) == 0);
     }
-    ok(conn.egress.flexicast_control.num_retired_ranges == 3); /* [100, 101), [1000, 6000), [PTLS_QUICINT_MAX, ...) */
+    ok(conn.egress.flexicast_control->num_retired_ranges == 3); /* [100, 101), [1000, 6000), [PTLS_QUICINT_MAX, ...) */
     /* at 4096 disjoint retired ranges, concurrent gap-bridging bindings both succeed and coalesce to 4094 on unbind */
-    for (size_t i = 0; conn.egress.flexicast_control.num_retired_ranges < QUICLY_MAX_FLEXICAST_RETIRED_ACK_RANGES; ++i) {
+    for (size_t i = 0; conn.egress.flexicast_control->num_retired_ranges < QUICLY_MAX_FLEXICAST_RETIRED_ACK_RANGES; ++i) {
         uint64_t pid = 10000 + i * 2;
         quicly_flexicast_flow_id_t dis_fid = make_fc_id_u64(pid);
         ok(quicly_flexicast_bind_ack_path(&conn, pid, &dis_fid) == 0);
         ok(quicly_flexicast_unbind_ack_path(&conn, &dis_fid) == 0);
     }
-    ok(conn.egress.flexicast_control.num_retired_ranges == QUICLY_MAX_FLEXICAST_RETIRED_ACK_RANGES);
+    ok(conn.egress.flexicast_control->num_retired_ranges == QUICLY_MAX_FLEXICAST_RETIRED_ACK_RANGES);
     quicly_flexicast_flow_id_t bridge1 = make_fc_id_u64(10001), bridge2 = make_fc_id_u64(10003), non_merge = make_fc_id_u64(999999);
     ok(quicly_flexicast_bind_ack_path(&conn, 10001, &bridge1) == 0);
     ok(quicly_flexicast_bind_ack_path(&conn, 10003, &bridge2) == 0);
     ok(quicly_flexicast_bind_ack_path(&conn, 999999, &non_merge) == QUICLY_ERROR_STATE_EXHAUSTION);
     ok(quicly_flexicast_unbind_ack_path(&conn, &bridge1) == 0);
     ok(quicly_flexicast_unbind_ack_path(&conn, &bridge2) == 0);
-    ok(conn.egress.flexicast_control.num_retired_ranges == QUICLY_MAX_FLEXICAST_RETIRED_ACK_RANGES - 2);
-    free(conn.egress.flexicast_control.retired_ranges);
+    ok(conn.egress.flexicast_control->num_retired_ranges == QUICLY_MAX_FLEXICAST_RETIRED_ACK_RANGES - 2);
+    free_flexicast_control_state(conn.egress.flexicast_control);
 }
 
 static uint64_t test_flexicast_ack_delay;
@@ -507,7 +508,7 @@ static void test_flexicast_control_receive(void)
                                                              .epoch = QUICLY_EPOCH_1RTT};
     conn.super.local.max_path_id = 12;
     ok(handle_path_abandon_frame(&conn, &abandon_state) == QUICLY_TRANSPORT_ERROR_PROTOCOL_VIOLATION);
-    free(conn.egress.flexicast_control.retired_ranges);
+    free_flexicast_control_state(conn.egress.flexicast_control);
 }
 
 struct st_test_flexicast_announce_order_t {
@@ -4434,7 +4435,7 @@ static void test_flexicast_control_exchange(void)
     ok(quicly_flexicast_bind_ack_path(server, 3, &announce.flow_id) == 0);
     ok(quicly_flexicast_send_announce(server, &announce) == 0);
     exchange_until_idle(client, server);
-    ok(flexicast_control_received[0] == 1 && server->egress.flexicast_control.count == 0);
+    ok(flexicast_control_received[0] == 1 && server->egress.flexicast_control->count == 0);
     ok(quicly_flexicast_bind_ack_path(client, 3, &flexicast_last_announce.flow_id) == 0);
 
     quicly_flexicast_state_frame_t state = {.flow_id = announce.flow_id, .action = QUICLY_FLEXICAST_STATE_JOIN};
@@ -4513,7 +4514,7 @@ static void test_flexicast_control_exchange(void)
     ok(quicly_flexicast_send_state(server, &state) == 0);
     exchange_flexicast_until_idle(client, server);
     ok(flexicast_control_received[1] == 3 && flexicast_received_action == QUICLY_FLEXICAST_STATE_LEAVE);
-    ok(client->egress.flexicast_control.count == 0 && server->egress.flexicast_control.count == 0);
+    ok(client->egress.flexicast_control->count == 0 && server->egress.flexicast_control->count == 0);
 
     flexicast_exchange_tx_flow = NULL;
     quicly_flexicast_flow_free(rx_flow);
@@ -4594,7 +4595,7 @@ static void test_flexicast_control_send_timing(void)
     quicly_get_stats(client, &after);
     ok(after.num_frames_sent.fc_state == before.num_frames_sent.fc_state);
     ok(after.num_frames_sent.path_ack == before.num_frames_sent.path_ack);
-    ok(client->egress.flexicast_control.count == 2);
+    ok(client->egress.flexicast_control->count == 2);
 
     /* enabling 1-RTT write keys rearms OTHERS_BIT and flushes queued control frames */
     client->application->one_rtt_writable = 1;
@@ -4603,7 +4604,7 @@ static void test_flexicast_control_send_timing(void)
     ok(quicly_get_first_timeout(client) <= quic_now);
     if (!exchange_flexicast_until_idle(client, server))
         goto Exit;
-    ok(client->egress.flexicast_control.count == 0);
+    ok(client->egress.flexicast_control->count == 0);
 
     /* hold the first ACK in the queue, then lose its packet; retransmission includes both delays */
     int64_t queued_at = quic_now;
@@ -4612,7 +4613,7 @@ static void test_flexicast_control_send_timing(void)
     num_datagrams = PTLS_ELEMENTSOF(datagrams);
     ok(quicly_send(client, &dest, &src, datagrams, &num_datagrams, packetsbuf, sizeof(packetsbuf)) == 0);
     ok(num_datagrams != 0);
-    quicly_flexicast_control_t *control = client->egress.flexicast_control.head;
+    quicly_flexicast_control_t *control = client->egress.flexicast_control->head;
     ok(control != NULL && control->sender == QUICLY_SENDER_STATE_UNACKED);
     const uint8_t *p = control->encoded, *end = p + control->encoded_size;
     quicly_ack_frame_t ack;
@@ -4629,7 +4630,7 @@ static void test_flexicast_control_send_timing(void)
     ok(test_flexicast_ack_delay == (uint64_t)(quic_now - queued_at) && quic_now - queued_at > 17);
     if (!exchange_flexicast_until_idle(client, server))
         goto Exit;
-    ok(client->egress.flexicast_control.count == 0);
+    ok(client->egress.flexicast_control->count == 0);
 
     /* send_pending_ack preserves elapsed delay and coalesces repeated updates during unicast stalls */
     uint8_t secret[32] = {0}, multicast_packet[256];
@@ -4655,7 +4656,7 @@ static void test_flexicast_control_send_timing(void)
     transmit(client, server);
     ok(test_flexicast_ack_delay == 30);
     exchange_flexicast_until_idle(client, server);
-    ok(client->egress.flexicast_control.count == 0);
+    ok(client->egress.flexicast_control->count == 0);
 
     /* 300 stalled send_pending_ack updates coalesce into 1 slot and leave room for FC_STATE */
     for (int i = 0; i != 300; ++i) {
@@ -4664,13 +4665,13 @@ static void test_flexicast_control_send_timing(void)
         ok(quicly_flexicast_receive_datagram(receiver, multicast_packet, packet_size, &payload, &packet_number, 0, quic_now) == 0);
         ok(quicly_flexicast_send_pending_ack(receiver, client, quic_now, 1) == 0);
     }
-    ok(client->egress.flexicast_control.count == 1);
+    ok(client->egress.flexicast_control->count == 1);
     state.action = QUICLY_FLEXICAST_STATE_LEAVE;
     state.sequence = 99;
     ok(quicly_flexicast_send_state(client, &state) == 0);
-    ok(client->egress.flexicast_control.count == 2);
+    ok(client->egress.flexicast_control->count == 2);
     exchange_flexicast_until_idle(client, server);
-    ok(client->egress.flexicast_control.count == 0);
+    ok(client->egress.flexicast_control->count == 0);
 
     quicly_flexicast_flow_free(receiver);
     quicly_flexicast_flow_free(source);

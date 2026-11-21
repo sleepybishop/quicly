@@ -421,6 +421,18 @@ typedef struct st_quicly_flexicast_ack_binding_t {
     uint64_t ack_path_id;
     quicly_flexicast_flow_id_t flow_id;
 } quicly_flexicast_ack_binding_t;
+
+typedef struct st_quicly_flexicast_control_state_t {
+    quicly_flexicast_control_t *head;
+    quicly_flexicast_control_t **tail_ref;
+    quicly_flexicast_ack_binding_t *bindings;
+    quicly_range_t *retired_ranges;
+    uint64_t next_id;
+    size_t count;
+    size_t num_bindings;
+    size_t num_retired_ranges;
+    size_t retired_ranges_capacity;
+} quicly_flexicast_control_state_t;
 #endif
 
 struct st_quicly_conn_t {
@@ -568,17 +580,7 @@ struct st_quicly_conn_t {
             uint64_t max_path_id;
         } paths_blocked;
 #if QUICLY_HAVE_FLEXICAST
-        struct {
-            quicly_flexicast_control_t *head;
-            quicly_flexicast_control_t **tail_ref;
-            quicly_flexicast_ack_binding_t *bindings;
-            quicly_range_t *retired_ranges;
-            uint64_t next_id;
-            size_t count;
-            size_t num_bindings;
-            size_t num_retired_ranges;
-            size_t retired_ranges_capacity;
-        } flexicast_control;
+        quicly_flexicast_control_state_t *flexicast_control;
 #endif
         /**
          * bit vector indicating if there's any pending crypto data (the insignificant 4 bits), or other non-stream data
@@ -861,9 +863,24 @@ int quicly_flexicast_is_negotiated(quicly_conn_t *conn)
 #define QUICLY_MAX_FLEXICAST_CONTROL_PAYLOAD                                                                                       \
     (QUICLY_MIN_CLIENT_INITIAL_SIZE - (1 + QUICLY_MAX_CID_LEN_V1 + QUICLY_SEND_PN_SIZE + QUICLY_AEAD_TAG_SIZE))
 
+static quicly_error_t ensure_flexicast_control_state(quicly_conn_t *conn)
+{
+    if (conn->egress.flexicast_control == NULL &&
+        (conn->egress.flexicast_control = calloc(1, sizeof(*conn->egress.flexicast_control))) == NULL)
+        return PTLS_ERROR_NO_MEMORY;
+    return 0;
+}
+
+static quicly_flexicast_control_t *flexicast_control_head(const quicly_conn_t *conn)
+{
+    return conn->egress.flexicast_control != NULL ? conn->egress.flexicast_control->head : NULL;
+}
+
 static quicly_flexicast_ack_binding_t *find_flexicast_ack_binding_by_path_id(const quicly_conn_t *conn, uint64_t ack_path_id)
 {
-    for (quicly_flexicast_ack_binding_t *b = conn->egress.flexicast_control.bindings; b != NULL; b = b->next) {
+    if (conn->egress.flexicast_control == NULL)
+        return NULL;
+    for (quicly_flexicast_ack_binding_t *b = conn->egress.flexicast_control->bindings; b != NULL; b = b->next) {
         if (b->ack_path_id == ack_path_id)
             return b;
     }
@@ -873,7 +890,9 @@ static quicly_flexicast_ack_binding_t *find_flexicast_ack_binding_by_path_id(con
 static quicly_flexicast_ack_binding_t *find_flexicast_ack_binding_by_flow_id(const quicly_conn_t *conn,
                                                                              const quicly_flexicast_flow_id_t *flow_id)
 {
-    for (quicly_flexicast_ack_binding_t *b = conn->egress.flexicast_control.bindings; b != NULL; b = b->next) {
+    if (conn->egress.flexicast_control == NULL)
+        return NULL;
+    for (quicly_flexicast_ack_binding_t *b = conn->egress.flexicast_control->bindings; b != NULL; b = b->next) {
         if (quicly_flexicast_flow_id_equal(&b->flow_id, flow_id))
             return b;
     }
@@ -895,8 +914,10 @@ static size_t find_retired_ack_range_slot(const quicly_range_t *ranges, size_t n
 
 static int is_retired_flexicast_ack_path(const quicly_conn_t *conn, uint64_t path_id)
 {
-    const quicly_range_t *ranges = conn->egress.flexicast_control.retired_ranges;
-    size_t n = conn->egress.flexicast_control.num_retired_ranges;
+    if (conn->egress.flexicast_control == NULL)
+        return 0;
+    const quicly_range_t *ranges = conn->egress.flexicast_control->retired_ranges;
+    size_t n = conn->egress.flexicast_control->num_retired_ranges;
     if (n == 0 || path_id < ranges[0].start || path_id >= ranges[n - 1].end)
         return 0;
     size_t slot = find_retired_ack_range_slot(ranges, n, path_id);
@@ -905,8 +926,10 @@ static int is_retired_flexicast_ack_path(const quicly_conn_t *conn, uint64_t pat
 
 static int retired_ack_path_merges(const quicly_conn_t *conn, uint64_t path_id)
 {
-    const quicly_range_t *ranges = conn->egress.flexicast_control.retired_ranges;
-    size_t n = conn->egress.flexicast_control.num_retired_ranges;
+    if (conn->egress.flexicast_control == NULL)
+        return 0;
+    const quicly_range_t *ranges = conn->egress.flexicast_control->retired_ranges;
+    size_t n = conn->egress.flexicast_control->num_retired_ranges;
     if (n == 0)
         return 0;
     size_t slot = find_retired_ack_range_slot(ranges, n, path_id);
@@ -921,34 +944,34 @@ static inline int is_flexicast_ack_path(const quicly_conn_t *conn, uint64_t path
 static quicly_error_t ensure_retired_flexicast_ack_capacity(quicly_conn_t *conn, uint64_t candidate_id)
 {
     size_t non_merging = retired_ack_path_merges(conn, candidate_id) ? 0 : 1;
-    for (const quicly_flexicast_ack_binding_t *b = conn->egress.flexicast_control.bindings; b != NULL; b = b->next) {
+    for (const quicly_flexicast_ack_binding_t *b = conn->egress.flexicast_control->bindings; b != NULL; b = b->next) {
         if (!retired_ack_path_merges(conn, b->ack_path_id))
             ++non_merging;
     }
-    size_t needed = conn->egress.flexicast_control.num_retired_ranges + non_merging;
+    size_t needed = conn->egress.flexicast_control->num_retired_ranges + non_merging;
     if (needed > QUICLY_MAX_FLEXICAST_RETIRED_ACK_RANGES)
         return QUICLY_ERROR_STATE_EXHAUSTION;
-    if (needed <= conn->egress.flexicast_control.retired_ranges_capacity)
+    if (needed <= conn->egress.flexicast_control->retired_ranges_capacity)
         return 0;
-    size_t capacity = conn->egress.flexicast_control.retired_ranges_capacity != 0
-                          ? conn->egress.flexicast_control.retired_ranges_capacity * 2
+    size_t capacity = conn->egress.flexicast_control->retired_ranges_capacity != 0
+                          ? conn->egress.flexicast_control->retired_ranges_capacity * 2
                           : 16;
     while (capacity < needed)
         capacity *= 2;
     if (capacity > QUICLY_MAX_FLEXICAST_RETIRED_ACK_RANGES)
         capacity = QUICLY_MAX_FLEXICAST_RETIRED_ACK_RANGES;
-    quicly_range_t *ranges = realloc(conn->egress.flexicast_control.retired_ranges, capacity * sizeof(*ranges));
+    quicly_range_t *ranges = realloc(conn->egress.flexicast_control->retired_ranges, capacity * sizeof(*ranges));
     if (ranges == NULL)
         return PTLS_ERROR_NO_MEMORY;
-    conn->egress.flexicast_control.retired_ranges = ranges;
-    conn->egress.flexicast_control.retired_ranges_capacity = capacity;
+    conn->egress.flexicast_control->retired_ranges = ranges;
+    conn->egress.flexicast_control->retired_ranges_capacity = capacity;
     return 0;
 }
 
 static void retire_flexicast_ack_path(quicly_conn_t *conn, uint64_t ack_path_id)
 {
-    quicly_range_t *ranges = conn->egress.flexicast_control.retired_ranges;
-    size_t n = conn->egress.flexicast_control.num_retired_ranges;
+    quicly_range_t *ranges = conn->egress.flexicast_control->retired_ranges;
+    size_t n = conn->egress.flexicast_control->num_retired_ranges;
     size_t slot = find_retired_ack_range_slot(ranges, n, ack_path_id);
     int merge_prev = slot > 0 && ranges[slot - 1].end == ack_path_id;
     int merge_next = slot < n && ack_path_id + 1 == ranges[slot].start;
@@ -957,17 +980,17 @@ static void retire_flexicast_ack_path(quicly_conn_t *conn, uint64_t ack_path_id)
         ranges[slot - 1].end = ranges[slot].end;
         if (slot + 1 < n)
             memmove(ranges + slot, ranges + slot + 1, (n - slot - 1) * sizeof(*ranges));
-        --conn->egress.flexicast_control.num_retired_ranges;
+        --conn->egress.flexicast_control->num_retired_ranges;
     } else if (merge_prev) {
         ranges[slot - 1].end = ack_path_id + 1;
     } else if (merge_next) {
         ranges[slot].start = ack_path_id;
     } else {
-        assert(n < conn->egress.flexicast_control.retired_ranges_capacity);
+        assert(n < conn->egress.flexicast_control->retired_ranges_capacity);
         if (slot < n)
             memmove(ranges + slot + 1, ranges + slot, (n - slot) * sizeof(*ranges));
         ranges[slot] = (quicly_range_t){ack_path_id, ack_path_id + 1};
-        ++conn->egress.flexicast_control.num_retired_ranges;
+        ++conn->egress.flexicast_control->num_retired_ranges;
     }
 }
 
@@ -978,6 +1001,24 @@ static void free_flexicast_control(quicly_flexicast_control_t *control)
     if (control->type == QUICLY_FRAME_TYPE_FC_KEY)
         ptls_clear_memory(control->encoded, control->encoded_size);
     free(control);
+}
+
+static void free_flexicast_control_state(quicly_flexicast_control_state_t *state)
+{
+    if (state == NULL)
+        return;
+    while (state->head != NULL) {
+        quicly_flexicast_control_t *control = state->head;
+        state->head = control->next;
+        free_flexicast_control(control);
+    }
+    while (state->bindings != NULL) {
+        quicly_flexicast_ack_binding_t *binding = state->bindings;
+        state->bindings = binding->next;
+        free(binding);
+    }
+    free(state->retired_ranges);
+    free(state);
 }
 
 static void arm_flexicast_control_send(quicly_conn_t *conn)
@@ -993,7 +1034,10 @@ static quicly_error_t alloc_flexicast_control(quicly_conn_t *conn, uint64_t type
         return QUICLY_TRANSPORT_ERROR_PROTOCOL_VIOLATION;
     if (encoded_size == 0 || encoded_size > QUICLY_MAX_FLEXICAST_CONTROL_PAYLOAD)
         return PTLS_ERROR_LIBRARY;
-    if (conn->egress.flexicast_control.count >= 256 || conn->egress.flexicast_control.next_id == UINT64_MAX)
+    quicly_error_t ret = ensure_flexicast_control_state(conn);
+    if (ret != 0)
+        return ret;
+    if (conn->egress.flexicast_control->count >= 256 || conn->egress.flexicast_control->next_id == UINT64_MAX)
         return QUICLY_ERROR_STATE_EXHAUSTION;
     if ((*control = malloc(offsetof(quicly_flexicast_control_t, encoded) + encoded_size)) == NULL)
         return PTLS_ERROR_NO_MEMORY;
@@ -1006,14 +1050,14 @@ static quicly_error_t alloc_flexicast_control(quicly_conn_t *conn, uint64_t type
 static quicly_error_t enqueue_flexicast_control(quicly_conn_t *conn, quicly_flexicast_control_t *control)
 {
     control->next = NULL;
-    control->id = conn->egress.flexicast_control.next_id++;
+    control->id = conn->egress.flexicast_control->next_id++;
     control->generation = 0;
     control->sender = QUICLY_SENDER_STATE_SEND;
-    if (conn->egress.flexicast_control.tail_ref == NULL)
-        conn->egress.flexicast_control.tail_ref = &conn->egress.flexicast_control.head;
-    *conn->egress.flexicast_control.tail_ref = control;
-    conn->egress.flexicast_control.tail_ref = &control->next;
-    ++conn->egress.flexicast_control.count;
+    if (conn->egress.flexicast_control->tail_ref == NULL)
+        conn->egress.flexicast_control->tail_ref = &conn->egress.flexicast_control->head;
+    *conn->egress.flexicast_control->tail_ref = control;
+    conn->egress.flexicast_control->tail_ref = &control->next;
+    ++conn->egress.flexicast_control->count;
     arm_flexicast_control_send(conn);
     return 0;
 }
@@ -1034,7 +1078,9 @@ quicly_error_t quicly_flexicast_bind_ack_path(quicly_conn_t *conn, uint64_t ack_
     quicly_flexicast_ack_binding_t *by_flow = find_flexicast_ack_binding_by_flow_id(conn, flow_id);
     if (by_path != NULL || by_flow != NULL)
         return by_path == by_flow ? 0 : PTLS_ERROR_LIBRARY;
-    if (conn->egress.flexicast_control.num_bindings >= QUICLY_MAX_FLEXICAST_ACK_BINDINGS)
+    if ((ret = ensure_flexicast_control_state(conn)) != 0)
+        return ret;
+    if (conn->egress.flexicast_control->num_bindings >= QUICLY_MAX_FLEXICAST_ACK_BINDINGS)
         return QUICLY_ERROR_STATE_EXHAUSTION;
     /* pre-reserve tombstone space so unbind never fails */
     if ((ret = ensure_retired_flexicast_ack_capacity(conn, ack_path_id)) != 0)
@@ -1044,17 +1090,17 @@ quicly_error_t quicly_flexicast_bind_ack_path(quicly_conn_t *conn, uint64_t ack_
         return PTLS_ERROR_NO_MEMORY;
     binding->ack_path_id = ack_path_id;
     binding->flow_id = *flow_id;
-    binding->next = conn->egress.flexicast_control.bindings;
-    conn->egress.flexicast_control.bindings = binding;
-    ++conn->egress.flexicast_control.num_bindings;
+    binding->next = conn->egress.flexicast_control->bindings;
+    conn->egress.flexicast_control->bindings = binding;
+    ++conn->egress.flexicast_control->num_bindings;
     return 0;
 }
 
 quicly_error_t quicly_flexicast_unbind_ack_path(quicly_conn_t *conn, const quicly_flexicast_flow_id_t *flow_id)
 {
-    if (conn == NULL || !quicly_flexicast_flow_id_is_valid(flow_id))
+    if (conn == NULL || conn->egress.flexicast_control == NULL || !quicly_flexicast_flow_id_is_valid(flow_id))
         return PTLS_ERROR_LIBRARY;
-    quicly_flexicast_ack_binding_t **bref = &conn->egress.flexicast_control.bindings;
+    quicly_flexicast_ack_binding_t **bref = &conn->egress.flexicast_control->bindings;
     while (*bref != NULL && !quicly_flexicast_flow_id_equal(&(*bref)->flow_id, flow_id))
         bref = &(*bref)->next;
     if (*bref == NULL)
@@ -1062,16 +1108,16 @@ quicly_error_t quicly_flexicast_unbind_ack_path(quicly_conn_t *conn, const quicl
     quicly_flexicast_ack_binding_t *binding = *bref;
     uint64_t ack_path_id = binding->ack_path_id;
     *bref = binding->next;
-    --conn->egress.flexicast_control.num_bindings;
+    --conn->egress.flexicast_control->num_bindings;
     free(binding);
     retire_flexicast_ack_path(conn, ack_path_id);
-    for (quicly_flexicast_control_t **cref = &conn->egress.flexicast_control.head; *cref != NULL;) {
+    for (quicly_flexicast_control_t **cref = &conn->egress.flexicast_control->head; *cref != NULL;) {
         quicly_flexicast_control_t *control = *cref;
         if (control->type == QUICLY_FRAME_TYPE_PATH_ACK && control->ack.ack_path_id == ack_path_id) {
             *cref = control->next;
             if (control->next == NULL)
-                conn->egress.flexicast_control.tail_ref = cref;
-            --conn->egress.flexicast_control.count;
+                conn->egress.flexicast_control->tail_ref = cref;
+            --conn->egress.flexicast_control->count;
             free_flexicast_control(control);
         } else {
             cref = &control->next;
@@ -1178,11 +1224,11 @@ quicly_error_t quicly_flexicast_send_path_ack(quicly_conn_t *conn, const quicly_
     }
 
     /* coalesce at most one pending PATH_ACK per bound flow so unicast stalls cannot starve FC_* frames */
-    for (quicly_flexicast_control_t **ref = &conn->egress.flexicast_control.head; *ref != NULL; ref = &(*ref)->next) {
+    for (quicly_flexicast_control_t **ref = &conn->egress.flexicast_control->head; *ref != NULL; ref = &(*ref)->next) {
         quicly_flexicast_control_t *existing = *ref;
         if (existing->type != QUICLY_FRAME_TYPE_PATH_ACK || existing->ack.ack_path_id != ack_path_id)
             continue;
-        if (conn->egress.flexicast_control.next_id == UINT64_MAX)
+        if (conn->egress.flexicast_control->next_id == UINT64_MAX)
             return QUICLY_ERROR_STATE_EXHAUSTION;
         if (existing->encoded_size < encoded_size) {
             quicly_flexicast_control_t *replacement = malloc(offsetof(quicly_flexicast_control_t, encoded) + encoded_size);
@@ -1192,13 +1238,13 @@ quicly_error_t quicly_flexicast_send_path_ack(quicly_conn_t *conn, const quicly_
             replacement->type = QUICLY_FRAME_TYPE_PATH_ACK;
             *ref = replacement;
             if (replacement->next == NULL)
-                conn->egress.flexicast_control.tail_ref = &replacement->next;
+                conn->egress.flexicast_control->tail_ref = &replacement->next;
             free(existing);
             existing = replacement;
         }
         memcpy(existing->encoded, buf, encoded_size);
         existing->encoded_size = encoded_size;
-        existing->id = conn->egress.flexicast_control.next_id++;
+        existing->id = conn->egress.flexicast_control->next_id++;
         existing->generation = 0;
         existing->sender = QUICLY_SENDER_STATE_SEND;
         existing->ack.ack_path_id = ack_path_id;
@@ -3832,23 +3878,7 @@ void quicly_free(quicly_conn_t *conn)
     destroy_all_streams(conn, 0, 1);
     update_open_count(conn->super.ctx, -1);
 #if QUICLY_HAVE_FLEXICAST
-    while (conn->egress.flexicast_control.head != NULL) {
-        quicly_flexicast_control_t *control = conn->egress.flexicast_control.head;
-        conn->egress.flexicast_control.head = control->next;
-        free_flexicast_control(control);
-    }
-    conn->egress.flexicast_control.tail_ref = NULL;
-    conn->egress.flexicast_control.count = 0;
-    while (conn->egress.flexicast_control.bindings != NULL) {
-        quicly_flexicast_ack_binding_t *binding = conn->egress.flexicast_control.bindings;
-        conn->egress.flexicast_control.bindings = binding->next;
-        free(binding);
-    }
-    conn->egress.flexicast_control.num_bindings = 0;
-    free(conn->egress.flexicast_control.retired_ranges);
-    conn->egress.flexicast_control.retired_ranges = NULL;
-    conn->egress.flexicast_control.num_retired_ranges = 0;
-    conn->egress.flexicast_control.retired_ranges_capacity = 0;
+    free_flexicast_control_state(conn->egress.flexicast_control);
 #endif
 
     for (size_t i = 0; i != PTLS_ELEMENTSOF(conn->delayed_packets.as_array); ++i) {
@@ -5391,7 +5421,7 @@ static quicly_error_t on_ack_flexicast_control(quicly_sentmap_t *map, const quic
                                                quicly_sent_t *sent)
 {
     quicly_conn_t *conn = get_conn_from_sentmap(map);
-    quicly_flexicast_control_t **ref = &conn->egress.flexicast_control.head;
+    quicly_flexicast_control_t **ref = &conn->egress.flexicast_control->head;
 
     while (*ref != NULL && (*ref)->id != sent->data.flexicast_control.id)
         ref = &(*ref)->next;
@@ -5401,8 +5431,8 @@ static quicly_error_t on_ack_flexicast_control(quicly_sentmap_t *map, const quic
     if (acked) {
         *ref = control->next;
         if (control->next == NULL)
-            conn->egress.flexicast_control.tail_ref = ref;
-        --conn->egress.flexicast_control.count;
+            conn->egress.flexicast_control->tail_ref = ref;
+        --conn->egress.flexicast_control->count;
         free_flexicast_control(control);
     } else if (packet->frames_in_flight && control->generation == sent->data.flexicast_control.generation &&
                control->sender == QUICLY_SENDER_STATE_UNACKED) {
@@ -7294,7 +7324,7 @@ static void refresh_flexicast_ack_delay(quicly_flexicast_control_t *control, int
 
 static quicly_error_t send_flexicast_control_frames(quicly_conn_t *conn, quicly_send_context_t *s)
 {
-    for (quicly_flexicast_control_t *control = conn->egress.flexicast_control.head; control != NULL; control = control->next) {
+    for (quicly_flexicast_control_t *control = flexicast_control_head(conn); control != NULL; control = control->next) {
         if (control->sender != QUICLY_SENDER_STATE_SEND)
             continue;
         if (control->type == QUICLY_FRAME_TYPE_PATH_ACK)
@@ -7997,7 +8027,7 @@ static void rearm_deferred_control_frames(quicly_conn_t *conn)
     if (conn->application == NULL || !conn->application->one_rtt_writable)
         return;
 #if QUICLY_HAVE_FLEXICAST
-    for (quicly_flexicast_control_t *fc = conn->egress.flexicast_control.head; fc != NULL; fc = fc->next) {
+    for (quicly_flexicast_control_t *fc = flexicast_control_head(conn); fc != NULL; fc = fc->next) {
         if (fc->sender == QUICLY_SENDER_STATE_SEND) {
             conn->egress.pending_flows |= QUICLY_PENDING_FLOW_OTHERS_BIT;
             return;
