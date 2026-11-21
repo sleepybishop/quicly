@@ -156,6 +156,14 @@ QUICLY_CALLBACK_TYPE(quicly_error_t, stream_open, quicly_stream_t *stream);
  */
 QUICLY_CALLBACK_TYPE(void, receive_datagram_frame, quicly_conn_t *conn, ptls_iovec_t payload);
 /**
+ * called synchronously for flexicast control frames; frame->data.key.key borrows packet memory valid only during the callback
+ */
+QUICLY_CALLBACK_TYPE(quicly_error_t, receive_flexicast_frame, quicly_conn_t *conn, const quicly_flexicast_frame_t *frame);
+/**
+ * called when a PATH_ACK frame arrives for a flexicast flow ID (above local max_path_id) with ack_delay in milliseconds
+ */
+QUICLY_CALLBACK_TYPE(quicly_error_t, receive_flexicast_ack, quicly_conn_t *conn, uint64_t flow_id, const quicly_ack_frame_t *frame);
+/**
  * Called when the connection is closed (i.e., when entering the closing or draining state). Otherwise the callback is not called;
  * e.g., when `quicly_free` is called directly while the connection is in the connected state. Call `quicly_get_close_reason` to
  * obtain the details of the closure.
@@ -304,6 +312,13 @@ typedef struct st_quicly_transport_parameters_t {
      * initial_max_path_id transport parameter (RFC 10069)
      */
     uint64_t initial_max_path_id;
+    /**
+     * address families supported by draft-navarre-quic-flexicast-03
+     */
+    struct {
+        uint8_t ipv4 : 1;
+        uint8_t ipv6 : 1;
+    } flexicast_support;
 } quicly_transport_parameters_t;
 
 typedef struct st_quicly_salt_t {
@@ -403,6 +418,14 @@ struct st_quicly_context_t {
      * callback for receiving datagram frame
      */
     quicly_receive_datagram_frame_t *receive_datagram_frame;
+    /**
+     * callback for draft-navarre-quic-flexicast control frames
+     */
+    quicly_receive_flexicast_frame_t *receive_flexicast_frame;
+    /**
+     * callback for PATH_ACK feedback referring to a flexicast flow ID
+     */
+    quicly_receive_flexicast_ack_t *receive_flexicast_ack;
     /**
      * callback called when a connection enters closing or draining
      */
@@ -659,7 +682,7 @@ struct st_quicly_conn_streamgroup_state_t {
             max_streams_bidi, max_streams_uni, data_blocked, stream_data_blocked, streams_blocked, new_connection_id,              \
             retire_connection_id, path_challenge, path_response, transport_close, application_close, handshake_done, datagram,     \
             ack_frequency, immediate_ack, reset_stream_at, path_ack, path_abandon, path_status, path_new_connection_id,            \
-            path_retire_connection_id, max_path_id, paths_blocked, path_cids_blocked;                                              \
+            path_retire_connection_id, max_path_id, paths_blocked, path_cids_blocked, fc_announce, fc_state, fc_key;               \
     } num_frames_received, num_frames_sent;                                                                                        \
     struct {                                                                                                                       \
         /**                                                                                                                        \
@@ -885,7 +908,10 @@ typedef struct st_quicly_path_stats_t {
     QUICLY_STATS__DO_FOREACH_NUM_FRAMES(path_retire_connection_id, dir, apply)                                                      \
     QUICLY_STATS__DO_FOREACH_NUM_FRAMES(max_path_id, dir, apply)                                                                   \
     QUICLY_STATS__DO_FOREACH_NUM_FRAMES(paths_blocked, dir, apply)                                                                 \
-    QUICLY_STATS__DO_FOREACH_NUM_FRAMES(path_cids_blocked, dir, apply)
+    QUICLY_STATS__DO_FOREACH_NUM_FRAMES(path_cids_blocked, dir, apply)                                                             \
+    QUICLY_STATS__DO_FOREACH_NUM_FRAMES(fc_announce, dir, apply)                                                                   \
+    QUICLY_STATS__DO_FOREACH_NUM_FRAMES(fc_state, dir, apply)                                                                      \
+    QUICLY_STATS__DO_FOREACH_NUM_FRAMES(fc_key, dir, apply)
 
 #define QUICLY_STATS_FOREACH_TRANSPORT_COUNTERS(apply)                                                                             \
     apply(num_paths.created, "num-paths.created")                                                                                  \
@@ -1697,6 +1723,33 @@ void quicly_send_datagram_frames_path(quicly_conn_t *conn, size_t path_index, pt
  * returns whether any path has queued DATAGRAM frames
  */
 int quicly_has_datagram_frames(quicly_conn_t *conn);
+/**
+ * returns the current path/peer framing limit for one DATAGRAM payload, or zero if unavailable
+ */
+size_t quicly_get_datagram_payload_limit(quicly_conn_t *conn, size_t path_index);
+/**
+ * discards locally queued DATAGRAM frames on the specified path before send
+ */
+void quicly_discard_datagram_frames(quicly_conn_t *conn, size_t path_index);
+/**
+ * returns whether flexicast and multipath are negotiated on the connection
+ */
+int quicly_flexicast_is_negotiated(quicly_conn_t *conn);
+/**
+ * queues an ack-eliciting, retransmittable flexicast control frame on the unicast connection
+ */
+quicly_error_t quicly_flexicast_send_announce(quicly_conn_t *conn, const quicly_flexicast_announce_frame_t *frame);
+quicly_error_t quicly_flexicast_send_state(quicly_conn_t *conn, const quicly_flexicast_state_frame_t *frame);
+quicly_error_t quicly_flexicast_send_key(quicly_conn_t *conn, const quicly_flexicast_key_frame_t *frame);
+/**
+ * queues or refreshes coalesced PATH_ACK feedback for a flexicast flow ID on the unicast connection
+ */
+quicly_error_t quicly_flexicast_send_path_ack(quicly_conn_t *conn, uint64_t flow_id, const quicly_ranges_t *ranges,
+                                              const uint64_t ecn_counts[3], uint64_t ack_delay_msec, int64_t now);
+/**
+ * closes the unicast connection on authenticated protocol/frame flexicast receive errors; ignores packet-local and AEAD limits
+ */
+quicly_error_t quicly_flexicast_handle_receive_error(quicly_conn_t *conn, int result);
 /**
  * Sets CC to the specified type. Returns a boolean indicating if the operation was successful.
  */

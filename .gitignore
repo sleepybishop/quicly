@@ -11,3 +11,5 @@ cmake_install.cmake
 xcuserdata
 *.xccheckout
 tmp/
+*.o
+*.d
