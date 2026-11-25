@@ -225,6 +225,7 @@ typedef struct st_quicly_crypto_engine_t {
      * header protection using `header_protect_ctx`. Quicly does not read or write the content of the UDP datagram payload after
      * this function is called. Therefore, an engine might retain the information provided by this function, and protect the packet
      * and the header at a later moment (e.g., hardware crypto offload).
+     * The unprotected first byte encodes the packet number length in its low two bits.
      */
     void (*encrypt_packet)(struct st_quicly_crypto_engine_t *engine, quicly_conn_t *conn, ptls_cipher_context_t *header_protect_ctx,
                            ptls_aead_context_t *packet_protect_ctx, ptls_iovec_t datagram, size_t first_byte_at,
@@ -785,7 +786,16 @@ struct st_quicly_conn_streamgroup_state_t {
     /**                                                                                                                            \
      * Total number of connections that used an alternative egress context (i.e., not `egress[0]`).                                \
      */                                                                                                                            \
-    uint64_t num_alt_egress
+    uint64_t num_alt_egress;                                                                                                       \
+    /**                                                                                                                            \
+     * Number of times the CIDs issued to the peer were replaced due to the change of the key used by the CID encryptor.           \
+     */                                                                                                                            \
+    uint64_t num_local_cid_rotations;                                                                                              \
+    /**                                                                                                                            \
+     * 1 if the connection needed to issue CIDs but could not due to their exhaustion (i.e., when rotating them or when replacing  \
+     * the ones retired by the peer), otherwise 0.                                                                                 \
+     */                                                                                                                            \
+    uint64_t num_local_cid_exhaustion
 
 /**
  * Stats that do not need to be gathered upon the invocation of `quicly_get_stats`. This macro is used to define the same fields in
@@ -968,7 +978,9 @@ typedef struct st_quicly_path_stats_t {
     apply(num_handshake_timeouts, "num-handshake-timeouts")                                                                        \
     apply(num_initial_handshake_exceeded, "num-initial-handshake-exceeded")                                                        \
     apply(num_jumpstart_applicable, "num-jumpstart-applicable")                                                                    \
-    apply(num_alt_egress, "num-alt-egress")
+    apply(num_alt_egress, "num-alt-egress")                                                                                        \
+    apply(num_local_cid_rotations, "num-local-cid-rotations")                                                                      \
+    apply(num_local_cid_exhaustion, "num-local-cid-exhaustion")
 
 /**
  * Macro for iterating QUICLY_STATS_PREBUILT_COUNTERS.

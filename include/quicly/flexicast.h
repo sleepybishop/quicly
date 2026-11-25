@@ -95,6 +95,24 @@ typedef struct st_quicly_flexicast_decrypted_t {
     size_t num_datagrams;
 } quicly_flexicast_decrypted_t;
 
+/* borrowed QUIC 1-RTT encryption contexts initialized for the flexicast traffic secret */
+typedef struct st_quicly_flexicast_egress_t {
+    quicly_crypto_engine_t *crypto_engine;
+    /* passed through to the crypto engine; NULL is allowed for the default engine */
+    quicly_conn_t *crypto_conn;
+    ptls_cipher_context_t *header_protection;
+    ptls_aead_context_t *aead;
+} quicly_flexicast_egress_t;
+
+/* returns protected UDP payload size or zero if unencodable; packet_number_length is 2 or 4 */
+size_t quicly_flexicast_datagram_packet_size(const quicly_flexicast_egress_t *egress, const quicly_flexicast_flow_id_t *flow_id,
+                                             size_t packet_number_length, size_t payload_size);
+/* encodes and protects one flexicast DATAGRAM; caller owns keys, PN allocation (no nonce reuse), and per-key limits;
+ * payload must not overlap packet; INVALID leaves packet and packet_size unchanged */
+int quicly_flexicast_encode_datagram_packet(const quicly_flexicast_egress_t *egress, const quicly_flexicast_flow_id_t *flow_id,
+                                            uint64_t packet_number, size_t packet_number_length, ptls_iovec_t payload,
+                                            uint8_t *packet, size_t packet_capacity, size_t *packet_size);
+
 int quicly_flexicast_flow_create(quicly_flexicast_flow_t **flow, const quicly_flexicast_config_t *config);
 /* rotates traffic keys; returns STATE_EXHAUSTION once QUICLY_FLEXICAST_MAX_RETIRED_KEYS distinct retired keys accumulate */
 int quicly_flexicast_flow_rekey(quicly_flexicast_flow_t *flow, ptls_iovec_t traffic_secret, uint64_t first_packet_number,
@@ -122,6 +140,7 @@ int quicly_flexicast_get_member_stats(const quicly_flexicast_flow_t *flow, uint6
                                       quicly_flexicast_member_stats_t *stats);
 
 size_t quicly_flexicast_datagram_size(const quicly_flexicast_flow_t *flow, size_t payload_size);
+/* requires at least one active member and records ACK obligations for all active members */
 int quicly_flexicast_send_datagram(quicly_flexicast_flow_t *flow, ptls_iovec_t payload, uint8_t *packet, size_t packet_capacity,
                                    size_t *packet_size, uint64_t *packet_number, int64_t now);
 int quicly_flexicast_mark_submitted(quicly_flexicast_flow_t *flow, uint64_t member_id, uint64_t packet_number, int64_t now,

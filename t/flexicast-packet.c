@@ -258,6 +258,104 @@ static void test_packet_size_limits(void)
     free(packet);
 }
 
+static void test_datagram_packet_encoder(void)
+{
+    quicly_flexicast_flow_id_t flow_id = default_packet_flow_id();
+    quicly_flexicast_egress_t egress = {.crypto_engine = &quicly_default_crypto_engine};
+    int ret = egress.crypto_engine->setup_cipher(egress.crypto_engine, NULL, QUICLY_EPOCH_1RTT, 1, &egress.header_protection,
+                                                 &egress.aead, ptls_openssl_aes128gcmsha256.aead, ptls_openssl_aes128gcmsha256.hash,
+                                                 packet_secret);
+    ok(ret == 0);
+    if (ret != 0)
+        return;
+
+    ptls_iovec_t payload = ptls_iovec_init("packet", 6);
+    uint8_t packet[128], untouched[sizeof(packet)];
+    size_t size = SIZE_MAX, expected = quicly_flexicast_datagram_packet_size(&egress, &flow_id, 4, payload.len);
+    ok(expected == 1 + flow_id.len + 4 + 2 + payload.len + egress.aead->algo->tag_size);
+    ok(quicly_flexicast_datagram_packet_size(&egress, &flow_id, 3, payload.len) == 0);
+    ok(quicly_flexicast_datagram_packet_size(&egress, &flow_id, 4, SIZE_MAX) == 0);
+    ok(quicly_flexicast_datagram_packet_size(&egress, &flow_id, 4, QUICLY_FLEXICAST_MAX_PACKET_SIZE) == 0);
+    ptls_aead_algorithm_t short_tag = {.tag_size = 8, .iv_size = 12, .ctr_cipher = egress.aead->algo->ctr_cipher};
+    ptls_aead_algorithm_t short_iv = {.tag_size = QUICLY_AEAD_TAG_SIZE, .iv_size = 8, .ctr_cipher = egress.aead->algo->ctr_cipher};
+    ptls_aead_context_t unsupported_aead = {.algo = &short_tag};
+    quicly_flexicast_egress_t unsupported_egress = egress;
+    unsupported_egress.aead = &unsupported_aead;
+    ok(quicly_flexicast_datagram_packet_size(&unsupported_egress, &flow_id, 4, payload.len) == 0);
+    unsupported_aead.algo = &short_iv;
+    ok(quicly_flexicast_datagram_packet_size(&unsupported_egress, &flow_id, 4, payload.len) == 0);
+    ptls_cipher_algorithm_t other_ctr = *egress.header_protection->algo;
+    ptls_cipher_context_t unsupported_hp = {.algo = &ptls_openssl_aes128ecb};
+    unsupported_egress = egress;
+    unsupported_egress.header_protection = &unsupported_hp;
+    ok(quicly_flexicast_datagram_packet_size(&unsupported_egress, &flow_id, 4, payload.len) == 0);
+    unsupported_hp.algo = &other_ctr;
+    ok(quicly_flexicast_datagram_packet_size(&unsupported_egress, &flow_id, 4, payload.len) == 0);
+    memset(packet, 0xa5, sizeof(packet));
+    memcpy(untouched, packet, sizeof(packet));
+    ok(quicly_flexicast_encode_datagram_packet(&egress, &flow_id, 0, 3, payload, packet, sizeof(packet), &size) ==
+       QUICLY_FLEXICAST_ERROR_INVALID);
+    ok(quicly_flexicast_encode_datagram_packet(&egress, &flow_id, PTLS_QUICINT_MAX + 1, 4, payload, packet, sizeof(packet),
+                                               &size) == QUICLY_FLEXICAST_ERROR_INVALID);
+    ok(quicly_flexicast_encode_datagram_packet(&egress, &flow_id, 0, 4, payload, packet, expected - 1, &size) ==
+       QUICLY_FLEXICAST_ERROR_INVALID);
+    ok(size == SIZE_MAX && memcmp(packet, untouched, sizeof(packet)) == 0);
+
+    /* wide PN crosses both a durable reservation gap and the 32-bit wire wrap */
+    uint64_t first = UINT32_MAX - UINT64_C(100), later = first + 65536;
+    quicly_flexicast_flow_t *rx = packet_flow(first, 0), *late_rx = packet_flow(first, 0);
+    ok(quicly_flexicast_encode_datagram_packet(&egress, &flow_id, first, 4, payload, packet, expected, &size) == 0);
+    ok(size == expected);
+    ptls_iovec_t received;
+    uint64_t pn;
+    ok(quicly_flexicast_receive_datagram(rx, packet, size, &received, &pn, 0, 1) == 0);
+    ok(pn == first && received.len == payload.len && memcmp(received.base, payload.base, payload.len) == 0);
+    ok(quicly_flexicast_encode_datagram_packet(&egress, &flow_id, later, 4, payload, packet, expected, &size) == 0);
+    uint8_t late_packet[sizeof(packet)];
+    memcpy(late_packet, packet, size);
+    ok(quicly_flexicast_receive_datagram(rx, packet, size, &received, &pn, 0, 2) == 0 && pn == later);
+    ok(quicly_flexicast_receive_datagram(late_rx, late_packet, size, &received, &pn, 0, 2) == 0);
+    ok(pn == later && received.len == payload.len && memcmp(received.base, payload.base, payload.len) == 0);
+    quicly_flexicast_flow_free(late_rx);
+    quicly_flexicast_flow_free(rx);
+
+    /* default two-byte width also supports a minimum-sized packet and header protection sample */
+    rx = packet_flow(0, 0);
+    ok(quicly_flexicast_encode_datagram_packet(&egress, &flow_id, 0, QUICLY_SEND_PN_SIZE, ptls_iovec_init(NULL, 0), packet,
+                                               sizeof(packet), &size) == 0);
+    ok(size == quicly_flexicast_datagram_size(rx, 0));
+    ok(quicly_flexicast_receive_datagram(rx, packet, size, &received, &pn, 0, 1) == 0 && pn == 0 && received.len == 0);
+    ok((packet[0] & 0x3) + 1 == QUICLY_SEND_PN_SIZE);
+    quicly_flexicast_flow_free(rx);
+    ptls_cipher_free(egress.header_protection);
+    ptls_aead_free(egress.aead);
+}
+
+static void test_send_requires_members(void)
+{
+    quicly_flexicast_flow_t *flow = packet_flow(0, 0);
+    ptls_iovec_t payload = ptls_iovec_init("packet", 6);
+    uint8_t packet[128];
+    size_t size = SIZE_MAX, pending;
+    uint64_t pn = UINT64_MAX;
+    quicly_flexicast_crypto_usage_t usage;
+    ok(quicly_flexicast_send_datagram(flow, payload, packet, sizeof(packet), &size, &pn, 1) == QUICLY_FLEXICAST_ERROR_NO_MEMBERS);
+    ok(!quicly_flexicast_flow_has_sender_state(flow));
+    ok(quicly_flexicast_get_next_packet_number(flow) == 0 && size == SIZE_MAX && pn == UINT64_MAX);
+    ok(quicly_flexicast_get_crypto_usage(flow, &usage) == 0 && usage.encrypted_packets == 0);
+
+    ok(quicly_flexicast_attach(flow, 1, 2) == 0);
+    ok(quicly_flexicast_send_datagram(flow, payload, packet, sizeof(packet), &size, &pn, 3) == 0 && pn == 0);
+    ok(quicly_flexicast_get_pending_members(flow, pn, &pending) == 0 && pending == 1);
+    int complete = 0;
+    ok(quicly_flexicast_ack_packet(flow, 1, pn, &complete, 4) == 0 && complete);
+    ok(quicly_flexicast_detach(flow, 1, 5) == 0);
+    ok(quicly_flexicast_send_datagram(flow, payload, packet, sizeof(packet), &size, &pn, 6) == QUICLY_FLEXICAST_ERROR_NO_MEMBERS);
+    ok(quicly_flexicast_get_next_packet_number(flow) == 1);
+    ok(quicly_flexicast_get_crypto_usage(flow, &usage) == 0 && usage.encrypted_packets == 1);
+    quicly_flexicast_flow_free(flow);
+}
+
 static void test_padding_history_bound(void)
 {
     quicly_flexicast_flow_t *flow = packet_flow(0, 0);
@@ -300,5 +398,7 @@ void test_flexicast_packets(void)
     subtest("packet-errors", test_packet_errors);
     subtest("packet-ack-elicitation", test_packet_ack_elicitation);
     subtest("packet-size-limits", test_packet_size_limits);
+    subtest("datagram-packet-encoder", test_datagram_packet_encoder);
+    subtest("send-requires-members", test_send_requires_members);
     subtest("padding-history-bound", test_padding_history_bound);
 }
