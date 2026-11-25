@@ -1,4 +1,5 @@
 #include "quicly/flexicast.h"
+#include "quicly/defaults.h"
 #include "flexicast_member_map.h"
 
 #include <limits.h>
@@ -95,12 +96,11 @@ typedef struct st_quicly_flexicast_member_t {
 struct st_quicly_flexicast_flow_t {
     quicly_flexicast_flow_id_t flow_id;
     ptls_cipher_suite_t *cipher_suite;
-    quicly_crypto_engine_t *crypto_engine;
-    quicly_conn_t *crypto_conn;
+    quicly_flexicast_egress_t egress;
     struct {
         ptls_cipher_context_t *header_protection;
         ptls_aead_context_t *aead;
-    } egress, ingress;
+    } ingress;
     struct {
         uint8_t secret_hash[PTLS_MAX_DIGEST_SIZE];
         flexicast_retired_key_t *retired_keys;
@@ -659,10 +659,26 @@ static void dispose_cipher(ptls_cipher_context_t **hp, ptls_aead_context_t **aea
     }
 }
 
+static int has_flexicast_aead_parameters(const ptls_aead_algorithm_t *aead)
+{
+    return aead != NULL && aead->tag_size == QUICLY_AEAD_TAG_SIZE && aead->iv_size == 12 && aead->ctr_cipher != NULL &&
+           aead->ctr_cipher->iv_size == 16;
+}
+
+static int has_flexicast_cipher_contexts(const quicly_crypto_engine_t *engine, const ptls_cipher_context_t *hp,
+                                         const ptls_aead_context_t *aead, int is_enc)
+{
+    if (engine == NULL || hp == NULL || hp->algo == NULL || hp->algo->iv_size != 16 || aead == NULL ||
+        !has_flexicast_aead_parameters(aead->algo))
+        return 0;
+    if (is_enc && engine->encrypt_packet == quicly_default_crypto_engine.encrypt_packet && hp->algo != aead->algo->ctr_cipher)
+        return 0;
+    return 1;
+}
+
 static int get_aead_limits(const quicly_flexicast_config_t *config, uint64_t *packets, uint64_t *failures, uint64_t *attempts)
 {
-    if (config->cipher_suite->aead->tag_size != 16 || config->cipher_suite->aead->iv_size != 12 ||
-        config->cipher_suite->aead->ctr_cipher == NULL)
+    if (!has_flexicast_aead_parameters(config->cipher_suite->aead))
         return 0;
     /* RFC 9001 section 6.6 limits */
     switch (config->cipher_suite->id) {
@@ -731,8 +747,8 @@ int quicly_flexicast_flow_create(quicly_flexicast_flow_t **flow, const quicly_fl
     new_flow->inactive_head = new_flow->inactive_tail = FLEXICAST_NO_SLOT;
     new_flow->flow_id = config->flow_id;
     new_flow->cipher_suite = config->cipher_suite;
-    new_flow->crypto_engine = config->crypto_engine;
-    new_flow->crypto_conn = config->crypto_conn;
+    new_flow->egress.crypto_engine = config->crypto_engine;
+    new_flow->egress.crypto_conn = config->crypto_conn;
     new_flow->crypto.max_packets_per_key = max_packets_per_key;
     new_flow->crypto.max_authentication_failures = max_authentication_failures;
     new_flow->crypto.max_decryption_attempts = max_decryption_attempts;
@@ -848,11 +864,15 @@ int quicly_flexicast_flow_rekey(quicly_flexicast_flow_t *flow, ptls_iovec_t traf
             return ret;
         }
     }
-    if (flow->crypto_engine->setup_cipher(flow->crypto_engine, flow->crypto_conn, QUICLY_EPOCH_1RTT, 1, &egress_hp, &egress_aead,
-                                          flow->cipher_suite->aead, flow->cipher_suite->hash, traffic_secret.base) != 0)
+    if (flow->egress.crypto_engine->setup_cipher(flow->egress.crypto_engine, flow->egress.crypto_conn, QUICLY_EPOCH_1RTT, 1,
+                                                 &egress_hp, &egress_aead, flow->cipher_suite->aead, flow->cipher_suite->hash,
+                                                 traffic_secret.base) != 0 ||
+        !has_flexicast_cipher_contexts(flow->egress.crypto_engine, egress_hp, egress_aead, 1))
         goto Error;
-    if (flow->crypto_engine->setup_cipher(flow->crypto_engine, flow->crypto_conn, QUICLY_EPOCH_1RTT, 0, &ingress_hp, &ingress_aead,
-                                          flow->cipher_suite->aead, flow->cipher_suite->hash, traffic_secret.base) != 0)
+    if (flow->egress.crypto_engine->setup_cipher(flow->egress.crypto_engine, flow->egress.crypto_conn, QUICLY_EPOCH_1RTT, 0,
+                                                 &ingress_hp, &ingress_aead, flow->cipher_suite->aead, flow->cipher_suite->hash,
+                                                 traffic_secret.base) != 0 ||
+        !has_flexicast_cipher_contexts(flow->egress.crypto_engine, ingress_hp, ingress_aead, 0))
         goto Error;
 
     dispose_cipher(&flow->egress.header_protection, &flow->egress.aead);
@@ -1173,13 +1193,59 @@ int quicly_flexicast_get_member_stats(const quicly_flexicast_flow_t *flow, uint6
     return QUICLY_FLEXICAST_OK;
 }
 
+size_t quicly_flexicast_datagram_packet_size(const quicly_flexicast_egress_t *egress, const quicly_flexicast_flow_id_t *flow_id,
+                                             size_t packet_number_length, size_t payload_size)
+{
+    if (!quicly_flexicast_flow_id_is_valid(flow_id) || (packet_number_length != 2 && packet_number_length != QUICLY_MAX_PN_SIZE) ||
+        payload_size > QUICLY_FLEXICAST_MAX_DATAGRAM_SIZE || egress == NULL || egress->crypto_engine == NULL ||
+        egress->crypto_engine->encrypt_packet == NULL ||
+        !has_flexicast_cipher_contexts(egress->crypto_engine, egress->header_protection, egress->aead, 1))
+        return 0;
+    size_t pn_offset = 1 + flow_id->len;
+    size_t size = pn_offset + packet_number_length + quicly_datagram_frame_capacity(ptls_iovec_init(NULL, payload_size)) +
+                  QUICLY_AEAD_TAG_SIZE;
+    if (size > QUICLY_FLEXICAST_MAX_PACKET_SIZE || size - pn_offset - QUICLY_MAX_PN_SIZE < egress->header_protection->algo->iv_size)
+        return 0;
+    return size;
+}
+
+static void encode_datagram_packet(const quicly_flexicast_egress_t *egress, const quicly_flexicast_flow_id_t *flow_id,
+                                   uint64_t packet_number, size_t packet_number_length, ptls_iovec_t payload, uint8_t *packet,
+                                   size_t packet_size)
+{
+    packet[0] = QUICLY_QUIC_BIT | (packet_number_length - 1);
+    memcpy(packet + 1, flow_id->bytes, flow_id->len);
+    size_t pn_offset = 1 + flow_id->len;
+    if (packet_number_length == QUICLY_MAX_PN_SIZE) {
+        quicly_encode32(packet + pn_offset, (uint32_t)packet_number);
+    } else {
+        quicly_encode16(packet + pn_offset, (uint16_t)packet_number);
+    }
+    size_t payload_from = pn_offset + packet_number_length;
+    quicly_encode_datagram_frame(packet + payload_from, payload);
+    egress->crypto_engine->encrypt_packet(egress->crypto_engine, egress->crypto_conn, egress->header_protection, egress->aead,
+                                          ptls_iovec_init(packet, packet_size), 0, payload_from, packet_number, 0);
+}
+
+int quicly_flexicast_encode_datagram_packet(const quicly_flexicast_egress_t *egress, const quicly_flexicast_flow_id_t *flow_id,
+                                            uint64_t packet_number, size_t packet_number_length, ptls_iovec_t payload,
+                                            uint8_t *packet, size_t packet_capacity, size_t *packet_size)
+{
+    if (packet == NULL || packet_size == NULL || (payload.len != 0 && payload.base == NULL) || packet_number > PTLS_QUICINT_MAX)
+        return QUICLY_FLEXICAST_ERROR_INVALID;
+    size_t size = quicly_flexicast_datagram_packet_size(egress, flow_id, packet_number_length, payload.len);
+    if (size == 0 || size > packet_capacity)
+        return QUICLY_FLEXICAST_ERROR_INVALID;
+    encode_datagram_packet(egress, flow_id, packet_number, packet_number_length, payload, packet, size);
+    *packet_size = size;
+    return QUICLY_FLEXICAST_OK;
+}
+
 size_t quicly_flexicast_datagram_size(const quicly_flexicast_flow_t *flow, size_t payload_size)
 {
-    size_t size;
-    if (flow == NULL || payload_size > QUICLY_FLEXICAST_MAX_DATAGRAM_SIZE)
+    if (flow == NULL)
         return 0;
-    size = 1 + flow->flow_id.len + QUICLY_SEND_PN_SIZE + quicly_datagram_frame_capacity(ptls_iovec_init(NULL, payload_size)) +
-           flow->cipher_suite->aead->tag_size;
+    size_t size = quicly_flexicast_datagram_packet_size(&flow->egress, &flow->flow_id, QUICLY_SEND_PN_SIZE, payload_size);
     return size <= flow->max_packet_size ? size : 0;
 }
 
@@ -1219,30 +1285,25 @@ static void retire_inactive_slot_obligations(quicly_flexicast_flow_t *flow, quic
 int quicly_flexicast_send_datagram(quicly_flexicast_flow_t *flow, ptls_iovec_t payload, uint8_t *packet, size_t packet_capacity,
                                    size_t *packet_size, uint64_t *packet_number, int64_t now)
 {
-    uint64_t pn;
-    size_t required, payload_from, active_words;
-    uint8_t *dst;
-    quicly_flexicast_sent_t *sent;
-
     if (flow == NULL || packet == NULL || packet_size == NULL || packet_number == NULL ||
         (payload.len != 0 && payload.base == NULL) || payload.len > QUICLY_FLEXICAST_MAX_DATAGRAM_SIZE ||
         flow->next_packet_number > PTLS_QUICINT_MAX)
         return QUICLY_FLEXICAST_ERROR_INVALID;
     if (flow->crypto.authentication_failures >= flow->crypto.max_authentication_failures)
         return QUICLY_FLEXICAST_ERROR_AEAD_LIMIT_REACHED;
-    if (flow->num_members == 0 || flow->sent == NULL)
+    if (flow->num_members == 0)
         return QUICLY_FLEXICAST_ERROR_NO_MEMBERS;
     if (flow->crypto.encrypted_packets >= flow->crypto.max_packets_per_key)
         return QUICLY_FLEXICAST_ERROR_KEY_UPDATE_REQUIRED;
-    required = quicly_flexicast_datagram_size(flow, payload.len);
+    size_t required = quicly_flexicast_datagram_size(flow, payload.len);
     if (required == 0 || required > packet_capacity)
         return QUICLY_FLEXICAST_ERROR_INVALID;
 
-    pn = flow->next_packet_number;
+    uint64_t pn = flow->next_packet_number;
     flexicast_sent_block_t **block = &flow->sent[sent_block_index(pn)];
     if (*block == NULL && (*block = calloc(1, sent_block_size(flow->member_word_count))) == NULL)
         return QUICLY_FLEXICAST_ERROR_NO_MEMORY;
-    sent = &(*block)->packets[pn % FLEXICAST_SENT_BLOCK_SIZE];
+    quicly_flexicast_sent_t *sent = &(*block)->packets[pn % FLEXICAST_SENT_BLOCK_SIZE];
     if (sent->pending_count != 0 && sent->packet_number != pn) {
         if (sent->checked_suspend_epoch != flow->suspend_epoch) {
             retire_inactive_slot_obligations(flow, sent);
@@ -1252,33 +1313,22 @@ int quicly_flexicast_send_datagram(quicly_flexicast_flow_t *flow, ptls_iovec_t p
             return QUICLY_FLEXICAST_ERROR_SEND_WINDOW;
     }
 
-    dst = packet;
-    *dst++ = QUICLY_QUIC_BIT | (QUICLY_SEND_PN_SIZE - 1);
-    memcpy(dst, flow->flow_id.bytes, flow->flow_id.len);
-    dst += flow->flow_id.len;
-    quicly_encode16(dst, (uint16_t)pn);
-    dst += QUICLY_SEND_PN_SIZE;
-    payload_from = (size_t)(dst - packet);
-    dst = quicly_encode_datagram_frame(dst, payload);
-    dst += flow->egress.aead->algo->tag_size;
-
-    flow->crypto_engine->encrypt_packet(flow->crypto_engine, flow->crypto_conn, flow->egress.header_protection, flow->egress.aead,
-                                        ptls_iovec_init(packet, (size_t)(dst - packet)), 0, payload_from, pn, 0);
+    encode_datagram_packet(&flow->egress, &flow->flow_id, pn, QUICLY_SEND_PN_SIZE, payload, packet, required);
     ++flow->crypto.encrypted_packets;
 
-    active_words = (flow->member_slot_watermark + 63) / 64;
+    size_t active_words = (flow->member_slot_watermark + 63) / 64;
     sent->packet_number = pn;
     sent->checked_suspend_epoch = flow->suspend_epoch;
     memcpy(sent_member_words(flow, sent), flow->active_member_words, active_words * sizeof(*flow->active_member_words));
     sent->pending_count = flow->num_members;
-    sent->packet_size = (size_t)(dst - packet);
+    sent->packet_size = required;
     sent->sent_at = now;
     sent->context = (quicly_flexicast_send_context_t){0};
     sent->has_submission = 0;
     sent->rtt_untracked = 0;
     ++flow->next_packet_number;
-    quicly_flexicast_cc_on_packet_sent(flow->cc, pn, (size_t)(dst - packet), now);
-    *packet_size = (size_t)(dst - packet);
+    quicly_flexicast_cc_on_packet_sent(flow->cc, pn, required, now);
+    *packet_size = required;
     *packet_number = pn;
     return QUICLY_FLEXICAST_OK;
 }

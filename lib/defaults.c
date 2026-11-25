@@ -455,16 +455,17 @@ static void default_finalize_send_packet(quicly_crypto_engine_t *engine, quicly_
                                          ptls_iovec_t datagram, size_t first_byte_at, size_t payload_from, uint64_t packet_number,
                                          int coalesced)
 {
+    size_t pn_length = (datagram.base[first_byte_at] & 0x3) + 1;
     ptls_aead_supplementary_encryption_t supp = {.ctx = header_protect_ctx,
-                                                 .input = datagram.base + payload_from - QUICLY_SEND_PN_SIZE + QUICLY_MAX_PN_SIZE};
+                                                 .input = datagram.base + payload_from - pn_length + QUICLY_MAX_PN_SIZE};
 
     ptls_aead_encrypt_s(packet_protect_ctx, datagram.base + payload_from, datagram.base + payload_from,
                         datagram.len - payload_from - packet_protect_ctx->algo->tag_size, packet_number,
                         datagram.base + first_byte_at, payload_from - first_byte_at, &supp);
 
     datagram.base[first_byte_at] ^= supp.output[0] & (QUICLY_PACKET_IS_LONG_HEADER(datagram.base[first_byte_at]) ? 0xf : 0x1f);
-    for (size_t i = 0; i != QUICLY_SEND_PN_SIZE; ++i)
-        datagram.base[payload_from + i - QUICLY_SEND_PN_SIZE] ^= supp.output[i + 1];
+    for (size_t i = 0; i != pn_length; ++i)
+        datagram.base[payload_from + i - pn_length] ^= supp.output[i + 1];
 }
 
 quicly_crypto_engine_t quicly_default_crypto_engine = {default_setup_cipher, default_finalize_send_packet};

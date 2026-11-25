@@ -205,6 +205,7 @@ static void test_authenticated_epoch_floor(void)
 }
 
 static int fail_ingress_setup;
+static int omit_egress_hp;
 
 static int test_setup_cipher(quicly_crypto_engine_t *engine, quicly_conn_t *conn, size_t epoch, int is_enc,
                              ptls_cipher_context_t **hp, ptls_aead_context_t **aead, ptls_aead_algorithm_t *algo,
@@ -212,7 +213,12 @@ static int test_setup_cipher(quicly_crypto_engine_t *engine, quicly_conn_t *conn
 {
     if (fail_ingress_setup && !is_enc)
         return PTLS_ERROR_LIBRARY;
-    return quicly_default_crypto_engine.setup_cipher(engine, conn, epoch, is_enc, hp, aead, algo, hash, secret);
+    int ret = quicly_default_crypto_engine.setup_cipher(engine, conn, epoch, is_enc, hp, aead, algo, hash, secret);
+    if (ret == 0 && omit_egress_hp && is_enc && hp != NULL && *hp != NULL) {
+        ptls_cipher_free(*hp);
+        *hp = NULL;
+    }
+    return ret;
 }
 
 static void test_rekey_setup_failure(void)
@@ -226,13 +232,19 @@ static void test_rekey_setup_failure(void)
     uint64_t pn;
     config.crypto_engine = &engine;
     config.max_packets_per_key = 2;
+    omit_egress_hp = 1;
+    ok(quicly_flexicast_flow_create(&flow, &config) == QUICLY_FLEXICAST_ERROR_CRYPTO && flow == NULL);
+    omit_egress_hp = 0;
     ok(quicly_flexicast_flow_create(&flow, &config) == QUICLY_FLEXICAST_OK);
     ok(quicly_flexicast_attach(flow, 1, 0) == QUICLY_FLEXICAST_OK);
     send_and_release(flow, 0);
-    /* failed ingress setup preserves the previous key, count, and membership */
+    /* failed or incomplete cipher setup preserves the previous key, count, and membership */
     fail_ingress_setup = 1;
     ok(quicly_flexicast_flow_rekey(flow, ptls_iovec_init(secrets[1], 32), 1, 1) == QUICLY_FLEXICAST_ERROR_CRYPTO);
     fail_ingress_setup = 0;
+    omit_egress_hp = 1;
+    ok(quicly_flexicast_flow_rekey(flow, ptls_iovec_init(secrets[1], 32), 1, 1) == QUICLY_FLEXICAST_ERROR_CRYPTO);
+    omit_egress_hp = 0;
     ok(quicly_flexicast_num_members(flow) == 1 && quicly_flexicast_get_next_packet_number(flow) == 1);
     send_and_release(flow, 1);
     ok(quicly_flexicast_send_datagram(flow, ptls_iovec_init(NULL, 0), packet, sizeof(packet), &size, &pn, 1) ==
